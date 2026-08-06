@@ -6,6 +6,8 @@
 """
 import re
 
+import envfile
+
 MIN_SECRET_LEN = 7
 
 TOKEN_PATTERNS = [
@@ -35,19 +37,11 @@ def redact(text, secrets=None):
 
 
 def load_secret_values(path):
-    """Прочитать env-файл и вернуть {значение: имя_переменной}."""
-    values = {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.readlines()
-    except OSError:
-        return values
-    for line in lines:
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        value = value.strip().strip('"').strip("'")
-        if value:
-            values[value] = key.strip()
-    return values
+    """Прочитать env-файл и вернуть {значение: имя_переменной}.
+
+    Кавычки снимает envfile.parse, а не .strip("'"): значения теперь пишутся
+    в одинарных кавычках с экранированием, и наивная обрезка кавычек по краям
+    вернула бы не тот текст — то есть настоящий пароль остался бы в логе
+    незамаскированным.
+    """
+    return {value: key for key, value in envfile.read(path).items() if value}

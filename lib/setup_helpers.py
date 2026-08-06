@@ -7,9 +7,16 @@
 import json
 import os
 
+import envfile
+
 
 def write_env(path, values):
     """Дописать переменные в env-файл, заменяя существующие. Права 600.
+
+    Значения пишутся в одинарных кавычках (envfile.quote): файл `source`-ит
+    bin/uzum перед запуском Claude Code, и без кавычек пароль с пробелом,
+    долларом или бэктиком либо не доезжал до переменной вообще, либо
+    подставлял в себя чужое значение, либо выполнял команду.
 
     Каталог, в котором лежит файл (обычно ~/.config/uzum-ai), тоже переводится
     на 700: секреты внутри и так закрыты правами файла, но сам каталог до
@@ -20,26 +27,11 @@ def write_env(path, values):
     dirpath = os.path.dirname(path) or "."
     os.makedirs(dirpath, exist_ok=True)
     os.chmod(dirpath, 0o700)
-    existing = {}
-    order = []
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key = key.strip()
-                if key not in existing:
-                    order.append(key)
-                existing[key] = value.strip()
-    for key, value in values.items():
-        if key not in existing:
-            order.append(key)
-        existing[key] = value
+    existing = envfile.read(path)  # порядок ключей сохраняется
+    existing.update(values)
     with open(path, "w", encoding="utf-8") as f:
-        for key in order:
-            f.write("%s=%s\n" % (key, existing[key]))
+        for key, value in existing.items():
+            f.write(envfile.format_line(key, value))
     os.chmod(path, 0o600)
 
 

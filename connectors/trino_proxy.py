@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 
 import pandas as pd
 from mcp import types
@@ -48,6 +49,10 @@ from mcp.server.stdio import stdio_server
 from trino.auth import OAuth2Authentication
 from trino.dbapi import connect
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "lib"))
+
+import envfile  # noqa: E402
+
 SECRETS_PATH = os.path.expanduser("~/.config/uzum-ai/secrets.env")
 
 # Глобальное подключение
@@ -55,19 +60,13 @@ _global_connection = None
 
 
 def _read_secrets_env(path):
-    """Прочитать простой KEY=VALUE файл секретов. Отсутствие файла — не ошибка."""
-    values = {}
-    try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                values[key.strip()] = value.strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return values
+    """Прочитать файл секретов. Отсутствие файла — не ошибка.
+
+    Формат значений един для всего репозитория (одинарные кавычки с
+    экранированием, см. lib/envfile.py) — разбор берём оттуда, чтобы у
+    коннектора не оказалось своего мнения о том, где кончается значение.
+    """
+    return envfile.read(path)
 
 
 def _trino_user():
