@@ -59,8 +59,8 @@
       }
     },
     "sheets": {
-      "command": "python3",
-      "args": ["${CLAUDE_PROJECT_DIR:-.}/connectors/sheets_mcp.py"],
+      "command": "uv",
+      "args": ["run", "${CLAUDE_PROJECT_DIR:-.}/connectors/sheets_mcp.py"],
       "env": {
         "GOOGLE_SERVICE_ACCOUNT_FILE": "${GOOGLE_SA_FILE}",
         "GOOGLE_SHEETS_FOLDER_ID": "${GOOGLE_SHEETS_FOLDER_ID}"

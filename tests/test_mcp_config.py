@@ -55,6 +55,5 @@ def test_secrets_forbid_default():
 
 
 def test_local_scripts_exist():
-    # sheets_mcp.py делается в задаче 8, следующей за этой — не проверяем его здесь.
-    for name in ("trino_proxy.py", "superset_mcp.py"):
+    for name in ("trino_proxy.py", "superset_mcp.py", "sheets_mcp.py"):
         assert (REPO_ROOT / "connectors" / name).exists()
