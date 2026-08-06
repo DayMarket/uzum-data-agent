@@ -12,12 +12,16 @@
     },
     "clickhouse": {
       "command": "uvx",
-      "args": ["mcp-clickhouse"],
+      "args": ["--with", "pyarrow", "mcp-clickhouse"],
       "env": {
+        "MCP_TRANSPORT": "stdio",
         "CLICKHOUSE_HOST": "${CH_HOST}",
+        "CLICKHOUSE_PORT": "${CH_PORT:-8123}",
         "CLICKHOUSE_USER": "${CH_USER}",
         "CLICKHOUSE_PASSWORD": "${CH_PASSWORD}",
-        "CLICKHOUSE_SECURE": "${CH_SECURE:-false}"
+        "CLICKHOUSE_SECURE": "${CH_SECURE:-false}",
+        "CLICKHOUSE_VERIFY": "false",
+        "CHDB_ENABLED": "false"
       }
     },
     "trino": {
@@ -36,26 +40,27 @@
       }
     },
     "grafana": {
-      "command": "uvx",
-      "args": ["mcp-grafana"],
+      "command": "mcp-grafana",
+      "args": [],
       "env": {
         "GRAFANA_URL": "${GRAFANA_URL}",
-        "GRAFANA_API_KEY": "${GRAFANA_TOKEN}"
+        "GRAFANA_SERVICE_ACCOUNT_TOKEN": "${GRAFANA_TOKEN}"
       }
     },
     "openmetadata": {
       "command": "uvx",
-      "args": ["mcp-openmetadata"],
+      "args": ["--with", "fastmcp<2.4", "--with", "pydantic<2.9",
+               "--from", "mcp-openmetadata", "python", "-m", "mcp_openmetadata.server"],
       "env": {
-        "OPENMETADATA_URL": "${OMD_URL}",
+        "OPENMETADATA_URI": "${OMD_URL}",
         "OPENMETADATA_JWT_TOKEN": "${OMD_TOKEN}"
       }
     },
     "growthbook": {
-      "command": "uvx",
-      "args": ["mcp-growthbook"],
+      "command": "npx",
+      "args": ["-y", "@growthbook/mcp"],
       "env": {
-        "GROWTHBOOK_API_KEY": "${GROWTHBOOK_TOKEN}"
+        "GB_API_KEY": "${GROWTHBOOK_TOKEN}"
       }
     },
     "sheets": {

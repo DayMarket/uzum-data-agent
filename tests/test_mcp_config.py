@@ -67,6 +67,60 @@ def test_local_scripts_exist():
         assert (REPO_ROOT / "connectors" / name).exists()
 
 
+def test_no_server_is_launched_from_a_nonexistent_pypi_package():
+    """Находка финального ревью: `uvx mcp-grafana` и `uvx mcp-growthbook` —
+    пакетов с такими именами на PyPI нет (проверено `uvx ... --help`:
+    "was not found in the package registry"), а `uvx mcp-openmetadata`
+    ставится, но не даёт исполняемого файла ("does not provide any
+    executables"). Установка при этом проходила зелёной — коннекторы просто
+    не поднимались в сессии.
+    """
+    servers = CONFIG["mcpServers"]
+    assert servers["grafana"]["command"] == "mcp-grafana", (
+        "mcp-grafana — Go-бинарь (brew install mcp-grafana), не PyPI-пакет"
+    )
+    assert servers["growthbook"]["command"] == "npx"
+    assert "@growthbook/mcp" in servers["growthbook"]["args"]
+    omd_args = servers["openmetadata"]["args"]
+    assert omd_args[-2:] == ["-m", "mcp_openmetadata.server"], (
+        "у mcp-openmetadata нет console script — только запуск модулем"
+    )
+    for server in servers.values():
+        assert server["args"][:1] != ["mcp-grafana"]
+        assert server["args"][:1] != ["mcp-growthbook"]
+
+
+def test_connector_env_var_names_match_the_servers_we_actually_run():
+    """Имя переменной — часть контракта конкретного сервера, а не наше
+    соглашение: grafana/mcp-grafana читает GRAFANA_SERVICE_ACCOUNT_TOKEN
+    (GRAFANA_API_KEY он игнорирует), а настройки mcp-openmetadata собраны
+    с env_prefix="OPENMETADATA_" и полем `uri` — то есть OPENMETADATA_URI,
+    не OPENMETADATA_URL (иначе pydantic роняет сервер на старте).
+    """
+    servers = CONFIG["mcpServers"]
+    assert servers["grafana"]["env"]["GRAFANA_SERVICE_ACCOUNT_TOKEN"] == "${GRAFANA_TOKEN}"
+    assert "GRAFANA_API_KEY" not in servers["grafana"]["env"]
+    assert servers["openmetadata"]["env"]["OPENMETADATA_URI"] == "${OMD_URL}"
+    assert "OPENMETADATA_URL" not in servers["openmetadata"]["env"]
+    assert servers["growthbook"]["env"]["GB_API_KEY"] == "${GROWTHBOOK_TOKEN}"
+
+
+def test_clickhouse_keeps_the_battle_tested_parameter_set():
+    """Рабочий (проверенный боем) конфиг mcp-clickhouse запускается как
+    `uvx --with pyarrow mcp-clickhouse` и передаёт MCP_TRANSPORT, порт,
+    CLICKHOUSE_VERIFY и CHDB_ENABLED. Порт особенно важен: без него
+    коннектор идёт на дефолтный 8443, хотя мастер спрашивает порт и
+    проверяет им доступ.
+    """
+    ch = CONFIG["mcpServers"]["clickhouse"]
+    assert ch["args"] == ["--with", "pyarrow", "mcp-clickhouse"]
+    env = ch["env"]
+    assert env["MCP_TRANSPORT"] == "stdio"
+    assert env["CLICKHOUSE_PORT"] == "${CH_PORT:-8123}"
+    assert env["CLICKHOUSE_VERIFY"] == "false"
+    assert env["CHDB_ENABLED"] == "false"
+
+
 def test_clickhouse_secure_is_not_a_hardcoded_literal():
     """Регрессия на находку ревью задачи 9: CLICKHOUSE_SECURE был захардкожен
     `"true"`, хотя реальный ClickHouse-эндпоинт отвечает по http на 8123, а не

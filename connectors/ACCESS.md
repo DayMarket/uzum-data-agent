@@ -3,6 +3,7 @@
 | Что | Где взять | Сколько ждать |
 |---|---|---|
 | ClickHouse | Логин — корп-почта через дефис. Пароль — заявка в JSM, тип «Доступ к DWH» | до 1 дня |
+| Телеметрия | Отдельного доступа не нужно: те же логин и пароль ClickHouse | — |
 | Jira | Профиль → Personal Access Tokens → Create token | сразу |
 | Superset | Ничего вводить не нужно: вход через Keycloak SSO в браузере | сразу |
 | Trino | Ничего вводить не нужно: OAuth2 SSO в браузере при первом запросе | сразу |
@@ -14,13 +15,37 @@
 Netbird обязателен: прод ClickHouse, Trino, OpenMetadata и Grafana доступны только
 из корпоративной сети. Установка требует прав администратора на ноутбуке.
 
+## Хосты ClickHouse
+
+| Кластер | Хост | Порт | Для чего |
+|---|---|---|---|
+| WMS (склады) | `wms-clickhouse.prod.um.internal` | 8123 | основной для операционной аналитики; здесь же таблицы телеметрии `sandbox.ai_usage_*` |
+| DWH (общий) | `dwh-clickhouse.prod.um.internal` | 8123 | продажи, финансы, маркетинг |
+
+Домен `*.prod-data.internal.daymarket.uz` — это Trino, не ClickHouse.
+
+Телеметрия спрашивается отдельным вопросом мастера и по умолчанию идёт на WMS,
+даже если рабочим кластером выбран DWH: таблиц `sandbox.ai_usage_*` на DWH нет.
+Переподключить отдельно — `./setup.sh --add telemetry`.
+
+## Что должно быть на машине, кроме `uv`
+
+- `mcp-grafana` — Go-бинарь (`brew install mcp-grafana`), пакета с таким именем
+  на PyPI нет. Сервер читает токен из `GRAFANA_SERVICE_ACCOUNT_TOKEN`.
+- `npx` (Node.js 18+, `brew install node`) — только для GrowthBook: официальный
+  сервер это npm-пакет `@growthbook/mcp`, питоновского аналога нет.
+- OpenMetadata запускается модулем (`python -m mcp_openmetadata.server`), у пакета
+  нет исполняемого файла; версии `fastmcp` и `pydantic` пришлось прижать —
+  с текущими пакет падает на старте.
+
 ## Куда кладём секреты
 
 Все токены и пароли — в один файл `~/.config/uzum-ai/secrets.env` (не в git, не в
 `.mcp.json`). Формат — `KEY=VALUE`, по строке на секрет:
 
 ```
-CH_HOST=<хост из ответа на заявку JSM, вида имя.internal.daymarket.uz>
+CH_HOST=wms-clickhouse.prod.um.internal
+CH_PORT=8123
 CH_USER=имя-фамилия
 CH_PASSWORD=<пароль из той же заявки JSM>
 JIRA_URL=https://jira.uzum.com

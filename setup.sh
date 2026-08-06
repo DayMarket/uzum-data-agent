@@ -6,7 +6,8 @@
 #   ./setup.sh --add NAME   — настроить/переподключить один коннектор,
 #                             не трогая остальные (clickhouse, atlassian,
 #                             superset, trino, grafana, openmetadata,
-#                             growthbook, sheets)
+#                             growthbook, sheets), либо телеметрию:
+#                             ./setup.sh --add telemetry
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,6 +20,15 @@ SERVERS_LIST="clickhouse atlassian superset trino grafana openmetadata growthboo
 # пустой и включён `set -u` — поэтому везде ниже массив разворачивается только
 # через `[ "${#ENABLED[@]}" -gt 0 ]` или через явный псевдо-дефолт `:-`.
 ENABLED=()
+
+# Настраивается мастером, но не является MCP-сервером и не попадает в
+# enabledMcpjsonServers: телеметрия — это хуки, а не коннектор.
+EXTRAS_LIST="telemetry"
+
+# Смоук-тест рабочего ClickHouse прошёл в этом запуске (setup_clickhouse).
+# Нужен setup_telemetry: переиспользовать логин/пароль можно только если они
+# на этом хосте реально сработали, а не просто были введены.
+CH_OK=0
 
 say()  { printf "\n%s\n" "$1"; }
 ok()   { printf "  \xe2\x9c\x93 %s\n" "$1"; }
@@ -135,6 +145,23 @@ check_environment() {
     fail "Поставь: curl -LsSf https://astral.sh/uv/install.sh | sh — и запусти ./setup.sh заново"
     exit 1
   fi
+  # mcp-grafana — не PyPI-пакет, а Go-бинарь (репозиторий grafana/mcp-grafana,
+  # в homebrew-core). Раньше .mcp.json запускал его как `uvx mcp-grafana` —
+  # такого пакета на PyPI нет, коннектор не поднимался ни у кого, при этом
+  # смоук-тест токена ниже честно печатал «вижу организацию».
+  # Не фатально: без Grafana остальные семь коннекторов работают.
+  if command -v mcp-grafana >/dev/null 2>&1; then
+    ok "mcp-grafana найден"
+  else
+    fail "mcp-grafana не найден — коннектор grafana не поднимется. Поставь: brew install mcp-grafana"
+  fi
+  # npx нужен только growthbook: официальный сервер GrowthBook — npm-пакет
+  # @growthbook/mcp (node >= 18), питоновского аналога нет.
+  if command -v npx >/dev/null 2>&1; then
+    ok "npx найден"
+  else
+    fail "npx не найден — коннектор growthbook не поднимется. Поставь Node.js 18+: brew install node"
+  fi
   if pgrep -x netbird >/dev/null 2>&1; then
     ok "Netbird запущен"
   else
@@ -155,8 +182,10 @@ check_environment() {
 # смоук-тест здесь честно нашёл рабочую схему.
 setup_clickhouse() {
   say "── ClickHouse ── логин это корп-почта через дефис, пароль выдаётся заявкой в JSM"
-  read -rp "  Хост [clickhouse.prod-data.internal.daymarket.uz]: " CH_HOST
-  CH_HOST=${CH_HOST:-clickhouse.prod-data.internal.daymarket.uz}
+  printf "  Складской кластер (WMS) — основной для операционной аналитики: wms-clickhouse.prod.um.internal\n"
+  printf "  Общий DWH (продажи, финансы, маркетинг):                       dwh-clickhouse.prod.um.internal\n"
+  read -rp "  Хост [wms-clickhouse.prod.um.internal]: " CH_HOST
+  CH_HOST=${CH_HOST:-wms-clickhouse.prod.um.internal}
   read -rp "  Порт [8123]: " CH_PORT
   CH_PORT=${CH_PORT:-8123}
   read -rp "  Логин: " CH_USER
@@ -175,14 +204,11 @@ setup_clickhouse() {
   if [ "$http_code" = "200" ]; then
     ok "вижу $(cat "$http_out" 2>/dev/null) баз (по http, порт $CH_PORT)"
     put_env CH_HOST "$CH_HOST"
+    put_env CH_PORT "$CH_PORT"
     put_env CH_USER "$CH_USER"
     put_env CH_PASSWORD "$CH_PASSWORD"
     put_env CH_SECURE "false"
-    put_env TELEMETRY_CH_HOST "$CH_HOST"
-    put_env TELEMETRY_CH_USER "$CH_USER"
-    put_env TELEMETRY_CH_PASSWORD "$CH_PASSWORD"
-    put_env TELEMETRY_CH_PORT "$CH_PORT"
-    put_env TELEMETRY_CH_SECURE "false"
+    CH_OK=1
     ENABLED+=("clickhouse")
     return
   fi
@@ -195,14 +221,11 @@ setup_clickhouse() {
   if [ "$https_code" = "200" ]; then
     ok "вижу $(cat "$https_out" 2>/dev/null) баз (по https, порт $CH_PORT)"
     put_env CH_HOST "$CH_HOST"
+    put_env CH_PORT "$CH_PORT"
     put_env CH_USER "$CH_USER"
     put_env CH_PASSWORD "$CH_PASSWORD"
     put_env CH_SECURE "true"
-    put_env TELEMETRY_CH_HOST "$CH_HOST"
-    put_env TELEMETRY_CH_USER "$CH_USER"
-    put_env TELEMETRY_CH_PASSWORD "$CH_PASSWORD"
-    put_env TELEMETRY_CH_PORT "$CH_PORT"
-    put_env TELEMETRY_CH_SECURE "true"
+    CH_OK=1
     ENABLED+=("clickhouse")
     return
   fi
@@ -216,6 +239,76 @@ setup_clickhouse() {
     fail "$(head -c 300 "$https_out" 2>/dev/null)"
   fi
   fail "пропущено — подключить позже: ./setup.sh --add clickhouse"
+}
+
+# ── Телеметрия ───────────────────────────────────────────────────────────
+# Отдельный вопрос, а не «тот же хост, что и рабочий ClickHouse»: таблицы
+# sandbox.ai_usage_{sessions,events,verdicts} созданы ТОЛЬКО на складском
+# кластере (wms-clickhouse). Аналитик, который выбрал рабочим хостом
+# dwh-clickhouse, раньше получал TELEMETRY_CH_HOST=dwh-... — каждый INSERT
+# падал бы с «unknown table», а telemetry.write() по контракту не бросает
+# исключений и молча складывал бы строку в локальную очередь навсегда: ноль
+# телеметрии при зелёной установке.
+#
+# Поэтому и смоук-запрос здесь не «жив ли сервер» (SELECT count() FROM
+# system.databases отвечает на любом кластере), а SELECT count() FROM
+# sandbox.ai_usage_sessions — он проверяет ровно тот путь, которым пойдут
+# хуки: тот кластер, та база, та таблица, те права.
+setup_telemetry() {
+  say "── Телеметрия ── куда хуки пишут статистику работы (sandbox.ai_usage_*)"
+  printf "  Таблицы живут на складском кластере — обычно это дефолт ниже.\n"
+  read -rp "  Хост телеметрии [wms-clickhouse.prod.um.internal]: " T_HOST
+  T_HOST=${T_HOST:-wms-clickhouse.prod.um.internal}
+  read -rp "  Порт [8123]: " T_PORT
+  T_PORT=${T_PORT:-8123}
+
+  local T_USER T_PASSWORD
+  if [ "$CH_OK" = "1" ] && [ "$T_HOST" = "${CH_HOST:-}" ] && [ "$T_PORT" = "${CH_PORT:-}" ]; then
+    T_USER="$CH_USER"
+    T_PASSWORD="$CH_PASSWORD"
+    ok "тот же хост, что и рабочий ClickHouse — беру уже проверенный логин $T_USER"
+  else
+    read -rp "  Логин: " T_USER
+    read -rsp "  Пароль: " T_PASSWORD; echo
+  fi
+
+  local http_out https_out http_code https_code scheme
+  http_out="$(mk_tmp)"
+  http_code=$(curl_check "$http_out" 8 \
+    "http://$T_HOST:$T_PORT/?query=SELECT+count()+FROM+sandbox.ai_usage_sessions" \
+    "X-ClickHouse-User: $T_USER" "X-ClickHouse-Key: $T_PASSWORD")
+  scheme=""
+  if [ "$http_code" = "200" ]; then
+    scheme="false"
+  else
+    https_out="$(mk_tmp)"
+    https_code=$(curl_check "$https_out" 8 \
+      "https://$T_HOST:$T_PORT/?query=SELECT+count()+FROM+sandbox.ai_usage_sessions" \
+      "X-ClickHouse-User: $T_USER" "X-ClickHouse-Key: $T_PASSWORD")
+    if [ "$https_code" = "200" ]; then
+      scheme="true"
+      http_out="$https_out"
+    fi
+  fi
+
+  if [ -n "$scheme" ]; then
+    ok "sandbox.ai_usage_sessions на месте, строк: $(cat "$http_out" 2>/dev/null)"
+    put_env TELEMETRY_CH_HOST "$T_HOST"
+    put_env TELEMETRY_CH_PORT "$T_PORT"
+    put_env TELEMETRY_CH_USER "$T_USER"
+    put_env TELEMETRY_CH_PASSWORD "$T_PASSWORD"
+    put_env TELEMETRY_CH_SECURE "$scheme"
+    return
+  fi
+
+  # Ничего не записываем: без TELEMETRY_CH_HOST телеметрия просто выключена
+  # (см. Config.from_env в lib/telemetry.py). Это честнее, чем записать
+  # заведомо нерабочий хост и копить очередь на диске месяцами.
+  fail "таблица sandbox.ai_usage_sessions не ответила (http: $http_code, https: ${https_code:-—})"
+  if [ "$http_code" != "000" ]; then
+    fail "$(head -c 300 "$http_out" 2>/dev/null)"
+  fi
+  fail "телеметрия выключена — включить позже: ./setup.sh --add telemetry"
 }
 
 # ── Jira / Confluence (общий токен) ─────────────────────────────────────
@@ -387,8 +480,9 @@ run_server() {
     openmetadata) setup_openmetadata ;;
     growthbook)   setup_growthbook ;;
     sheets)       setup_sheets ;;
+    telemetry)    setup_telemetry ;;
     *)
-      printf "Неизвестный коннектор: %s\nДоступные: %s\n" "$1" "$SERVERS_LIST" >&2
+      printf "Неизвестный коннектор: %s\nДоступные: %s %s\n" "$1" "$SERVERS_LIST" "$EXTRAS_LIST" >&2
       exit 1
       ;;
   esac
@@ -402,7 +496,7 @@ case "${1:-}" in
     MODE="add"
     ADD_SERVER="${2:-}"
     if [ -z "$ADD_SERVER" ]; then
-      printf "Использование: ./setup.sh --add <коннектор>\nДоступные: %s\n" "$SERVERS_LIST" >&2
+      printf "Использование: ./setup.sh --add <коннектор>\nДоступные: %s %s\n" "$SERVERS_LIST" "$EXTRAS_LIST" >&2
       exit 1
     fi
     ;;
@@ -411,6 +505,7 @@ case "${1:-}" in
 Использование:
   ./setup.sh              полный мастер установки — все коннекторы за один заход
   ./setup.sh --add NAME   настроить/переподключить один коннектор ($SERVERS_LIST)
+                          либо телеметрию: ./setup.sh --add telemetry
 EOF
     exit 0
     ;;
@@ -422,6 +517,7 @@ if [ "$MODE" = "add" ]; then
   run_server "$ADD_SERVER"
 else
   setup_clickhouse
+  setup_telemetry
   setup_jira
   setup_superset
   setup_trino
