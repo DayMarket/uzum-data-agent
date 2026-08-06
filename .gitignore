@@ -1,0 +1,14 @@
+# личное рабочее место аналитика
+work/
+
+# локальная конфигурация Claude Code (включённые MCP-серверы)
+.claude/settings.local.json
+
+# сгенерированное
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# секретов здесь быть не должно вообще — они живут в ~/.config/uzum-ai/
+*.env
+*service-account*.json
