@@ -40,3 +40,18 @@ def test_sheets_connector_is_reachable_from_a_skill():
 def test_adhoc_export_knows_where_to_put_the_result():
     text = (SKILLS_DIR / "adhoc-export" / "SKILL.md").read_text(encoding="utf-8")
     assert "sheets" in text
+
+
+def test_readme_documents_how_to_run_the_suite_without_warnings():
+    """Набор гоняется через uv с современным интерпретатором: зависимости
+    коннекторов объявлены для `uv run`, а не для системного python3. Раньше
+    прогон давал три предупреждения из google-auth в системном Python 3.9 —
+    причина была не в нашем коде, а в том, чем его запускали."""
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "uv run --python 3.12" in readme
+    assert "--with pytest" in readme
+    # предупреждения не глушим конфигом: это спрятало бы сигнал
+    for name in ("pytest.ini", "setup.cfg", "pyproject.toml", "tox.ini"):
+        cfg = REPO_ROOT / name
+        if cfg.exists():
+            assert "filterwarnings" not in cfg.read_text(encoding="utf-8"), name
