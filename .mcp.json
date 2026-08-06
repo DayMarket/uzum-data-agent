@@ -1,0 +1,70 @@
+{
+  "mcpServers": {
+    "atlassian": {
+      "command": "uvx",
+      "args": ["mcp-atlassian"],
+      "env": {
+        "JIRA_URL": "${JIRA_URL}",
+        "JIRA_PERSONAL_TOKEN": "${JIRA_TOKEN}",
+        "CONFLUENCE_URL": "${CONFLUENCE_URL:-https://confluence.uzum.com}",
+        "CONFLUENCE_PERSONAL_TOKEN": "${JIRA_TOKEN}"
+      }
+    },
+    "clickhouse": {
+      "command": "uvx",
+      "args": ["mcp-clickhouse"],
+      "env": {
+        "CLICKHOUSE_HOST": "${CH_HOST}",
+        "CLICKHOUSE_USER": "${CH_USER}",
+        "CLICKHOUSE_PASSWORD": "${CH_PASSWORD}",
+        "CLICKHOUSE_SECURE": "true"
+      }
+    },
+    "trino": {
+      "command": "uv",
+      "args": ["run", "${CLAUDE_PROJECT_DIR:-.}/connectors/trino_proxy.py"],
+      "env": {
+        "TRINO_HOST": "${TRINO_HOST:-trino.prod-data.internal.daymarket.uz}",
+        "TRINO_CATALOG": "${TRINO_CATALOG:-dwh-iceberg}"
+      }
+    },
+    "superset": {
+      "command": "uv",
+      "args": ["run", "${CLAUDE_PROJECT_DIR:-.}/connectors/superset_mcp.py"],
+      "env": {
+        "SUPERSET_URL": "${SUPERSET_URL}"
+      }
+    },
+    "grafana": {
+      "command": "uvx",
+      "args": ["mcp-grafana"],
+      "env": {
+        "GRAFANA_URL": "${GRAFANA_URL}",
+        "GRAFANA_API_KEY": "${GRAFANA_TOKEN}"
+      }
+    },
+    "openmetadata": {
+      "command": "uvx",
+      "args": ["mcp-openmetadata"],
+      "env": {
+        "OPENMETADATA_URL": "${OMD_URL}",
+        "OPENMETADATA_JWT_TOKEN": "${OMD_TOKEN}"
+      }
+    },
+    "growthbook": {
+      "command": "uvx",
+      "args": ["mcp-growthbook"],
+      "env": {
+        "GROWTHBOOK_API_KEY": "${GROWTHBOOK_TOKEN}"
+      }
+    },
+    "sheets": {
+      "command": "python3",
+      "args": ["${CLAUDE_PROJECT_DIR:-.}/connectors/sheets_mcp.py"],
+      "env": {
+        "GOOGLE_SERVICE_ACCOUNT_FILE": "${GOOGLE_SA_FILE}",
+        "GOOGLE_SHEETS_FOLDER_ID": "${GOOGLE_SHEETS_FOLDER_ID}"
+      }
+    }
+  }
+}
