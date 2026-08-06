@@ -83,3 +83,20 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_verdicts ON CLUSTER default
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_verdicts', '{replica}')
 ORDER BY (jira_key, drafted_at);
+
+
+-- ── Что нужно применить на уже созданных таблицах ────────────────────────
+-- Выполняет человек с правами записи (MCP-сервер uzum-wms-clickhouse-write
+-- или клиент под учёткой с доступом на запись). Обе команды идемпотентны.
+--
+-- 1. Убрать колонку cost_usd: она всегда писалась нулём, из схемы и из хука
+--    удалена (см. комментарий выше).
+--
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default DROP COLUMN IF EXISTS cost_usd;
+--
+-- 2. Выкинуть три строки, вставленные при проверке схемы до перехода на UTC —
+--    по одной в каждой таблице:
+--
+--    ALTER TABLE sandbox.ai_usage_events   DELETE WHERE user = 'schema-check';
+--    ALTER TABLE sandbox.ai_usage_sessions DELETE WHERE user = 'schema-check';
+--    ALTER TABLE sandbox.ai_usage_verdicts DELETE WHERE user = 'schema-check';
