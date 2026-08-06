@@ -9,13 +9,23 @@
 -- HTTP-запрос — проверено эмпирически (см. task-3-report.md, раунд 4):
 -- без ON CLUSTER таблица была видна в system.tables через раз, в зависимости
 -- от того, какой хост ответил на запрос балансировщика.
+--
+-- Все колонки времени — DateTime('UTC') / DateTime64(3, 'UTC') явно.
+-- Причина: ноутбуки аналитиков не обязаны стоять в Asia/Tashkent (часовой
+-- пояс сервера ClickHouse), а наивная DateTime-строка без указания зоны
+-- интерпретируется ClickHouse в часовом поясе КОЛОНКИ, а не отправителя —
+-- при разных поясах машины и сервера события расходятся во времени молча,
+-- без единой ошибки на вставке или чтении (см. task-3-report.md, раунд 5).
+-- lib/telemetry.py.utc_now_str() формирует строки в UTC без суффикса зоны —
+-- ровно то, что здесь и ожидается. При чтении для дашбордов/отчётов в
+-- Ташкентском времени приводить явно: toTimeZone(col, 'Asia/Tashkent').
 
 CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
 (
     session_id   String,
     user         LowCardinality(String),
-    started_at   DateTime,
-    ended_at     DateTime,
+    started_at   DateTime('UTC'),
+    ended_at     DateTime('UTC'),
     duration_s   UInt32,
     jira_key     String,
     skills_used  Array(LowCardinality(String)),
@@ -28,7 +38,7 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
     repo_sha     String,
     end_reason   LowCardinality(String),
     transcript   String CODEC(ZSTD(3)),
-    inserted_at  DateTime DEFAULT now()
+    inserted_at  DateTime('UTC') DEFAULT now()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_sessions', '{replica}')
 PARTITION BY toYYYYMM(started_at)
@@ -37,7 +47,7 @@ TTL started_at + INTERVAL 12 MONTH;
 
 CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events ON CLUSTER default
 (
-    ts          DateTime64(3),
+    ts          DateTime64(3, 'UTC'),
     session_id  String,
     user        LowCardinality(String),
     event_type  LowCardinality(String),
@@ -46,7 +56,7 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events ON CLUSTER default
     duration_ms UInt32,
     ok          UInt8,
     error_text  String,
-    inserted_at DateTime DEFAULT now()
+    inserted_at DateTime('UTC') DEFAULT now()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_events', '{replica}')
 PARTITION BY toYYYYMM(ts)
@@ -59,11 +69,11 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_verdicts ON CLUSTER default
     session_id  String,
     user        LowCardinality(String),
     job         LowCardinality(String),
-    drafted_at  DateTime,
-    verdict_at  DateTime,
+    drafted_at  DateTime('UTC'),
+    verdict_at  DateTime('UTC'),
     verdict     LowCardinality(String),
     reason      String,
-    inserted_at DateTime DEFAULT now()
+    inserted_at DateTime('UTC') DEFAULT now()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_verdicts', '{replica}')
 ORDER BY (jira_key, drafted_at);

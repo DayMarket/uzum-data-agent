@@ -1,4 +1,5 @@
 # tests/test_telemetry.py
+import datetime
 import json
 import os
 
@@ -19,6 +20,55 @@ def test_config_reads_env(monkeypatch, tmp_path):
     assert cfg.enabled is True
     assert cfg.database == "sandbox"
     assert cfg.queue_dir == str(tmp_path / "queue")
+    assert cfg.secure is False  # дефолт: http, как у CLICKHOUSE_SECURE в .mcp.json
+    assert cfg.port == "8123"
+
+
+def test_post_uses_http_by_default_and_https_when_secure_true(monkeypatch, tmp_path):
+    """Реальный прод-эндпоинт — http://...:8123 (CLICKHOUSE_SECURE=false в
+    .mcp.json). _post раньше хардкодил https:// и вставка не проходила бы.
+    Схема и порт должны собираться из TELEMETRY_CH_SECURE/TELEMETRY_CH_PORT."""
+    _enable(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeResponse(object):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def fake_urlopen(req, timeout=None):
+        captured["url"] = req.full_url
+        return FakeResponse()
+
+    monkeypatch.setattr(telemetry.urllib.request, "urlopen", fake_urlopen)
+
+    # дефолт: TELEMETRY_CH_SECURE не задан -> http, порт из TELEMETRY_CH_PORT
+    # тоже не задан -> дефолтный 8123
+    cfg_http = telemetry.Config.from_env()
+    assert telemetry._post(cfg_http, "ai_usage_events", [{"n": 1}]) is True
+    assert captured["url"].startswith("http://ch.example.uz:8123/?")
+
+    # TELEMETRY_CH_SECURE=true -> https, порт из TELEMETRY_CH_PORT
+    monkeypatch.setenv("TELEMETRY_CH_SECURE", "true")
+    monkeypatch.setenv("TELEMETRY_CH_PORT", "8443")
+    cfg_https = telemetry.Config.from_env()
+    assert telemetry._post(cfg_https, "ai_usage_events", [{"n": 1}]) is True
+    assert captured["url"].startswith("https://ch.example.uz:8443/?")
+
+
+def test_utc_now_str_reflects_utc_not_local_time(monkeypatch):
+    """Контракт: время, которое формирует telemetry.py для колонок
+    DateTime('UTC')/DateTime64(3, 'UTC'), должно быть в UTC, а не в
+    локальном часовом поясе машины аналитика."""
+    fixed = datetime.datetime(2026, 8, 6, 12, 34, 56, 789000, tzinfo=datetime.timezone.utc)
+    monkeypatch.setattr(telemetry, "_utc_now", lambda: fixed)
+
+    assert telemetry.utc_now_str() == "2026-08-06 12:34:56"
+    assert telemetry.utc_now_str(milliseconds=True) == "2026-08-06 12:34:56.789"
 
 
 def test_write_queues_when_send_fails(monkeypatch, tmp_path):

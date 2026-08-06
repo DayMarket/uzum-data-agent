@@ -8,7 +8,19 @@
 Таблицы живут в базе `sandbox` (прав на CREATE DATABASE нет) с префиксом
 `ai_usage_` — вызывающий код передаёт полное имя таблицы с префиксом,
 например `write("ai_usage_events", row)`.
+
+Контракт по времени (обязателен для задач 4/5): все колонки времени в
+sql/schema.sql типизированы как DateTime('UTC') / DateTime64(3, 'UTC').
+Любая строка времени, которая пишется в ai_usage.* (ts, started_at,
+ended_at, drafted_at, verdict_at), должна быть посчитана в UTC —
+`datetime.datetime.now(datetime.timezone.utc)` — и отформатирована БЕЗ
+суффикса зоны тем же строковым форматом, что и раньше
+('%Y-%m-%d %H:%M:%S' или с тремя знаками миллисекунд). Используйте
+`utc_now_str()` из этого модуля, а не `datetime.now()`/`datetime.today()`:
+наивное локальное время ноутбука аналитика (который не обязан быть в
+Asia/Tashkent) даст рассинхрон с тем, что реально пишется в колонку.
 """
+import datetime
 import json
 import os
 import time
@@ -17,6 +29,7 @@ import urllib.parse
 import urllib.request
 
 DEFAULT_DB = "sandbox"
+DEFAULT_PORT = "8123"
 TIMEOUT_S = 4
 
 # Верхние границы на один вызов flush(), чтобы большая очередь или медленная
@@ -26,13 +39,19 @@ FLUSH_MAX_ROWS = 2000
 
 
 class Config(object):
-    def __init__(self, host, user, password, database, queue_dir, enabled):
+    def __init__(self, host, user, password, database, queue_dir, enabled,
+                 secure=False, port=DEFAULT_PORT):
         self.host = host
         self.user = user
         self.password = password
         self.database = database
         self.queue_dir = queue_dir
         self.enabled = enabled
+        # HTTPS/порт настраиваются отдельно от host, по образцу CLICKHOUSE_SECURE
+        # / CLICKHOUSE_PORT из .mcp.json — чтобы у аналитика не было двух разных
+        # имён одного и того же параметра.
+        self.secure = secure
+        self.port = port
 
     @classmethod
     def from_env(cls):
@@ -48,13 +67,36 @@ class Config(object):
             database=os.environ.get("TELEMETRY_CH_DB", DEFAULT_DB),
             queue_dir=os.path.join(state, "queue"),
             enabled=bool(host) and os.environ.get("TELEMETRY_ENABLED", "1") != "0",
+            secure=os.environ.get("TELEMETRY_CH_SECURE", "").strip().lower() == "true",
+            port=os.environ.get("TELEMETRY_CH_PORT", DEFAULT_PORT).strip() or DEFAULT_PORT,
         )
+
+
+def _utc_now():
+    """Текущий момент как aware datetime в UTC. Отдельная функция — чтобы
+    тесты могли зафиксировать конкретное значение через monkeypatch."""
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def utc_now_str(milliseconds=False):
+    """Текущее время в UTC строкой для колонок DateTime('UTC') /
+    DateTime64(3, 'UTC') — без суффикса зоны. См. контракт в докстринге
+    модуля."""
+    now = _utc_now()
+    if milliseconds:
+        return now.strftime("%Y-%m-%d %H:%M:%S.") + "%03d" % (now.microsecond // 1000)
+    return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _base_url(cfg):
+    scheme = "https" if cfg.secure else "http"
+    return "%s://%s:%s/" % (scheme, cfg.host, cfg.port)
 
 
 def _post(cfg, table, rows):
     """Отправить строки в ClickHouse. True — успех, False — нет."""
     query = "INSERT INTO %s.%s FORMAT JSONEachRow" % (cfg.database, table)
-    url = "https://%s/?%s" % (cfg.host, urllib.parse.urlencode({"query": query}))
+    url = _base_url(cfg) + "?" + urllib.parse.urlencode({"query": query})
     body = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-ClickHouse-User", cfg.user)
