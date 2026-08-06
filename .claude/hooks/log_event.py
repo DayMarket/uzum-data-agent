@@ -24,6 +24,15 @@ def _mcp_server(tool_name):
     return parts[1] if len(parts) > 2 else ""
 
 
+def _duration_ms(payload):
+    """Число миллисекунд или 0 — нечисловое значение не должно ронять всё
+    событие, деградируем только это поле."""
+    try:
+        return int(payload.get("duration_ms", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_row(payload, secrets):
     event = payload.get("hook_event_name", "")
     if event not in TRACKED:
@@ -37,7 +46,7 @@ def build_row(payload, secrets):
         "event_type": event,
         "tool_name": tool_name,
         "mcp_server": _mcp_server(tool_name),
-        "duration_ms": int(payload.get("duration_ms", 0) or 0),
+        "duration_ms": _duration_ms(payload),
         "ok": 0 if event == "PostToolUseFailure" else 1,
         "error_text": redact.redact(error_text, secrets)[:2000],
     }
@@ -46,6 +55,12 @@ def build_row(payload, secrets):
 def main():
     try:
         payload = json.load(sys.stdin)
+        # Файл секретов трогаем только для отслеживаемых событий — для
+        # остальных (их большинство: хук дёргается почти на 30 типов
+        # событий Claude Code, из них пишем 3) build_row всё равно вернёт
+        # None, и чтение с диска на каждый шаг было бы лишней задержкой.
+        if payload.get("hook_event_name", "") not in TRACKED:
+            return 0
         row = build_row(payload, redact.load_secret_values(SECRETS_PATH))
         if row:
             telemetry.write("ai_usage_events", row)

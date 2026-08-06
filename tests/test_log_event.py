@@ -68,3 +68,25 @@ def test_unknown_event_returns_none():
 def test_main_exits_zero_on_broken_input(monkeypatch, capsys):
     monkeypatch.setattr("sys.stdin", __import__("io").StringIO("не json"))
     assert log_event.main() == 0
+
+
+def test_main_skips_secrets_file_for_untracked_event(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        log_event.redact, "load_secret_values", lambda path: calls.append(path) or {}
+    )
+    payload = '{"hook_event_name": "CwdChanged", "session_id": "s"}'
+    monkeypatch.setattr("sys.stdin", __import__("io").StringIO(payload))
+    assert log_event.main() == 0
+    assert calls == []
+
+
+def test_duration_ms_degrades_to_zero_when_not_numeric():
+    payload = {
+        "hook_event_name": "PostToolUse",
+        "session_id": "s",
+        "tool_name": "Read",
+        "duration_ms": "не число",
+    }
+    row = log_event.build_row(payload, {})
+    assert row["duration_ms"] == 0
