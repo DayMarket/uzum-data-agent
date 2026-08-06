@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# Мастер установки: спрашивает доступы и проверяет каждый живым запросом.
+#
+# Запуск:
+#   ./setup.sh              — полный мастер, все коннекторы за один заход
+#   ./setup.sh --add NAME   — настроить/переподключить один коннектор,
+#                             не трогая остальные (clickhouse, atlassian,
+#                             superset, trino, grafana, openmetadata,
+#                             growthbook, sheets)
+set -uo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SECRETS="$HOME/.config/uzum-ai/secrets.env"
+SETTINGS_LOCAL="$REPO_DIR/.claude/settings.local.json"
+SERVERS_LIST="clickhouse atlassian superset trino grafana openmetadata growthbook sheets"
+
+# Коннекторы, включённые за этот запуск. Bash 3.2 (дефолтный на macOS) роняет
+# скрипт с "unbound variable" на "${ENABLED[@]}"/"${ENABLED[*]}", если массив
+# пустой и включён `set -u` — поэтому везде ниже массив разворачивается только
+# через `[ "${#ENABLED[@]}" -gt 0 ]` или через явный псевдо-дефолт `:-`.
+ENABLED=()
+
+say()  { printf "\n%s\n" "$1"; }
+ok()   { printf "  \xe2\x9c\x93 %s\n" "$1"; }
+fail() { printf "  \xe2\x9c\x97 %s\n" "$1"; }
+
+# Значение уходит в python не через подстановку в исходный код (это ломается
+# на паролях с кавычками), а через переменную окружения — python читает её
+# через os.environ, шелл ничего не интерполирует внутрь строки.
+put_env() {
+  PUT_ENV_KEY="$1" PUT_ENV_VALUE="$2" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import setup_helpers
+setup_helpers.write_env('$SECRETS', {os.environ['PUT_ENV_KEY']: os.environ['PUT_ENV_VALUE']})
+"
+}
+
+# Пишет итоговый список включённых серверов, объединяя с уже включёнными
+# раньше (а не затирая их) — иначе ./setup.sh --add одного коннектора молча
+# выключил бы все остальные, настроенные в прошлый раз.
+write_enabled() {
+  local existing joined x
+  existing="$(python3 -c "
+import json, os
+p = '$SETTINGS_LOCAL'
+if os.path.exists(p):
+    try:
+        data = json.load(open(p, encoding='utf-8'))
+        print(chr(10).join(data.get('enabledMcpjsonServers', [])))
+    except Exception:
+        pass
+")"
+  joined="$existing"
+  if [ "${#ENABLED[@]}" -gt 0 ]; then
+    for x in "${ENABLED[@]}"; do
+      joined="$joined
+$x"
+    done
+  fi
+  UZUM_SERVERS="$joined" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import setup_helpers
+servers = [s for s in os.environ.get('UZUM_SERVERS', '').split(chr(10)) if s.strip()]
+setup_helpers.write_enabled_servers('$SETTINGS_LOCAL', servers)
+"
+}
+
+check_environment() {
+  say "Проверяю окружение…"
+  if command -v claude >/dev/null 2>&1; then
+    ok "claude найден"
+  else
+    fail "Claude Code не установлен: https://claude.com/code"
+    exit 1
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    ok "python3 найден"
+  else
+    fail "нужен python3"
+    exit 1
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    ok "curl найден"
+  else
+    fail "нужен curl — без него мастер не может проверить ни один доступ"
+    exit 1
+  fi
+  # uv обязателен: коннекторы trino/superset/sheets запускаются через
+  # `uv run`, остальные пять — через `uvx`. Без uv не поднимется ни один.
+  if command -v uv >/dev/null 2>&1 && command -v uvx >/dev/null 2>&1; then
+    ok "uv найден"
+  else
+    fail "uv не найден — без него не поднимется ни один из восьми коннекторов"
+    fail "Поставь: curl -LsSf https://astral.sh/uv/install.sh | sh — и запусти ./setup.sh заново"
+    exit 1
+  fi
+  if pgrep -x netbird >/dev/null 2>&1; then
+    ok "Netbird запущен"
+  else
+    fail "Netbird не запущен — без него не будет доступа к прод-данным (ClickHouse, Trino, OpenMetadata, Grafana). Инструкция: connectors/ACCESS.md"
+  fi
+}
+
+# ── ClickHouse ───────────────────────────────────────────────────────────
+# Реальный HTTP-интерфейс ClickHouse — http, порт 8123 (не https из брифа:
+# тот же дефект уже находили в lib/telemetry.py, из-за него не доходило ни
+# одной строки телеметрии). Порт спрашиваем, а не хардкодим, и подбираем
+# схему по факту ответа, а не гадаем — https пробуем вторым номером.
+setup_clickhouse() {
+  say "── ClickHouse ── логин это корп-почта через дефис, пароль выдаётся заявкой в JSM"
+  read -rp "  Хост [clickhouse.prod-data.internal.daymarket.uz]: " CH_HOST
+  CH_HOST=${CH_HOST:-clickhouse.prod-data.internal.daymarket.uz}
+  read -rp "  Порт [8123]: " CH_PORT
+  CH_PORT=${CH_PORT:-8123}
+  read -rp "  Логин: " CH_USER
+  read -rsp "  Пароль: " CH_PASSWORD; echo
+
+  # Пробуем каждую схему в свой файл — иначе при обрыве соединения на втором
+  # запросе (например https, если сервер вообще не говорит по TLS) curl не
+  # трогает файл первого запроса, и в диагностике легко перепутать код одной
+  # попытки с телом ответа другой.
+  local http_code https_code
+  http_code=$(curl -sS --max-time 8 -o /tmp/uzum_ch_check_http -w "%{http_code}" \
+    -H "X-ClickHouse-User: $CH_USER" -H "X-ClickHouse-Key: $CH_PASSWORD" \
+    "http://$CH_HOST:$CH_PORT/?query=SELECT+count()+FROM+system.databases" \
+    2>/tmp/uzum_ch_err_http)
+
+  if [ "$http_code" = "200" ]; then
+    ok "вижу $(cat /tmp/uzum_ch_check_http 2>/dev/null) баз (по http, порт $CH_PORT)"
+    put_env CH_HOST "$CH_HOST"
+    put_env CH_USER "$CH_USER"
+    put_env CH_PASSWORD "$CH_PASSWORD"
+    put_env TELEMETRY_CH_HOST "$CH_HOST"
+    put_env TELEMETRY_CH_USER "$CH_USER"
+    put_env TELEMETRY_CH_PASSWORD "$CH_PASSWORD"
+    put_env TELEMETRY_CH_PORT "$CH_PORT"
+    put_env TELEMETRY_CH_SECURE "false"
+    ENABLED+=("clickhouse")
+    return
+  fi
+
+  https_code=$(curl -sS --max-time 8 -o /tmp/uzum_ch_check_https -w "%{http_code}" \
+    -H "X-ClickHouse-User: $CH_USER" -H "X-ClickHouse-Key: $CH_PASSWORD" \
+    "https://$CH_HOST:$CH_PORT/?query=SELECT+count()+FROM+system.databases" \
+    2>/tmp/uzum_ch_err_https)
+
+  if [ "$https_code" = "200" ]; then
+    ok "вижу $(cat /tmp/uzum_ch_check_https 2>/dev/null) баз (по https, порт $CH_PORT)"
+    put_env CH_HOST "$CH_HOST"
+    put_env CH_USER "$CH_USER"
+    put_env CH_PASSWORD "$CH_PASSWORD"
+    put_env TELEMETRY_CH_HOST "$CH_HOST"
+    put_env TELEMETRY_CH_USER "$CH_USER"
+    put_env TELEMETRY_CH_PASSWORD "$CH_PASSWORD"
+    put_env TELEMETRY_CH_PORT "$CH_PORT"
+    put_env TELEMETRY_CH_SECURE "true"
+    ENABLED+=("clickhouse")
+    return
+  fi
+
+  fail "не подключился ни по http (код: $http_code), ни по https (код: $https_code) на $CH_HOST:$CH_PORT"
+  # Показываем текст той попытки, которая реально дошла до сервера (код не
+  # 000) — там настоящая причина отказа, а не обрыв TCP/TLS соединения.
+  if [ "$http_code" != "000" ]; then
+    fail "$(head -c 300 /tmp/uzum_ch_check_http 2>/dev/null)"
+  elif [ "$https_code" != "000" ]; then
+    fail "$(head -c 300 /tmp/uzum_ch_check_https 2>/dev/null)"
+  fi
+  fail "пропущено — подключить позже: ./setup.sh --add clickhouse"
+}
+
+# ── Jira / Confluence (общий токен) ─────────────────────────────────────
+setup_jira() {
+  say "── Jira ── Профиль → Personal Access Tokens → Create token"
+  read -rsp "  Токен: " JIRA_TOKEN; echo
+  local code name
+  code=$(curl -sS --max-time 10 -o /tmp/uzum_jira_check -w "%{http_code}" \
+    -H "Authorization: Bearer $JIRA_TOKEN" \
+    "https://jira.uzum.com/rest/api/2/myself" 2>/tmp/uzum_jira_check_err)
+  if [ "$code" = "200" ]; then
+    name=$(python3 -c "import json;print(json.load(open('/tmp/uzum_jira_check'))['displayName'])" 2>/dev/null || echo "пользователя")
+    ok "вижу тебя как $name"
+    put_env JIRA_TOKEN "$JIRA_TOKEN"
+    ENABLED+=("atlassian")
+  else
+    fail "токен не принят (код: $code)"
+    fail "пропущено — подключить позже: ./setup.sh --add atlassian"
+  fi
+}
+
+# ── Superset ── SSO, но SUPERSET_URL — обязательная переменная в .mcp.json
+# без дефолта: без неё superset_mcp.py падает на старте, а не "не смог
+# подключиться" — поэтому URL всё равно нужно записать, даже без кредов.
+setup_superset() {
+  say "── Superset ── кредов не нужно, вход через Keycloak SSO в браузере при первом обращении"
+  read -rp "  URL Superset [https://bi.uzum.uz]: " SUPERSET_URL
+  SUPERSET_URL=${SUPERSET_URL:-https://bi.uzum.uz}
+  put_env SUPERSET_URL "$SUPERSET_URL"
+  ENABLED+=("superset")
+  ok "включён"
+}
+
+# ── Trino ── тоже SSO. TRINO_USER не идёт через .mcp.json (это не секрет),
+# его trino_proxy.py читает из secrets.env сам при первом запросе — если не
+# указать, коннектор поднимется, но первый же запрос упадёт с понятной
+# ошибкой вместо тихого молчания.
+setup_trino() {
+  say "── Trino ── кредов не нужно, OAuth2 SSO в браузере при первом запросе"
+  read -rp "  Твой корп. email (для атрибуции запросов, Enter — пропустить): " TRINO_USER
+  if [ -n "$TRINO_USER" ]; then
+    put_env TRINO_USER "$TRINO_USER"
+    ok "включён"
+  else
+    fail "email не указан — Trino всё равно включится, но первый запрос упадёт с понятной ошибкой, пока не добавишь TRINO_USER в $SECRETS"
+  fi
+  ENABLED+=("trino")
+}
+
+# ── Grafana ── GRAFANA_URL тоже обязателен и без дефолта в .mcp.json, а в
+# брифе его никто не спрашивал — добавляю запрос URL, иначе включённый
+# коннектор гарантированно не поднимется.
+setup_grafana() {
+  say "── Grafana ── сервисный токен у платформы (URL приходит вместе с ним)"
+  read -rp "  URL Grafana (Enter — пропустить): " GRAFANA_URL
+  if [ -z "$GRAFANA_URL" ]; then
+    fail "пропущено — подключить позже: ./setup.sh --add grafana"
+    return
+  fi
+  read -rsp "  Токен: " GRAFANA_TOKEN; echo
+  local code org
+  code=$(curl -sS --max-time 10 -o /tmp/uzum_grafana_check -w "%{http_code}" \
+    -H "Authorization: Bearer $GRAFANA_TOKEN" \
+    "${GRAFANA_URL%/}/api/org" 2>/tmp/uzum_grafana_check_err)
+  if [ "$code" = "200" ]; then
+    org=$(python3 -c "import json;print(json.load(open('/tmp/uzum_grafana_check')).get('name','?'))" 2>/dev/null || echo "?")
+    ok "вижу организацию $org"
+    put_env GRAFANA_URL "$GRAFANA_URL"
+    put_env GRAFANA_TOKEN "$GRAFANA_TOKEN"
+    ENABLED+=("grafana")
+  else
+    fail "токен не принят (код: $code)"
+    fail "пропущено — подключить позже: ./setup.sh --add grafana"
+  fi
+}
+
+# ── OpenMetadata ── тот же случай, что и с Grafana: OMD_URL обязателен и
+# без дефолта, брифом не спрашивался.
+setup_openmetadata() {
+  say "── OpenMetadata ── Профиль → Access Token (URL — спроси в платформе, если нет под рукой)"
+  read -rp "  URL OpenMetadata (Enter — пропустить): " OMD_URL
+  if [ -z "$OMD_URL" ]; then
+    fail "пропущено — подключить позже: ./setup.sh --add openmetadata"
+    return
+  fi
+  read -rsp "  Токен: " OMD_TOKEN; echo
+  local code who
+  code=$(curl -sS --max-time 10 -o /tmp/uzum_omd_check -w "%{http_code}" \
+    -H "Authorization: Bearer $OMD_TOKEN" \
+    "${OMD_URL%/}/api/v1/users/loggedInUser" 2>/tmp/uzum_omd_check_err)
+  if [ "$code" = "200" ]; then
+    who=$(python3 -c "import json;print(json.load(open('/tmp/uzum_omd_check')).get('name','?'))" 2>/dev/null || echo "?")
+    ok "вижу тебя как $who"
+    put_env OMD_URL "$OMD_URL"
+    put_env OMD_TOKEN "$OMD_TOKEN"
+    ENABLED+=("openmetadata")
+  else
+    fail "токен не принят (код: $code)"
+    fail "пропущено — подключить позже: ./setup.sh --add openmetadata"
+  fi
+}
+
+# ── GrowthBook ── у GROWTHBOOK_TOKEN нет своего URL в .mcp.json (адрес API
+# зашит внутри самого mcp-growthbook), поэтому в отличие от Grafana/OMD
+# здесь живым запросом проверить нечего — принимаем токен как есть, как и
+# было в брифе, и проверка перенесётся на первое обращение внутри сессии.
+setup_growthbook() {
+  say "── GrowthBook ── Settings → API Keys → read-only ключ"
+  read -rsp "  Токен (Enter — пропустить): " GROWTHBOOK_TOKEN; echo
+  if [ -n "$GROWTHBOOK_TOKEN" ]; then
+    put_env GROWTHBOOK_TOKEN "$GROWTHBOOK_TOKEN"
+    ENABLED+=("growthbook")
+    ok "записан — по-настоящему проверится при первом обращении в сессии"
+  else
+    fail "пропущено — подключить позже: ./setup.sh --add growthbook"
+  fi
+}
+
+# ── Google Sheets ── живой запрос к Google из bash нецелесообразен (подпись
+# JWT сервисного аккаунта завязана на google-auth, см. connectors/ACCESS.md),
+# поэтому вместо "ok"/"fail по факту существования файла" — разбираем сам
+# файл и показываем email сервисного аккаунта, чтобы ошибка (не тот файл,
+# битый JSON, не тот тип ключа) была видна сразу, а не при первом запросе.
+setup_sheets() {
+  say "── Google Sheets ── файл сервисного аккаунта — у Насти"
+  read -rp "  Путь к файлу (Enter — пропустить): " GOOGLE_SA_FILE
+  if [ -z "$GOOGLE_SA_FILE" ]; then
+    fail "пропущено — подключить позже: ./setup.sh --add sheets"
+    return
+  fi
+  GOOGLE_SA_FILE="${GOOGLE_SA_FILE/#\~/$HOME}"
+  if [ ! -f "$GOOGLE_SA_FILE" ]; then
+    fail "файла нет: $GOOGLE_SA_FILE"
+    fail "пропущено — подключить позже: ./setup.sh --add sheets"
+    return
+  fi
+  local email
+  email=$(GOOGLE_SA_FILE_PATH="$GOOGLE_SA_FILE" python3 -c "
+import json, os
+try:
+    data = json.load(open(os.environ['GOOGLE_SA_FILE_PATH'], encoding='utf-8'))
+    if data.get('type') != 'service_account' or not data.get('private_key'):
+        raise ValueError('это не похоже на ключ сервисного аккаунта')
+    print(data['client_email'])
+except Exception as e:
+    print('ERROR:' + str(e))
+" 2>/dev/null)
+  case "$email" in
+    ERROR:*|"")
+      fail "файл не подходит: ${email#ERROR:}"
+      fail "пропущено — подключить позже: ./setup.sh --add sheets"
+      return
+      ;;
+  esac
+  read -rp "  ID папки для таблиц (из URL: drive.google.com/drive/folders/ЭТОТ_ID): " GOOGLE_SHEETS_FOLDER_ID
+  put_env GOOGLE_SA_FILE "$GOOGLE_SA_FILE"
+  put_env GOOGLE_SHEETS_FOLDER_ID "$GOOGLE_SHEETS_FOLDER_ID"
+  ENABLED+=("sheets")
+  ok "сервисный аккаунт: $email — не забудь расшарить на него папку с таблицами"
+}
+
+run_server() {
+  case "$1" in
+    clickhouse)   setup_clickhouse ;;
+    atlassian)    setup_jira ;;
+    superset)     setup_superset ;;
+    trino)        setup_trino ;;
+    grafana)      setup_grafana ;;
+    openmetadata) setup_openmetadata ;;
+    growthbook)   setup_growthbook ;;
+    sheets)       setup_sheets ;;
+    *)
+      printf "Неизвестный коннектор: %s\nДоступные: %s\n" "$1" "$SERVERS_LIST" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# ── разбор аргументов ────────────────────────────────────────────────────
+MODE="full"
+ADD_SERVER=""
+case "${1:-}" in
+  --add)
+    MODE="add"
+    ADD_SERVER="${2:-}"
+    if [ -z "$ADD_SERVER" ]; then
+      printf "Использование: ./setup.sh --add <коннектор>\nДоступные: %s\n" "$SERVERS_LIST" >&2
+      exit 1
+    fi
+    ;;
+  --help|-h)
+    cat <<EOF
+Использование:
+  ./setup.sh              полный мастер установки — все коннекторы за один заход
+  ./setup.sh --add NAME   настроить/переподключить один коннектор ($SERVERS_LIST)
+EOF
+    exit 0
+    ;;
+esac
+
+check_environment
+
+if [ "$MODE" = "add" ]; then
+  run_server "$ADD_SERVER"
+else
+  setup_clickhouse
+  setup_jira
+  setup_superset
+  setup_trino
+  setup_grafana
+  setup_openmetadata
+  setup_growthbook
+  setup_sheets
+fi
+
+write_enabled
+
+mkdir -p "$HOME/.local/bin"
+ln -sf "$REPO_DIR/bin/uzum" "$HOME/.local/bin/uzum"
+chmod +x "$REPO_DIR/bin/uzum" "$REPO_DIR/setup.sh" 2>/dev/null || true
+
+say "Готово. Включено в этом запуске: ${#ENABLED[@]}"
+
+if ! command -v uzum >/dev/null 2>&1; then
+  say "Команда uzum пока не видна в PATH."
+  cat <<EOF
+  Добавь в ~/.zshrc (или ~/.bashrc) и открой новый терминал:
+    export PATH="\$HOME/.local/bin:\$PATH"
+  Либо запускай сразу так: $HOME/.local/bin/uzum
+EOF
+fi
+
+cat <<'EOF'
+
+ВАЖНО: при первом запуске Claude Code спросит, доверяешь ли ты этой папке —
+ответь «да» (Yes, proceed). Клонированный репозиторий не может сам одобрить
+свои же MCP-серверы: если ответить «нет» или пропустить диалог, ни один
+коннектор не поднимется, хотя всё настроено правильно.
+
+Запускай:       uzum
+Первая задача:  /task <ключ задачи из Jira>
+Если сломалось: /fix-access прямо в сессии
+Добавить доступ позже: ./setup.sh --add <коннектор>
+EOF
