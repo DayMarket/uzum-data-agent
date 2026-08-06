@@ -78,6 +78,25 @@ def test_utc_now_str_reflects_utc_not_local_time(monkeypatch):
     assert telemetry.utc_now_str(milliseconds=True) == "2026-08-06 12:34:56.789"
 
 
+def test_format_utc_formats_arbitrary_datetime_not_just_now():
+    """format_utc() — единственное место в репозитории, где определён формат
+    строк времени для DateTime('UTC'): utc_now_str() форматирует "сейчас"
+    через него же. Он нужен и коду, которому надо отформатировать НЕ текущий
+    момент (например, log_session.py форматирует started_at — время начала
+    сессии, прочитанное из файла, а не "сейчас")."""
+    dt = datetime.datetime(2020, 1, 2, 3, 4, 5, 6000, tzinfo=datetime.timezone.utc)
+    assert telemetry.format_utc(dt) == "2020-01-02 03:04:05"
+    assert telemetry.format_utc(dt, milliseconds=True) == "2020-01-02 03:04:05.006"
+
+
+def test_format_utc_converts_non_utc_aware_datetime_to_utc():
+    """Aware datetime в другом поясе должен быть приведён к UTC перед
+    форматированием, а не отформатирован "как есть"."""
+    tz = datetime.timezone(datetime.timedelta(hours=5))  # Asia/Tashkent, UTC+5
+    dt = datetime.datetime(2020, 1, 2, 8, 4, 5, tzinfo=tz)
+    assert telemetry.format_utc(dt) == "2020-01-02 03:04:05"
+
+
 def test_utc_now_returns_utc_aware_datetime():
     """Регрессионный тест на саму _utc_now() — без подмены. Если её тело
     откатить к datetime.datetime.now() (наивное локальное время машины,

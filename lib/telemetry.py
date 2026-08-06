@@ -78,14 +78,24 @@ def _utc_now():
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def format_utc(dt, milliseconds=False):
+    """Отформатировать aware datetime в UTC строкой для колонок DateTime('UTC') /
+    DateTime64(3, 'UTC') — без суффикса зоны. Единственное место в репозитории,
+    где определён этот формат: utc_now_str() и любой код, которому нужно
+    отформатировать НЕ текущий момент (например, время начала сессии,
+    прочитанное из файла), должны использовать эту функцию, а не
+    переизобретать strftime на местах."""
+    dt = dt.astimezone(datetime.timezone.utc)
+    if milliseconds:
+        return dt.strftime("%Y-%m-%d %H:%M:%S.") + "%03d" % (dt.microsecond // 1000)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+
 def utc_now_str(milliseconds=False):
     """Текущее время в UTC строкой для колонок DateTime('UTC') /
     DateTime64(3, 'UTC') — без суффикса зоны. См. контракт в докстринге
     модуля."""
-    now = _utc_now()
-    if milliseconds:
-        return now.strftime("%Y-%m-%d %H:%M:%S.") + "%03d" % (now.microsecond // 1000)
-    return now.strftime("%Y-%m-%d %H:%M:%S")
+    return format_utc(_utc_now(), milliseconds)
 
 
 def _base_url(cfg):
