@@ -34,7 +34,13 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
     tokens_in    UInt64,
     tokens_out   UInt64,
     tokens_cache UInt64,
-    cost_usd     Decimal(10, 4),
+    -- Колонки cost_usd здесь нет намеренно. Она была, но всегда писалась
+    -- нулём: считать стоимость честно значит вести прайс по идентификаторам
+    -- моделей из транскрипта (claude-opus-4-8, claude-fable-5, <synthetic>),
+    -- держать его в актуальном состоянии и обновлять историю при смене
+    -- тарифа. Пустая колонка «стоимость» в отчётности хуже отсутствующей:
+    -- по ней строят выводы. Токены (in/out/cache) пишутся точно — стоимость
+    -- считается по ним запросом, когда прайс понадобится.
     repo_sha     String,
     end_reason   LowCardinality(String),
     transcript   String CODEC(ZSTD(3)),

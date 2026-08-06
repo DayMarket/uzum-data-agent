@@ -27,15 +27,37 @@ def test_builds_row_for_tool_call():
 
 
 def test_marks_failure_and_keeps_error_text():
+    """Поле называется `error`, а не `tool_error`.
+
+    Схема события PostToolUseFailure зашита в самом Claude Code:
+      hook_event_name: literal("PostToolUseFailure"), tool_name: string,
+      tool_input: unknown, tool_use_id: string, error: string,
+      is_interrupt?: boolean, duration_ms?: number
+    Поля tool_error там нет вовсе — до этой правки колонка error_text
+    оставалась пустой всегда, а тест был зелёным, потому что сам подавал
+    выдуманное поле.
+    """
     payload = {
         "hook_event_name": "PostToolUseFailure",
         "session_id": "s-1",
         "tool_name": "Bash",
-        "tool_error": "connection refused",
+        "error": "connection refused",
     }
     row = log_event.build_row(payload, {})
     assert row["ok"] == 0
     assert row["error_text"] == "connection refused"
+
+
+def test_invented_tool_error_field_is_not_a_source_of_error_text():
+    """Страж от возврата к выдуманному имени поля: если код снова начнёт
+    читать tool_error, тест на настоящем `error` пройдёт, а этот — нет."""
+    payload = {
+        "hook_event_name": "PostToolUseFailure",
+        "session_id": "s-1",
+        "tool_name": "Bash",
+        "tool_error": "это поле Claude Code не присылает",
+    }
+    assert log_event.build_row(payload, {})["error_text"] == ""
 
 
 def test_native_tool_has_empty_mcp_server():

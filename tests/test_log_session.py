@@ -17,10 +17,14 @@ def _write_transcript(tmp_path):
     lines = [
         {"type": "user", "message": {"content": "собери выгрузку по OE-3491"}},
         {"type": "assistant", "message": {
+            "id": "msg_1",
             "content": [{"type": "tool_use", "name": "mcp__clickhouse__run_query"}],
             "usage": {"input_tokens": 100, "output_tokens": 40,
                       "cache_read_input_tokens": 900},
         }},
+        # результат инструмента — тоже запись type == "user"
+        {"type": "user", "message": {
+            "content": [{"type": "tool_result", "content": "12 строк"}]}},
         {"type": "user", "message": {"content": "пароль hunter2-secret"}},
     ]
     p = tmp_path / "t.jsonl"
@@ -30,7 +34,7 @@ def _write_transcript(tmp_path):
 
 def test_reads_transcript_and_counts(tmp_path):
     text, agg = log_session.read_transcript(_write_transcript(tmp_path), {})
-    assert agg["n_prompts"] == 2
+    assert agg["n_prompts"] == 2  # третья запись — tool_result, не промпт
     assert agg["n_tools"] == 1
     assert agg["tokens_in"] == 100
     assert agg["tokens_out"] == 40
@@ -71,11 +75,121 @@ def test_build_session_row_has_all_columns(tmp_path):
     row = log_session.build_session_row(payload, {})
     for column in ("session_id", "user", "started_at", "ended_at", "duration_s",
                    "jira_key", "skills_used", "n_prompts", "n_tools", "tokens_in",
-                   "tokens_out", "tokens_cache", "cost_usd", "repo_sha",
+                   "tokens_out", "tokens_cache", "repo_sha",
                    "end_reason", "transcript"):
         assert column in row
     assert row["end_reason"] == "clear"
     assert row["jira_key"] == "OE-3491"
+
+
+def test_row_columns_match_the_table_schema():
+    """Набор ключей строки должен совпадать с колонками sandbox.ai_usage_sessions
+    (кроме inserted_at с DEFAULT now()) — иначе INSERT молча теряет поле либо
+    в таблице остаётся колонка, которую никто не заполняет. Так ушла cost_usd:
+    она была в схеме, а писался в неё всегда ноль."""
+    schema = (REPO_ROOT / "sql" / "schema.sql").read_text(encoding="utf-8")
+    body = schema.split("CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions", 1)[1]
+    body = body.split("(", 1)[1].split("ENGINE", 1)[0]
+    columns = set()
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("--") or line.startswith("(") or line.startswith(")"):
+            continue
+        columns.add(line.split()[0])
+    columns.discard("inserted_at")
+
+    row = log_session.build_session_row(
+        {"session_id": "s", "transcript_path": "/nope.jsonl",
+         "hook_event_name": "SessionEnd", "reason": "clear"},
+        {},
+    )
+    assert set(row) == columns
+
+
+def test_cost_usd_is_gone_from_row_and_schema():
+    """Находка 7: cost_usd всегда была нулём — пустое обещание в отчётности.
+    Колонки нет ни в строке, ни в схеме; стоимость считается из токенов."""
+    row = log_session.build_session_row(
+        {"session_id": "s", "transcript_path": "/nope.jsonl",
+         "hook_event_name": "SessionEnd", "reason": "clear"},
+        {},
+    )
+    assert "cost_usd" not in row
+    schema = (REPO_ROOT / "sql" / "schema.sql").read_text(encoding="utf-8")
+    assert "cost_usd     Decimal" not in schema
+
+
+# --- находки 6 и 7 финального ревью ----------------------------------------
+
+
+def test_tool_results_are_not_counted_as_prompts(tmp_path):
+    """Находка 6: результат инструмента приходит записью с type == "user".
+    На живом транскрипте это давало 733 «промпта» вместо 139 настоящих —
+    воронка адопшена врала бы в разы."""
+    lines = [
+        {"type": "user", "message": {"content": "посчитай OPH за июль"}},
+        {"type": "user", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "t1",
+                         "content": "1000 строк"}]}},
+        {"type": "user", "message": {
+            "content": [{"type": "tool_result", "tool_use_id": "t2",
+                         "content": "ещё 1000 строк"}]}},
+        {"type": "user", "message": {
+            "content": [{"type": "text", "text": "а теперь по складам"}]}},
+        # служебная вставка самого Claude Code — не промпт человека
+        {"type": "user", "isMeta": True, "message": {
+            "content": [{"type": "text", "text": "Base directory for this skill: /x"}]}},
+    ]
+    p = tmp_path / "prompts.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+    _, agg = log_session.read_transcript(str(p), {})
+
+    assert agg["n_prompts"] == 2
+
+
+def test_usage_is_counted_once_per_message_id(tmp_path):
+    """Находка 7: одно сообщение ассистента разложено на несколько записей с
+    общим message.id и повторённым usage — наивная сумма задваивает токены
+    (на живом транскрипте 2 292 123 против 879 392)."""
+    usage = {"input_tokens": 100, "output_tokens": 40,
+             "cache_read_input_tokens": 900, "cache_creation_input_tokens": 300}
+    lines = [
+        {"type": "assistant", "message": {"id": "msg_1", "usage": usage,
+                                          "content": [{"type": "text", "text": "думаю"}]}},
+        {"type": "assistant", "message": {"id": "msg_1", "usage": usage,
+                                          "content": [{"type": "tool_use", "name": "Read"}]}},
+        {"type": "assistant", "message": {"id": "msg_1", "usage": usage,
+                                          "content": [{"type": "tool_use", "name": "Read"}]}},
+        {"type": "assistant", "message": {"id": "msg_2", "usage": usage,
+                                          "content": [{"type": "text", "text": "готово"}]}},
+    ]
+    p = tmp_path / "tokens.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+    _, agg = log_session.read_transcript(str(p), {})
+
+    assert agg["tokens_in"] == 200          # два уникальных message.id, не четыре
+    assert agg["tokens_out"] == 80
+    assert agg["tokens_cache"] == 2400      # (900 чтения + 300 создания) x 2
+    assert agg["n_tools"] == 2              # вызовы инструментов не дедуплицируются
+
+
+def test_usage_without_message_id_is_still_counted(tmp_path):
+    """Дедупликация не должна проглатывать строки, у которых id нет вовсе."""
+    lines = [
+        {"type": "assistant", "message": {
+            "usage": {"input_tokens": 7, "output_tokens": 3}, "content": []}},
+        {"type": "assistant", "message": {
+            "usage": {"input_tokens": 7, "output_tokens": 3}, "content": []}},
+    ]
+    p = tmp_path / "noid.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+    _, agg = log_session.read_transcript(str(p), {})
+
+    assert agg["tokens_in"] == 14
+    assert agg["tokens_out"] == 6
 
 
 # --- регрессии по ревью: находки 2-6 ---------------------------------------
@@ -99,7 +213,9 @@ def test_read_transcript_skips_malformed_json_structures(tmp_path):
 
     text, agg = log_session.read_transcript(str(p), {})
 
-    assert agg["n_prompts"] == 2  # обе строки с type=="user" посчитаны
+    # запись с message не-объектом промптом не считается (её текст всё равно
+    # не прочитать), а нормальная — считается; главное, что разбор не упал
+    assert agg["n_prompts"] == 1
     assert "OE-1" in text
 
 

@@ -38,7 +38,13 @@ def build_row(payload, secrets):
     if event not in TRACKED:
         return None
     tool_name = payload.get("tool_name", "") or ""
-    error_text = payload.get("tool_error", "") or ""
+    # Поле называется `error`. Схема события зашита в самом Claude Code:
+    # PostToolUseFailure = {hook_event_name, tool_name, tool_input,
+    # tool_use_id, error: string, is_interrupt?, duration_ms?}. Поля
+    # `tool_error`, которое читали раньше, не существует — колонка error_text
+    # оставалась пустой всегда, хотя «где падает» это одна из главных причин,
+    # ради которых телеметрия вообще собирается.
+    error_text = payload.get("error", "") or ""
     return {
         "ts": telemetry.utc_now_str(milliseconds=True),
         "session_id": payload.get("session_id", ""),

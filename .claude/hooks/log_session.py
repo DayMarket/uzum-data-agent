@@ -71,6 +71,34 @@ def _content_text(content):
     return ""
 
 
+def _is_user_prompt(item):
+    """Запись — настоящий промпт человека, а не результат инструмента.
+
+    Результаты инструментов приходят такими же записями с type == "user":
+    на живом транскрипте из 733 записей type == "user" настоящих промптов
+    было 139, остальные 591 — блоки tool_result (плюс картинки). Считать
+    промптом каждую запись type == "user" значит завысить n_prompts в
+    несколько раз и получить воронку адопшена, которая врёт.
+
+    Признак промпта тот же, по которому собирается текст пользователя:
+    content — строка либо содержит блок type == "text". Служебные вставки
+    самого Claude Code (isMeta: базовые каталоги скиллов, подписи к
+    картинкам) — не промпты человека.
+    """
+    if item.get("type") != "user" or item.get("isMeta"):
+        return False
+    message = item.get("message")
+    if not isinstance(message, dict):
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return True
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "text"
+        for block in content
+    )
+
+
 def _read_transcript_bytes(path):
     """Прочитать байты транскрипта, при необходимости — только хвост.
     Возвращает (bytes, исходный_размер, обрезан_ли)."""
@@ -100,6 +128,12 @@ def read_transcript(path, secrets):
 
     user_text_parts = []
     skills_used = set()
+    # message.id, по которым usage уже посчитан: одно сообщение ассистента
+    # разложено в транскрипте на несколько записей с одним и тем же id и
+    # повторённым блоком usage. На живом транскрипте наивная сумма давала
+    # 2 292 123 токена против 879 392 по уникальным идентификаторам — счёт
+    # расходов и нагрузки завышался в 2,6 раза.
+    counted_usage_ids = set()
     for line in raw_lines:
         try:
             item = json.loads(line)
@@ -111,22 +145,29 @@ def read_transcript(path, secrets):
         if not isinstance(item, dict):
             continue
 
-        is_user = item.get("type") == "user"
-        if is_user:
+        is_prompt = _is_user_prompt(item)
+        if is_prompt:
             agg["n_prompts"] += 1
 
         message = item.get("message")
         if not isinstance(message, dict):
             continue
 
-        if is_user:
+        if is_prompt:
             user_text_parts.append(_content_text(message.get("content")))
 
         usage = message.get("usage")
-        if isinstance(usage, dict):
+        message_id = message.get("id")
+        already_counted = isinstance(message_id, str) and message_id in counted_usage_ids
+        if isinstance(usage, dict) and not already_counted:
+            if isinstance(message_id, str):
+                counted_usage_ids.add(message_id)
             agg["tokens_in"] += _to_int(usage.get("input_tokens"))
             agg["tokens_out"] += _to_int(usage.get("output_tokens"))
+            # Кеш это две разные вещи и обе стоят денег: чтение из кеша и
+            # его создание. Раньше считалось только чтение.
             agg["tokens_cache"] += _to_int(usage.get("cache_read_input_tokens"))
+            agg["tokens_cache"] += _to_int(usage.get("cache_creation_input_tokens"))
 
         content = message.get("content")
         if isinstance(content, list):
@@ -212,7 +253,6 @@ def build_session_row(payload, secrets):
         "tokens_in": agg["tokens_in"],
         "tokens_out": agg["tokens_out"],
         "tokens_cache": agg["tokens_cache"],
-        "cost_usd": 0,
         "repo_sha": _repo_sha(),
         "end_reason": payload.get("reason", ""),
         "transcript": text,
