@@ -37,6 +37,16 @@ TIMEOUT_S = 4
 FLUSH_TIME_BUDGET_S = 2.0
 FLUSH_MAX_ROWS = 2000
 
+# Потолки локальной очереди. Без них очередь росла бесследно: при недоступной
+# базе каждая сессия кладёт файл (в строке сессии лежит транскрипт — до 5 МБ)
+# и он остаётся навсегда. У аналитика, который месяц работает вне корпоративной
+# сети, это гигабайты в ~/.local/state, о которых он никогда не узнает.
+# При переполнении выбрасываем самые старые файлы: свежая телеметрия ценнее
+# позапрошлогодней, а чинить ситуацию всё равно человеку — см. скилл
+# fix-access, там написано, как посмотреть размер очереди.
+QUEUE_MAX_BYTES = 50 * 1024 * 1024
+QUEUE_MAX_AGE_S = 30 * 24 * 3600
+
 
 class Config(object):
     def __init__(self, host, user, password, database, queue_dir, enabled,
@@ -106,7 +116,16 @@ def _base_url(cfg):
 def _post(cfg, table, rows):
     """Отправить строки в ClickHouse. True — успех, False — нет."""
     query = "INSERT INTO %s.%s FORMAT JSONEachRow" % (cfg.database, table)
-    url = _base_url(cfg) + "?" + urllib.parse.urlencode({"query": query})
+    # async_insert: без него на каждый вызов инструмента у каждого аналитика
+    # приходится отдельная вставка — по куску на строку, и MergeTree потом
+    # это всё сливает. wait_for_async_insert=0 — не ждём подтверждения записи
+    # на диск: хук на PostToolUse висит в горячем пути работы аналитика, а
+    # потеря последних секунд телеметрии при падении сервера нам не страшна.
+    url = _base_url(cfg) + "?" + urllib.parse.urlencode({
+        "query": query,
+        "async_insert": "1",
+        "wait_for_async_insert": "0",
+    })
     body = "\n".join(json.dumps(r, ensure_ascii=False) for r in rows).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-ClickHouse-User", cfg.user)
@@ -118,11 +137,82 @@ def _post(cfg, table, rows):
         return False
 
 
+def queue_stats(queue_dir):
+    """(число файлов, суммарный размер в байтах, возраст самого старого в
+    секундах) — для диагностики (скилл fix-access). Никогда не падает."""
+    files, total, oldest = 0, 0, 0
+    now = time.time()
+    try:
+        for name in os.listdir(queue_dir):
+            if not name.endswith(".jsonl"):
+                continue
+            try:
+                st = os.stat(os.path.join(queue_dir, name))
+            except OSError:
+                continue
+            files += 1
+            total += st.st_size
+            oldest = max(oldest, int(now - st.st_mtime))
+    except OSError:
+        pass
+    return files, total, oldest
+
+
+def _prune_queue(queue_dir):
+    """Удержать очередь в потолке по объёму и возрасту. Сначала уходит самое
+    старое — свежая телеметрия ценнее. Никогда не бросает исключений."""
+    try:
+        entries = []
+        for name in os.listdir(queue_dir):
+            if not name.endswith(".jsonl"):
+                continue
+            path = os.path.join(queue_dir, name)
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            entries.append((st.st_mtime, st.st_size, path))
+    except OSError:
+        return
+
+    now = time.time()
+    kept = []
+    total = 0
+    for mtime, size, path in sorted(entries):
+        if now - mtime > QUEUE_MAX_AGE_S:
+            _remove(path)
+            continue
+        kept.append((mtime, size, path))
+        total += size
+
+    # сверху по объёму — выбрасываем самые старые из оставшихся
+    for mtime, size, path in kept:
+        if total <= QUEUE_MAX_BYTES:
+            break
+        _remove(path)
+        total -= size
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def _enqueue(cfg, table, row):
     try:
         os.makedirs(cfg.queue_dir, exist_ok=True)
+        os.chmod(cfg.queue_dir, 0o700)
+        _prune_queue(cfg.queue_dir)
         path = os.path.join(cfg.queue_dir, "%d-%d.jsonl" % (int(time.time()), os.getpid()))
-        with open(path, "a", encoding="utf-8") as f:
+        # 0600 на самом файле, а не только права каталога по умолчанию: в
+        # строке сессии лежит полный транскрипт — тексты запросов аналитика,
+        # ответы агента, имена витрин. Ставим до записи (os.open с mode), а не
+        # chmod после — иначе между созданием и chmod есть окно, в котором
+        # файл с транскриптом доступен на чтение всем.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a", encoding="utf-8") as f:
             f.write(json.dumps({"table": table, "row": row}, ensure_ascii=False) + "\n")
     except Exception:
         pass

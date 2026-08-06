@@ -2,6 +2,7 @@
 import datetime
 import json
 import os
+import time
 
 import telemetry
 
@@ -333,3 +334,100 @@ def test_flush_respects_time_budget(monkeypatch, tmp_path):
 
     assert sent == 1
     assert len(list(queue_dir.glob("*.jsonl"))) == 1  # второй файл не тронут
+
+
+# --- находки 10, 11 и «права на файлы очереди» финального ревью -------------
+
+
+def test_insert_url_asks_for_async_insert(monkeypatch, tmp_path):
+    """Находка 10: без async_insert на каждый вызов инструмента у каждого
+    аналитика приходится отдельная вставка в MergeTree."""
+    _enable(monkeypatch, tmp_path)
+    captured = {}
+
+    class FakeResponse(object):
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        telemetry.urllib.request, "urlopen",
+        lambda req, timeout=None: (captured.update(url=req.full_url), FakeResponse())[1],
+    )
+    telemetry._post(telemetry.Config.from_env(), "ai_usage_events", [{"n": 1}])
+    assert "async_insert=1" in captured["url"]
+    assert "wait_for_async_insert=0" in captured["url"]
+
+
+def test_queue_file_is_readable_only_by_owner(monkeypatch, tmp_path):
+    """В файле очереди лежит полный транскрипт сессии — права 0600, и каталог
+    очереди 0700, как у каталога секретов."""
+    _enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(telemetry, "_post", lambda *a, **k: False)
+    telemetry.write("ai_usage_sessions", {"transcript": "секретный текст"})
+    queue_dir = tmp_path / "queue"
+    assert oct(queue_dir.stat().st_mode)[-3:] == "700"
+    files = list(queue_dir.glob("*.jsonl"))
+    assert files
+    assert oct(files[0].stat().st_mode)[-3:] == "600"
+
+
+def test_queue_drops_oldest_files_over_the_size_cap(monkeypatch, tmp_path):
+    """Находка 11: при недоступной базе очередь росла без потолка — каждая
+    сессия кладёт файл до 5 МБ и он остаётся навсегда."""
+    _enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(telemetry, "QUEUE_MAX_BYTES", 3000)
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    base = int(time.time()) - 400  # свежие файлы: потолок по возрасту ни при чём
+    names = []
+    for i in range(4):
+        p = queue_dir / ("%d-1.jsonl" % (base + i))
+        p.write_text("x" * 1000, encoding="utf-8")
+        os.utime(p, (base + i, base + i))
+        names.append(p.name)
+
+    monkeypatch.setattr(telemetry, "_post", lambda *a, **k: False)
+    telemetry.write("ai_usage_events", {"n": 1})
+
+    left = sorted(p.name for p in queue_dir.glob("*.jsonl"))
+    files, total, _ = telemetry.queue_stats(str(queue_dir))
+    assert total <= telemetry.QUEUE_MAX_BYTES + 200  # новый файл маленький
+    assert files == len(left)
+    assert names[0] not in left  # самый старый ушёл первым
+    assert names[3] in left      # свежий остался
+
+
+def test_queue_drops_files_older_than_the_age_cap(monkeypatch, tmp_path):
+    _enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(telemetry, "QUEUE_MAX_AGE_S", 60)
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    old = queue_dir / "old.jsonl"
+    old.write_text("{}\n", encoding="utf-8")
+    os.utime(old, (time.time() - 3600, time.time() - 3600))
+    fresh = queue_dir / "fresh.jsonl"
+    fresh.write_text("{}\n", encoding="utf-8")
+
+    monkeypatch.setattr(telemetry, "_post", lambda *a, **k: False)
+    telemetry.write("ai_usage_events", {"n": 1})
+
+    assert not old.exists()
+    assert fresh.exists()
+
+
+def test_queue_stats_reports_size_for_diagnostics(tmp_path):
+    (tmp_path / "a.jsonl").write_text("x" * 10, encoding="utf-8")
+    (tmp_path / "b.jsonl").write_text("x" * 5, encoding="utf-8")
+    (tmp_path / "не-очередь.txt").write_text("x", encoding="utf-8")
+    files, total, oldest = telemetry.queue_stats(str(tmp_path))
+    assert (files, total) == (2, 15)
+    assert oldest >= 0
+
+
+def test_queue_stats_on_missing_dir():
+    assert telemetry.queue_stats("/nope/queue") == (0, 0, 0)
