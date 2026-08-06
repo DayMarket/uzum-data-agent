@@ -24,6 +24,43 @@ say()  { printf "\n%s\n" "$1"; }
 ok()   { printf "  \xe2\x9c\x93 %s\n" "$1"; }
 fail() { printf "  \xe2\x9c\x97 %s\n" "$1"; }
 
+# Временные файлы смоук-проверок: непредсказуемые имена (mktemp, не
+# фиксированные /tmp/uzum_*) и гарантированная уборка при выходе — даже при
+# early exit из проверки окружения. Тела ответов (email, displayName и т.п.)
+# не должны переживать сам процесс setup.sh.
+TMP_FILES=()
+mk_tmp() {
+  local f
+  f=$(mktemp "${TMPDIR:-/tmp}/uzum-setup.XXXXXX") || { fail "не удалось создать временный файл"; exit 1; }
+  TMP_FILES+=("$f")
+  printf "%s" "$f"
+}
+cleanup_tmp() {
+  if [ "${#TMP_FILES[@]}" -gt 0 ]; then
+    rm -f "${TMP_FILES[@]}"
+  fi
+}
+trap cleanup_tmp EXIT
+
+# Живой запрос без секрета в argv: заголовки уходят в curl через конфиг на
+# стандартном вводе (--config -), а не через -H аргумент — иначе пароль/токен
+# на время запроса виден в выводе `ps` любому процессу того же пользователя.
+# $1 = файл для тела ответа, $2 = max-time, $3 = url, $4.. = заголовки
+# в формате "Имя: значение".
+curl_check() {
+  local out="$1" maxtime="$2" url="$3" cfg="" h esc
+  shift 3
+  for h in "$@"; do
+    esc="${h//\\/\\\\}"
+    esc="${esc//\"/\\\"}"
+    cfg="$cfg
+header = \"$esc\""
+  done
+  # stderr curl'а (например "could not resolve host") в терминал не идёт —
+  # для диагностики отказа хватает http_code и тела ответа в $out.
+  printf '%s\n' "$cfg" | curl -sS --max-time "$maxtime" -o "$out" -w "%{http_code}" --config - "$url" 2>/dev/null
+}
+
 # Значение уходит в python не через подстановку в исходный код (это ломается
 # на паролях с кавычками), а через переменную окружения — python читает её
 # через os.environ, шелл ничего не интерполирует внутрь строки.
@@ -78,13 +115,15 @@ check_environment() {
   if command -v python3 >/dev/null 2>&1; then
     ok "python3 найден"
   else
-    fail "нужен python3"
+    fail "python3 не найден — без него не отработает ни одна проверка доступа"
+    fail "Поставь: xcode-select --install (или brew install python3) — и запусти ./setup.sh заново"
     exit 1
   fi
   if command -v curl >/dev/null 2>&1; then
     ok "curl найден"
   else
-    fail "нужен curl — без него мастер не может проверить ни один доступ"
+    fail "curl не найден — без него мастер не может проверить ни один доступ"
+    fail "Поставь: brew install curl — и запусти ./setup.sh заново"
     exit 1
   fi
   # uv обязателен: коннекторы trino/superset/sheets запускаются через
@@ -108,6 +147,12 @@ check_environment() {
 # тот же дефект уже находили в lib/telemetry.py, из-за него не доходило ни
 # одной строки телеметрии). Порт спрашиваем, а не хардкодим, и подбираем
 # схему по факту ответа, а не гадаем — https пробуем вторым номером.
+#
+# CH_SECURE пишется в secrets.env наравне с TELEMETRY_CH_SECURE: .mcp.json
+# подставляет её в CLICKHOUSE_SECURE (см. CH_SECURE в этом же файле) —
+# раньше там был захардкожен литерал "true", из-за чего рабочий коннектор
+# clickhouse считался бы настроенным и не подключался в первой сессии, хотя
+# смоук-тест здесь честно нашёл рабочую схему.
 setup_clickhouse() {
   say "── ClickHouse ── логин это корп-почта через дефис, пароль выдаётся заявкой в JSM"
   read -rp "  Хост [clickhouse.prod-data.internal.daymarket.uz]: " CH_HOST
@@ -121,17 +166,18 @@ setup_clickhouse() {
   # запросе (например https, если сервер вообще не говорит по TLS) curl не
   # трогает файл первого запроса, и в диагностике легко перепутать код одной
   # попытки с телом ответа другой.
-  local http_code https_code
-  http_code=$(curl -sS --max-time 8 -o /tmp/uzum_ch_check_http -w "%{http_code}" \
-    -H "X-ClickHouse-User: $CH_USER" -H "X-ClickHouse-Key: $CH_PASSWORD" \
+  local http_out https_out http_code https_code
+  http_out="$(mk_tmp)"
+  http_code=$(curl_check "$http_out" 8 \
     "http://$CH_HOST:$CH_PORT/?query=SELECT+count()+FROM+system.databases" \
-    2>/tmp/uzum_ch_err_http)
+    "X-ClickHouse-User: $CH_USER" "X-ClickHouse-Key: $CH_PASSWORD")
 
   if [ "$http_code" = "200" ]; then
-    ok "вижу $(cat /tmp/uzum_ch_check_http 2>/dev/null) баз (по http, порт $CH_PORT)"
+    ok "вижу $(cat "$http_out" 2>/dev/null) баз (по http, порт $CH_PORT)"
     put_env CH_HOST "$CH_HOST"
     put_env CH_USER "$CH_USER"
     put_env CH_PASSWORD "$CH_PASSWORD"
+    put_env CH_SECURE "false"
     put_env TELEMETRY_CH_HOST "$CH_HOST"
     put_env TELEMETRY_CH_USER "$CH_USER"
     put_env TELEMETRY_CH_PASSWORD "$CH_PASSWORD"
@@ -141,16 +187,17 @@ setup_clickhouse() {
     return
   fi
 
-  https_code=$(curl -sS --max-time 8 -o /tmp/uzum_ch_check_https -w "%{http_code}" \
-    -H "X-ClickHouse-User: $CH_USER" -H "X-ClickHouse-Key: $CH_PASSWORD" \
+  https_out="$(mk_tmp)"
+  https_code=$(curl_check "$https_out" 8 \
     "https://$CH_HOST:$CH_PORT/?query=SELECT+count()+FROM+system.databases" \
-    2>/tmp/uzum_ch_err_https)
+    "X-ClickHouse-User: $CH_USER" "X-ClickHouse-Key: $CH_PASSWORD")
 
   if [ "$https_code" = "200" ]; then
-    ok "вижу $(cat /tmp/uzum_ch_check_https 2>/dev/null) баз (по https, порт $CH_PORT)"
+    ok "вижу $(cat "$https_out" 2>/dev/null) баз (по https, порт $CH_PORT)"
     put_env CH_HOST "$CH_HOST"
     put_env CH_USER "$CH_USER"
     put_env CH_PASSWORD "$CH_PASSWORD"
+    put_env CH_SECURE "true"
     put_env TELEMETRY_CH_HOST "$CH_HOST"
     put_env TELEMETRY_CH_USER "$CH_USER"
     put_env TELEMETRY_CH_PASSWORD "$CH_PASSWORD"
@@ -164,9 +211,9 @@ setup_clickhouse() {
   # Показываем текст той попытки, которая реально дошла до сервера (код не
   # 000) — там настоящая причина отказа, а не обрыв TCP/TLS соединения.
   if [ "$http_code" != "000" ]; then
-    fail "$(head -c 300 /tmp/uzum_ch_check_http 2>/dev/null)"
+    fail "$(head -c 300 "$http_out" 2>/dev/null)"
   elif [ "$https_code" != "000" ]; then
-    fail "$(head -c 300 /tmp/uzum_ch_check_https 2>/dev/null)"
+    fail "$(head -c 300 "$https_out" 2>/dev/null)"
   fi
   fail "пропущено — подключить позже: ./setup.sh --add clickhouse"
 }
@@ -175,12 +222,12 @@ setup_clickhouse() {
 setup_jira() {
   say "── Jira ── Профиль → Personal Access Tokens → Create token"
   read -rsp "  Токен: " JIRA_TOKEN; echo
-  local code name
-  code=$(curl -sS --max-time 10 -o /tmp/uzum_jira_check -w "%{http_code}" \
-    -H "Authorization: Bearer $JIRA_TOKEN" \
-    "https://jira.uzum.com/rest/api/2/myself" 2>/tmp/uzum_jira_check_err)
+  local out code name
+  out="$(mk_tmp)"
+  code=$(curl_check "$out" 10 "https://jira.uzum.com/rest/api/2/myself" \
+    "Authorization: Bearer $JIRA_TOKEN")
   if [ "$code" = "200" ]; then
-    name=$(python3 -c "import json;print(json.load(open('/tmp/uzum_jira_check'))['displayName'])" 2>/dev/null || echo "пользователя")
+    name=$(UZUM_CHECK_FILE="$out" python3 -c "import json,os;print(json.load(open(os.environ['UZUM_CHECK_FILE']))['displayName'])" 2>/dev/null || echo "пользователя")
     ok "вижу тебя как $name"
     put_env JIRA_TOKEN "$JIRA_TOKEN"
     ENABLED+=("atlassian")
@@ -229,12 +276,12 @@ setup_grafana() {
     return
   fi
   read -rsp "  Токен: " GRAFANA_TOKEN; echo
-  local code org
-  code=$(curl -sS --max-time 10 -o /tmp/uzum_grafana_check -w "%{http_code}" \
-    -H "Authorization: Bearer $GRAFANA_TOKEN" \
-    "${GRAFANA_URL%/}/api/org" 2>/tmp/uzum_grafana_check_err)
+  local out code org
+  out="$(mk_tmp)"
+  code=$(curl_check "$out" 10 "${GRAFANA_URL%/}/api/org" \
+    "Authorization: Bearer $GRAFANA_TOKEN")
   if [ "$code" = "200" ]; then
-    org=$(python3 -c "import json;print(json.load(open('/tmp/uzum_grafana_check')).get('name','?'))" 2>/dev/null || echo "?")
+    org=$(UZUM_CHECK_FILE="$out" python3 -c "import json,os;print(json.load(open(os.environ['UZUM_CHECK_FILE'])).get('name','?'))" 2>/dev/null || echo "?")
     ok "вижу организацию $org"
     put_env GRAFANA_URL "$GRAFANA_URL"
     put_env GRAFANA_TOKEN "$GRAFANA_TOKEN"
@@ -255,12 +302,12 @@ setup_openmetadata() {
     return
   fi
   read -rsp "  Токен: " OMD_TOKEN; echo
-  local code who
-  code=$(curl -sS --max-time 10 -o /tmp/uzum_omd_check -w "%{http_code}" \
-    -H "Authorization: Bearer $OMD_TOKEN" \
-    "${OMD_URL%/}/api/v1/users/loggedInUser" 2>/tmp/uzum_omd_check_err)
+  local out code who
+  out="$(mk_tmp)"
+  code=$(curl_check "$out" 10 "${OMD_URL%/}/api/v1/users/loggedInUser" \
+    "Authorization: Bearer $OMD_TOKEN")
   if [ "$code" = "200" ]; then
-    who=$(python3 -c "import json;print(json.load(open('/tmp/uzum_omd_check')).get('name','?'))" 2>/dev/null || echo "?")
+    who=$(UZUM_CHECK_FILE="$out" python3 -c "import json,os;print(json.load(open(os.environ['UZUM_CHECK_FILE'])).get('name','?'))" 2>/dev/null || echo "?")
     ok "вижу тебя как $who"
     put_env OMD_URL "$OMD_URL"
     put_env OMD_TOKEN "$OMD_TOKEN"

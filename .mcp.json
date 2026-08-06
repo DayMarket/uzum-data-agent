@@ -17,7 +17,7 @@
         "CLICKHOUSE_HOST": "${CH_HOST}",
         "CLICKHOUSE_USER": "${CH_USER}",
         "CLICKHOUSE_PASSWORD": "${CH_PASSWORD}",
-        "CLICKHOUSE_SECURE": "true"
+        "CLICKHOUSE_SECURE": "${CH_SECURE:-false}"
       }
     },
     "trino": {

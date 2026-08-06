@@ -10,7 +10,15 @@ EXPECTED = {"atlassian", "clickhouse", "trino", "superset", "grafana",
 # Структурные значения — адреса/пути. Не секрет, поэтому дефолт через
 # ${VAR:-значение} допустим: .mcp.json тогда работает "из коробки" без
 # лишних warning в `claude mcp list`, пока человек ещё не заполнил secrets.env.
-STRUCTURAL_VARS = ("CH_HOST", "JIRA_URL", "CONFLUENCE_URL")
+#
+# CH_SECURE — тоже структурное значение (схема http/https для рабочего
+# коннектора clickhouse), а не секрет. Раньше CLICKHOUSE_SECURE был
+# захардкожен литералом "true", хотя реальный эндпоинт отвечает по http на
+# 8123 (тот же дефект чинили в lib/telemetry.py) — коннектор "успешно
+# устанавливался", но не подключался в первой же сессии. Дефолт "false"
+# отражает рабочую схему; setup.sh пишет в CH_SECURE результат своего же
+# смоук-теста (какая схема реально ответила), а не гадает заранее.
+STRUCTURAL_VARS = ("CH_HOST", "CH_SECURE", "JIRA_URL", "CONFLUENCE_URL")
 
 # Настоящие секреты — пароли и токены. Дефолт здесь значит зашитый в git секрет
 # (пример регрессии: "${CH_PASSWORD:-hardcoded-secret}" всё ещё подстановка
@@ -57,3 +65,16 @@ def test_secrets_forbid_default():
 def test_local_scripts_exist():
     for name in ("trino_proxy.py", "superset_mcp.py", "sheets_mcp.py"):
         assert (REPO_ROOT / "connectors" / name).exists()
+
+
+def test_clickhouse_secure_is_not_a_hardcoded_literal():
+    """Регрессия на находку ревью задачи 9: CLICKHOUSE_SECURE был захардкожен
+    `"true"`, хотя реальный ClickHouse-эндпоинт отвечает по http на 8123, а не
+    по https — коннектор считался бы настроенным и не подключался в первой же
+    сессии. Схема должна приходить из CH_SECURE (результат смоук-теста
+    setup.sh), а не быть вкопанной в файл строкой.
+    """
+    raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
+    assert '"CLICKHOUSE_SECURE": "true"' not in raw
+    assert '"CLICKHOUSE_SECURE": "false"' not in raw
+    assert re.search(r'"CLICKHOUSE_SECURE":\s*"\$\{CH_SECURE(:-[^}]*)?\}"', raw)
