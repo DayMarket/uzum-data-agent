@@ -99,9 +99,12 @@ def flush():
     остаток остаётся в очереди и уйдёт при следующем flush().
 
     Строки одной таблицы из одного файла очереди отправляются одним батчем
-    (один HTTP-запрос на группу "таблица х файл"). Если батч не отправился,
-    в файл очереди переписывается только неотправленный остаток — уже
-    подтверждённые батчи повторно не шлются.
+    (один HTTP-запрос на группу "таблица х файл"), но не крупнее остатка
+    бюджета FLUSH_MAX_ROWS — если строк в группе больше, чем осталось от
+    потолка, группа режется на кусок нужного размера и остаток дописывается
+    обратно в очередь. Если батч не отправился, в файл очереди переписывается
+    только неотправленный остаток — уже подтверждённые батчи повторно не
+    шлются.
     """
     try:
         return _flush_impl()
@@ -124,9 +127,6 @@ def _flush_impl():
     sent = 0
 
     for name in names:
-        if sent >= FLUSH_MAX_ROWS or time.monotonic() >= deadline:
-            break
-
         path = os.path.join(cfg.queue_dir, name)
         try:
             with open(path, encoding="utf-8") as f:
@@ -136,19 +136,41 @@ def _flush_impl():
 
         # Группируем строки файла по таблице, сохраняя порядок первого
         # появления таблицы — так одна группа = один батч = один запрос.
+        # Записи с испорченной структурой (не dict) пропускаем, не роняя
+        # весь flush().
         order = []
         groups = {}
         for item in items:
+            if not isinstance(item, dict):
+                continue
             table = item.get("table")
+            row = item.get("row")
             if table not in groups:
                 groups[table] = []
                 order.append(table)
-            groups[table].append(item)
+            groups[table].append({"table": table, "row": row})
 
         remaining = []
+        budget_exhausted = False
         for table in order:
             group_items = groups[table]
-            rows = [gi.get("row") for gi in group_items]
+
+            if budget_exhausted or sent >= FLUSH_MAX_ROWS or time.monotonic() >= deadline:
+                budget_exhausted = True
+                remaining.extend(group_items)
+                continue
+
+            # Потолок по строкам должен соблюдаться и внутри файла: если
+            # в группе больше строк, чем осталось от бюджета, отправляем
+            # только кусок по размеру остатка, а хвост оставляем в очереди.
+            room = FLUSH_MAX_ROWS - sent
+            if room < len(group_items):
+                chunk, leftover = group_items[:room], group_items[room:]
+                budget_exhausted = True
+            else:
+                chunk, leftover = group_items, []
+
+            rows = [gi["row"] for gi in chunk]
             try:
                 ok = _post(cfg, table, rows)
             except Exception:
@@ -156,7 +178,8 @@ def _flush_impl():
             if ok:
                 sent += len(rows)
             else:
-                remaining.extend(group_items)
+                leftover = chunk + leftover
+            remaining.extend(leftover)
 
         try:
             if remaining:
@@ -167,5 +190,8 @@ def _flush_impl():
                 os.remove(path)
         except Exception:
             pass
+
+        if budget_exhausted:
+            break
 
     return sent

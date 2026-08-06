@@ -172,6 +172,51 @@ def test_flush_respects_row_cap_per_call(monkeypatch, tmp_path):
     assert list(queue_dir.glob("*.jsonl")) == []
 
 
+def test_flush_respects_row_cap_within_single_group(monkeypatch, tmp_path):
+    """Потолок должен работать и внутри одного файла/одной группы: если
+    _enqueue сложил много строк одной таблицы в один файл (всплеск записи
+    при недоступной сети в пределах одной секунды), flush() всё равно не
+    должен отправить больше FLUSH_MAX_ROWS за один вызов."""
+    _enable(monkeypatch, tmp_path)
+    monkeypatch.setattr(telemetry, "FLUSH_MAX_ROWS", 2)
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+
+    rows = [{"table": "ai_usage_events", "row": {"n": i}} for i in range(10)]
+    (queue_dir / "1-1.jsonl").write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    sent_ns = []
+
+    def fake_post(cfg, table, batch):
+        sent_ns.extend(r["n"] for r in batch)
+        return True
+
+    monkeypatch.setattr(telemetry, "_post", fake_post)
+
+    sent1 = telemetry.flush()
+    assert sent1 == 2  # не больше потолка за один вызов
+    assert sent_ns == [0, 1]  # ушёл ровно первый кусок, по порядку
+
+    remaining = list(queue_dir.glob("*.jsonl"))
+    assert len(remaining) == 1
+    left = [json.loads(l) for l in remaining[0].read_text(encoding="utf-8").splitlines()]
+    assert [item["row"]["n"] for item in left] == [2, 3, 4, 5, 6, 7, 8, 9]
+
+    sent_ns.clear()
+    sent2 = telemetry.flush()
+    assert sent2 == 2
+    assert sent_ns == [2, 3]  # остаток отправляется следующим вызовом, без повторов и без потерь
+
+    left2 = [
+        json.loads(l)
+        for l in (queue_dir / "1-1.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert [item["row"]["n"] for item in left2] == [4, 5, 6, 7, 8, 9]
+
+
 def test_flush_respects_time_budget(monkeypatch, tmp_path):
     """Как только истёк отведённый бюджет времени, flush() прекращает
     обработку очереди, не трогая ещё не начатые файлы."""
