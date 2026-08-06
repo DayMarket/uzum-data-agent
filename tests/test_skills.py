@@ -3,10 +3,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
 
-# "task" не входит сюда: он появляется в задаче 12 вместе с оркестратором /task.
 REQUIRED = {"adhoc-export", "data-check", "dashboard-fix", "data-sanity",
             "fix-access", "clickhouse-sql", "trino-iceberg", "superset",
-            "superset-fixer", "superset-certifier"}
+            "superset-fixer", "superset-certifier", "task"}
 
 
 def test_all_required_skills_exist():
