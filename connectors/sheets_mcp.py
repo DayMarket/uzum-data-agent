@@ -46,13 +46,26 @@ class OutsidePerimeter(Exception):
     """Попытка записи вне разрешённой папки."""
 
 
+_credentials = None
+
+
 def _access_token(sa_path):
-    """Получить access token сервисного аккаунта через google-auth."""
-    credentials = service_account.Credentials.from_service_account_file(
-        sa_path, scopes=SCOPES
-    )
-    credentials.refresh(Request())
-    return credentials.token
+    """Получить access token сервисного аккаунта через google-auth.
+
+    Объект Credentials кэшируется на модуль: google-auth сам знает, истёк ли
+    токен (credentials.valid), и обновляет его только когда нужно. Это не
+    просто оптимизация — без кэша один вызов append_rows дважды ходил на
+    oauth2.googleapis.com/token (один раз в handle(), второй раз внутри
+    check_perimeter → _parent_folder).
+    """
+    global _credentials
+    if _credentials is None:
+        _credentials = service_account.Credentials.from_service_account_file(
+            sa_path, scopes=SCOPES
+        )
+    if not _credentials.valid:
+        _credentials.refresh(Request())
+    return _credentials.token
 
 
 def _api(token, url, method="GET", payload=None):
@@ -96,8 +109,33 @@ def rows_to_values(rows):
     return [["" if cell is None else str(cell) for cell in row] for row in rows]
 
 
+def _try_trash(token, file_id):
+    """Убрать таблицу, которая после переноса оказалась вне периметра.
+
+    Лучшее из возможного, не гарантия: если сервисному аккаунту не хватит
+    прав на удаление, глотаем ошибку — молчаливая неудача здесь безопаснее,
+    чем маскировка исходного OutsidePerimeter исключением из cleanup-кода.
+    """
+    try:
+        _api(
+            token,
+            "https://www.googleapis.com/drive/v3/files/%s" % file_id,
+            "PATCH",
+            {"trashed": True},
+        )
+    except Exception:
+        pass
+
+
 def handle(method, params):
     folder = os.environ.get("GOOGLE_SHEETS_FOLDER_ID", "")
+    # Периметр проверяем до любого обращения к API — включая запрос токена:
+    # пустая/незаданная папка обязана останавливать создание таблицы, а не
+    # проходить как «папка не указана, но и не запрещена».
+    if method == "create_sheet" and not folder:
+        raise OutsidePerimeter(
+            "Папка для записи не настроена: задай GOOGLE_SHEETS_FOLDER_ID"
+        )
     token = _access_token(os.environ["GOOGLE_SERVICE_ACCOUNT_FILE"])
     if method == "create_sheet":
         created = _api(
@@ -114,6 +152,15 @@ def handle(method, params):
             "PATCH",
             {},
         )
+        # Не надеемся, что перенос сработал — перепроверяем фактического
+        # родителя тем же способом, что и append_rows. Строки пишем только
+        # после подтверждения; если таблица всё же не в папке — не пишем
+        # ничего и убираем её, а не оставляем висеть вне периметра.
+        try:
+            check_perimeter(sid, folder)
+        except OutsidePerimeter:
+            _try_trash(token, sid)
+            raise
         if params.get("rows"):
             _api(
                 token,
