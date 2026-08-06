@@ -1,6 +1,9 @@
-CREATE DATABASE IF NOT EXISTS ai_usage;
+-- Таблицы телеметрии живут в существующей базе sandbox (прав на CREATE DATABASE
+-- нет и не будет), с префиксом ai_usage_, чтобы не теряться среди остальных
+-- 318+ таблиц sandbox. Движок ReplicatedMergeTree — как у всех соседних таблиц
+-- в sandbox (кластер реплицированный).
 
-CREATE TABLE IF NOT EXISTS ai_usage.sessions
+CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions
 (
     session_id   String,
     user         LowCardinality(String),
@@ -20,12 +23,12 @@ CREATE TABLE IF NOT EXISTS ai_usage.sessions
     transcript   String CODEC(ZSTD(3)),
     inserted_at  DateTime DEFAULT now()
 )
-ENGINE = MergeTree
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_sessions', '{replica}')
 PARTITION BY toYYYYMM(started_at)
 ORDER BY (user, started_at, session_id)
 TTL started_at + INTERVAL 12 MONTH;
 
-CREATE TABLE IF NOT EXISTS ai_usage.events
+CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events
 (
     ts          DateTime64(3),
     session_id  String,
@@ -38,12 +41,12 @@ CREATE TABLE IF NOT EXISTS ai_usage.events
     error_text  String,
     inserted_at DateTime DEFAULT now()
 )
-ENGINE = MergeTree
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_events', '{replica}')
 PARTITION BY toYYYYMM(ts)
 ORDER BY (user, ts)
 TTL toDateTime(ts) + INTERVAL 12 MONTH;
 
-CREATE TABLE IF NOT EXISTS ai_usage.verdicts
+CREATE TABLE IF NOT EXISTS sandbox.ai_usage_verdicts
 (
     jira_key    String,
     session_id  String,
@@ -55,5 +58,5 @@ CREATE TABLE IF NOT EXISTS ai_usage.verdicts
     reason      String,
     inserted_at DateTime DEFAULT now()
 )
-ENGINE = MergeTree
+ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_verdicts', '{replica}')
 ORDER BY (jira_key, drafted_at);

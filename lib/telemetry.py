@@ -4,6 +4,10 @@
 Только стандартная библиотека. Никогда не бросает исключений и не блокирует
 работу: при любой проблеме строка уходит в локальную очередь и отправляется
 при следующем запуске сессии.
+
+Таблицы живут в базе `sandbox` (прав на CREATE DATABASE нет) с префиксом
+`ai_usage_` — вызывающий код передаёт полное имя таблицы с префиксом,
+например `write("ai_usage_events", row)`.
 """
 import json
 import os
@@ -12,8 +16,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-DEFAULT_DB = "ai_usage"
+DEFAULT_DB = "sandbox"
 TIMEOUT_S = 4
+
+# Верхние границы на один вызов flush(), чтобы большая очередь или медленная
+# сеть не задерживали старт сессии аналитика дольше пары секунд.
+FLUSH_TIME_BUDGET_S = 2.0
+FLUSH_MAX_ROWS = 2000
 
 
 class Config(object):
@@ -82,35 +91,81 @@ def write(table, row):
 
 
 def flush():
-    """Отправить накопленное из очереди. Возвращает число отправленных строк."""
-    cfg = Config.from_env()
-    if not cfg.enabled or not os.path.isdir(cfg.queue_dir):
+    """Отправить накопленное из очереди. Возвращает число отправленных строк.
+
+    Никогда не бросает исключений — вся работа обёрнута в try/except.
+    Ограничена по времени (FLUSH_TIME_BUDGET_S) и по числу строк
+    (FLUSH_MAX_ROWS) за один вызов: при большой очереди или медленной сети
+    остаток остаётся в очереди и уйдёт при следующем flush().
+
+    Строки одной таблицы из одного файла очереди отправляются одним батчем
+    (один HTTP-запрос на группу "таблица х файл"). Если батч не отправился,
+    в файл очереди переписывается только неотправленный остаток — уже
+    подтверждённые батчи повторно не шлются.
+    """
+    try:
+        return _flush_impl()
+    except Exception:
         return 0
+
+
+def _flush_impl():
+    cfg = Config.from_env()
+    if not cfg.enabled:
+        return 0
+    try:
+        if not os.path.isdir(cfg.queue_dir):
+            return 0
+        names = sorted(n for n in os.listdir(cfg.queue_dir) if n.endswith(".jsonl"))
+    except Exception:
+        return 0
+
+    deadline = time.monotonic() + FLUSH_TIME_BUDGET_S
     sent = 0
-    for name in sorted(os.listdir(cfg.queue_dir)):
-        if not name.endswith(".jsonl"):
-            continue
+
+    for name in names:
+        if sent >= FLUSH_MAX_ROWS or time.monotonic() >= deadline:
+            break
+
         path = os.path.join(cfg.queue_dir, name)
         try:
             with open(path, encoding="utf-8") as f:
                 items = [json.loads(line) for line in f if line.strip()]
         except Exception:
             continue
-        ok = True
+
+        # Группируем строки файла по таблице, сохраняя порядок первого
+        # появления таблицы — так одна группа = один батч = один запрос.
+        order = []
+        groups = {}
         for item in items:
+            table = item.get("table")
+            if table not in groups:
+                groups[table] = []
+                order.append(table)
+            groups[table].append(item)
+
+        remaining = []
+        for table in order:
+            group_items = groups[table]
+            rows = [gi.get("row") for gi in group_items]
             try:
-                if not _post(cfg, item["table"], [item["row"]]):
-                    ok = False
-                    break
+                ok = _post(cfg, table, rows)
             except Exception:
                 ok = False
-                break
-            sent += 1
-        if ok:
-            try:
+            if ok:
+                sent += len(rows)
+            else:
+                remaining.extend(group_items)
+
+        try:
+            if remaining:
+                with open(path, "w", encoding="utf-8") as f:
+                    for item in remaining:
+                        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+            else:
                 os.remove(path)
-            except OSError:
-                pass
-        else:
-            break
+        except Exception:
+            pass
+
     return sent
