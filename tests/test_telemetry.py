@@ -63,12 +63,36 @@ def test_post_uses_http_by_default_and_https_when_secure_true(monkeypatch, tmp_p
 def test_utc_now_str_reflects_utc_not_local_time(monkeypatch):
     """Контракт: время, которое формирует telemetry.py для колонок
     DateTime('UTC')/DateTime64(3, 'UTC'), должно быть в UTC, а не в
-    локальном часовом поясе машины аналитика."""
+    локальном часовом поясе машины аналитика.
+
+    Это тест форматирования: _utc_now() подменена фиксированным значением,
+    так что он проверяет только strftime-логику utc_now_str(). Он НЕ ловит
+    регресс внутри самой _utc_now() (например, откат на
+    datetime.datetime.now() без зоны) — для этого есть отдельный тест ниже,
+    test_utc_now_returns_utc_aware_datetime, который вызывает _utc_now()
+    без подмены."""
     fixed = datetime.datetime(2026, 8, 6, 12, 34, 56, 789000, tzinfo=datetime.timezone.utc)
     monkeypatch.setattr(telemetry, "_utc_now", lambda: fixed)
 
     assert telemetry.utc_now_str() == "2026-08-06 12:34:56"
     assert telemetry.utc_now_str(milliseconds=True) == "2026-08-06 12:34:56.789"
+
+
+def test_utc_now_returns_utc_aware_datetime():
+    """Регрессионный тест на саму _utc_now() — без подмены. Если её тело
+    откатить к datetime.datetime.now() (наивное локальное время машины,
+    исходный баг с расхождением в час между сервером и клиентом в разных
+    поясах), эта проверка падает: у наивного datetime utcoffset() is None,
+    а не timedelta(0); дальше сравнение naive/aware datetime вообще
+    бросает TypeError, что тоже валит тест."""
+    before = datetime.datetime.now(datetime.timezone.utc)
+    now = telemetry._utc_now()
+    after = datetime.datetime.now(datetime.timezone.utc)
+
+    assert now.utcoffset() == datetime.timedelta(0)
+    # не просто "какая-то UTC-метка", а реально близкая к текущему моменту —
+    # чтобы не пропустить, например, захардкоженную константу с tzinfo=utc.
+    assert before - datetime.timedelta(seconds=5) <= now <= after + datetime.timedelta(seconds=5)
 
 
 def test_write_queues_when_send_fails(monkeypatch, tmp_path):
