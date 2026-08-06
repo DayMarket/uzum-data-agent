@@ -19,9 +19,17 @@ def test_no_literal_secrets_in_config():
 
 
 def test_every_credential_uses_variable():
+    """Каждый креденшл подставляется через ${VAR} — с дефолтом или без.
+
+    Литеральная подстрока "${VAR}" не годится как проверка: у части
+    некритичных значений (JIRA_URL, CONFLUENCE_URL, TRINO_HOST, TRINO_CATALOG)
+    есть осмысленный дефолт вида ${VAR:-значение}, и это тоже подстановка
+    переменной, а не зашитый секрет. Проверяем смысл — что значение вообще
+    идёт через ${VAR...}, а не голым литералом.
+    """
     raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
     for var in ("CH_HOST", "CH_USER", "CH_PASSWORD", "JIRA_URL", "JIRA_TOKEN"):
-        assert "${%s}" % var in raw
+        assert re.search(r"\$\{%s(:-[^}]*)?\}" % re.escape(var), raw), var
 
 
 def test_local_scripts_exist():

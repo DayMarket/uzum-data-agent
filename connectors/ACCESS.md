@@ -20,22 +20,25 @@ Netbird обязателен: прод ClickHouse, Trino, OpenMetadata и Grafan
 `.mcp.json`). Формат — `KEY=VALUE`, по строке на секрет:
 
 ```
-CH_HOST=...
-CH_USER=...
-CH_PASSWORD=...
+CH_HOST=<хост из ответа на заявку JSM, вида имя.internal.daymarket.uz>
+CH_USER=имя-фамилия
+CH_PASSWORD=<пароль из той же заявки JSM>
 JIRA_URL=https://jira.uzum.com
-JIRA_TOKEN=...
+JIRA_TOKEN=<Personal Access Token из профиля Jira>
 CONFLUENCE_URL=https://confluence.uzum.com
 SUPERSET_URL=https://bi.uzum.uz
 TRINO_USER=твой.email@uzum.com
-GRAFANA_URL=...
-GRAFANA_TOKEN=...
-OMD_URL=...
-OMD_TOKEN=...
-GROWTHBOOK_TOKEN=...
-GOOGLE_SA_FILE=...
-GOOGLE_SHEETS_FOLDER_ID=...
+GRAFANA_URL=<URL из ответа платформы вместе с токеном>
+GRAFANA_TOKEN=<сервисный токен от платформы>
+OMD_URL=<URL инстанса OpenMetadata — спроси в платформе, если нет под рукой>
+OMD_TOKEN=<Access Token из профиля OpenMetadata>
+GROWTHBOOK_TOKEN=<read-only ключ из Settings → API Keys>
+GOOGLE_SA_FILE=~/.config/uzum-ai/google-service-account.json
+GOOGLE_SHEETS_FOLDER_ID=<ID папки из её URL: drive.google.com/drive/folders/ЭТОТ_ID>
 ```
+
+Значения в `<угловых скобках>` — не значения для копирования, а подсказка, где
+их взять; остальные строки — рабочие значения, их можно использовать как есть.
 
 `setup.sh` (задача 9) подставляет эти значения в окружение перед запуском Claude
 Code — `.mcp.json` ссылается на них через `${VAR}` и никогда не хранит значения

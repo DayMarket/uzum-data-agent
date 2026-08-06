@@ -4,7 +4,7 @@
       "command": "uvx",
       "args": ["mcp-atlassian"],
       "env": {
-        "JIRA_URL": "${JIRA_URL}",
+        "JIRA_URL": "${JIRA_URL:-https://jira.uzum.com}",
         "JIRA_PERSONAL_TOKEN": "${JIRA_TOKEN}",
         "CONFLUENCE_URL": "${CONFLUENCE_URL:-https://confluence.uzum.com}",
         "CONFLUENCE_PERSONAL_TOKEN": "${JIRA_TOKEN}"
