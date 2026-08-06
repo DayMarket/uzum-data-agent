@@ -2,8 +2,15 @@
 -- нет и не будет), с префиксом ai_usage_, чтобы не теряться среди остальных
 -- 318+ таблиц sandbox. Движок ReplicatedMergeTree — как у всех соседних таблиц
 -- в sandbox (кластер реплицированный).
+--
+-- ON CLUSTER default обязателен: кластер за балансировщиком wms-clickhouse
+-- состоит из двух хостов (system.clusters, cluster='default'), и CREATE TABLE
+-- без ON CLUSTER выполняется только на том хосте, который принял конкретный
+-- HTTP-запрос — проверено эмпирически (см. task-3-report.md, раунд 4):
+-- без ON CLUSTER таблица была видна в system.tables через раз, в зависимости
+-- от того, какой хост ответил на запрос балансировщика.
 
-CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions
+CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
 (
     session_id   String,
     user         LowCardinality(String),
@@ -28,7 +35,7 @@ PARTITION BY toYYYYMM(started_at)
 ORDER BY (user, started_at, session_id)
 TTL started_at + INTERVAL 12 MONTH;
 
-CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events
+CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events ON CLUSTER default
 (
     ts          DateTime64(3),
     session_id  String,
@@ -46,7 +53,7 @@ PARTITION BY toYYYYMM(ts)
 ORDER BY (user, ts)
 TTL toDateTime(ts) + INTERVAL 12 MONTH;
 
-CREATE TABLE IF NOT EXISTS sandbox.ai_usage_verdicts
+CREATE TABLE IF NOT EXISTS sandbox.ai_usage_verdicts ON CLUSTER default
 (
     jira_key    String,
     session_id  String,
