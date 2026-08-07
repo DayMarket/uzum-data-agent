@@ -1,4 +1,5 @@
-"""Помощники установщика: запись секретов и списка включённых серверов.
+"""Помощники установщика: запись секретов, список включённых серверов и
+чтение файла доступов `.env` (задача 14 — заполнение мастера файлом).
 
 Только стандартная библиотека — этот модуль подключается из setup.sh (мастер
 установки), который должен работать до того, как в системе появится хоть один
@@ -6,6 +7,7 @@
 """
 import json
 import os
+import stat
 
 import envfile
 
@@ -33,6 +35,41 @@ def write_env(path, values):
         for key, value in existing.items():
             f.write(envfile.format_line(key, value))
     os.chmod(path, 0o600)
+
+
+def read_dotenv(path):
+    """Прочитать файл доступов `.env`, заполненный человеком вручную.
+
+    Тот же разборщик, что и для secrets.env (envfile.read) — второго парсера
+    нарочно нет, чтобы значение с пробелом/`$`/бэктиком/кавычкой не сломалось
+    здесь так же, как это уже однажды случилось с secrets.env (см.
+    tests/test_envfile.py). `.env` лежит внутри рабочей папки, а не в
+    ~/.config/uzum-ai — тот же класс данных (пароли в открытом виде), поэтому
+    права проверяются и ужимаются до 600 точно так же, как каталог секретов
+    ужимается до 700 в write_env.
+
+    Возвращает (значения, было_ли_право_сужено). Отсутствие файла — не
+    ошибка, как и для envfile.read.
+    """
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except OSError:
+        return {}, False
+    tightened = False
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        os.chmod(path, 0o600)
+        tightened = True
+    return envfile.read(path), tightened
+
+
+def missing_keys(values, required):
+    """Обязательные ключи, которых нет в `values` или которые пусты.
+
+    Порядок из `required` сохраняется. Пустая строка считается "не
+    заполнено" — ровно та же граница, на которой мастер в интерактивном
+    режиме переспрашивает значение, а не молча принимает пустой ввод.
+    """
+    return [key for key in required if not values.get(key)]
 
 
 def write_enabled_servers(path, servers):
