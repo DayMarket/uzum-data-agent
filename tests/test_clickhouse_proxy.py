@@ -86,3 +86,57 @@ def test_source_vars_of_the_other_cluster_are_not_required():
     wms_only = {"CH_WMS_HOST": "h", "CH_WMS_USER": "u", "CH_WMS_PASSWORD": "p"}
     env = clickhouse_proxy.build_env("wms", wms_only)
     assert env["CLICKHOUSE_HOST"] == "h"
+
+
+def test_the_other_clusters_secrets_do_not_leak_into_the_child_environment():
+    """Находка ревью: реальная запускалка одним `source` секретов выставляет
+    в окружение ОБА набора (CH_WMS_* и CH_DWH_*) разом — так уже устроено для
+    Claude Code. Раньше build_env строил результат как `dict(source_env)` и
+    ДОПИСЫВАЛ CLICKHOUSE_*, то есть весь необъяснённый мусор из source_env
+    (включая CH_DWH_PASSWORD, когда собирали wms) утекал в дочерний процесс
+    как есть. Дочерний процесс (mcp-clickhouse) читает только CLICKHOUSE_*,
+    но секрет соседнего кластера всё равно оказывался в его os.environ —
+    доступен через /proc, любой дочерний subprocess, дамп на падении и т.д.
+
+    Правильное поведение: результат build_env строится с нуля, явным
+    минимальным списком (CLICKHOUSE_* для СВОЕГО кластера плюс объяснённые
+    системные вроде PATH/HOME) — ничего из source_env не должно попадать
+    внутрь просто потому, что оно там было."""
+    wms_env = clickhouse_proxy.build_env("wms", COMBINED_ENV)
+
+    assert "CH_DWH_HOST" not in wms_env
+    assert "CH_DWH_USER" not in wms_env
+    assert "CH_DWH_PASSWORD" not in wms_env
+    assert "CH_DWH_PORT" not in wms_env
+    assert "CH_DWH_SECURE" not in wms_env
+    # Свои собственные CH_WMS_*-имена (не переименованные в CLICKHOUSE_*)
+    # тоже не должны задваиваться в результате.
+    assert "CH_WMS_HOST" not in wms_env
+    assert "CH_WMS_PASSWORD" not in wms_env
+    # Посторонний мусор из source_env не должен просачиваться вообще.
+    assert "UNRELATED" not in wms_env
+
+    dwh_env = clickhouse_proxy.build_env("dwh", COMBINED_ENV)
+    assert "CH_WMS_HOST" not in dwh_env
+    assert "CH_WMS_PASSWORD" not in dwh_env
+    assert "UNRELATED" not in dwh_env
+
+
+def test_child_environment_is_limited_to_an_explicit_allowlist():
+    """Дополнительная защита от регрессии: перечисляем ВСЕ ключи, которые
+    вообще имеют право оказаться в результате, а не только отсутствие
+    секретов соседа — иначе завтрашняя новая "системная" переменная могла бы
+    молча начать копироваться так же, как раньше копировалось всё целиком."""
+    allowed_keys = {
+        "CLICKHOUSE_HOST", "CLICKHOUSE_USER", "CLICKHOUSE_PASSWORD",
+        "CLICKHOUSE_PORT", "CLICKHOUSE_SECURE",
+        "MCP_TRANSPORT", "CLICKHOUSE_VERIFY", "CHDB_ENABLED",
+    } | set(clickhouse_proxy.PASSTHROUGH_SYSTEM_VARS)
+
+    env_with_system_vars = dict(COMBINED_ENV)
+    env_with_system_vars["PATH"] = "/usr/bin:/bin"
+    env_with_system_vars["HOME"] = "/Users/someone"
+    env_with_system_vars["SOME_FUTURE_LEAK"] = "should-never-appear"
+
+    result = clickhouse_proxy.build_env("wms", env_with_system_vars)
+    assert set(result) <= allowed_keys, set(result) - allowed_keys

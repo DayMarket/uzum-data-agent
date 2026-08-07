@@ -55,6 +55,15 @@ import sys
 REQUIRED = ("HOST", "USER", "PASSWORD")  # без дефолта — как и в .mcp.json
 OPTIONAL_DEFAULTS = {"PORT": "8123", "SECURE": "false"}
 
+# Системные переменные, которые нужны самому процессу (не ClickHouse), а не
+# результат "скопировать всё, что было в окружении, на всякий случай". PATH —
+# без него os.execvpe не найдёт бинарь "mcp-clickhouse" по имени (это не
+# опечатка: сама программа ищет себя по PATH, а не по абсолютному пути). HOME
+# — питоновские тулинги (в т.ч. то, на чём стоит uv/сам mcp-clickhouse)
+# нередко падают или пишут не туда без него (кэш, конфиги). Ни то, ни другое
+# не секрет и не специфично для конкретного кластера ClickHouse.
+PASSTHROUGH_SYSTEM_VARS = ("PATH", "HOME")
+
 
 def _prefix_for(cluster: str) -> str:
     cluster = cluster.strip().lower()
@@ -66,12 +75,28 @@ def _prefix_for(cluster: str) -> str:
 
 
 def build_env(cluster: str, source_env: dict) -> dict:
-    """Собрать CLICKHOUSE_*-переменные из CH_<CLUSTER>_*-источника.
+    """Собрать окружение дочернего процесса (mcp-clickhouse) с нуля.
+
+    Находка ревью задачи Codex-3: раньше эта функция строила результат как
+    `dict(source_env)` и ДОПИСЫВАЛА CLICKHOUSE_* поверх — то есть все
+    остальные переменные из source_env (включая CH_DWH_* при сборке wms,
+    когда запускалка одним `source` секретов выставляет в окружение сразу
+    оба кластера — так уже устроено для Claude Code) утекали в дочерний
+    процесс как есть, хотя mcp-clickhouse их не читает и видеть не должен.
+    Секрет соседнего кластера в os.environ дочернего процесса — это утечка
+    сама по себе (доступно любому его subprocess, дампу при падении и т.п.),
+    даже если сам процесс этим значением не пользуется.
+
+    Правильно — наоборот: результат содержит ТОЛЬКО то, что явно перечислено
+    здесь (CLICKHOUSE_* для СВОЕГО кластера, плюс объяснённый минимум
+    системных переменных, см. PASSTHROUGH_SYSTEM_VARS). Ничего не наследуется
+    просто потому, что оно было в source_env.
 
     Чистая функция, не трогает os.environ и не запускает mcp-clickhouse —
-    это позволяет проверить раскладку юнит-тестом (в т.ч. что WMS и DWH из
-    ОДНОГО общего source_env дают РАЗНЫЕ CLICKHOUSE_*, см.
-    tests/test_clickhouse_proxy.py) без сети и без реального пакета.
+    это позволяет проверить сборку юнит-тестом (в т.ч. что WMS и DWH из
+    ОДНОГО общего source_env дают РАЗНЫЕ CLICKHOUSE_* и не видят секретов
+    друг друга, см. tests/test_clickhouse_proxy.py) без сети и без реального
+    пакета.
     """
     prefix = _prefix_for(cluster)
     missing = [prefix + name for name in REQUIRED if not source_env.get(prefix + name)]
@@ -81,15 +106,19 @@ def build_env(cluster: str, source_env: dict) -> dict:
             % (", ".join(missing), cluster)
         )
 
-    env = dict(source_env)
+    env = {}
+    for name in PASSTHROUGH_SYSTEM_VARS:
+        if name in source_env:
+            env[name] = source_env[name]
+
     env["CLICKHOUSE_HOST"] = source_env[prefix + "HOST"]
     env["CLICKHOUSE_USER"] = source_env[prefix + "USER"]
     env["CLICKHOUSE_PASSWORD"] = source_env[prefix + "PASSWORD"]
     for name, default in OPTIONAL_DEFAULTS.items():
         env["CLICKHOUSE_" + name] = source_env.get(prefix + name, default)
-    env.setdefault("MCP_TRANSPORT", "stdio")
-    env.setdefault("CLICKHOUSE_VERIFY", "false")
-    env.setdefault("CHDB_ENABLED", "false")
+    env["MCP_TRANSPORT"] = "stdio"
+    env["CLICKHOUSE_VERIFY"] = "false"
+    env["CHDB_ENABLED"] = "false"
     return env
 
 
