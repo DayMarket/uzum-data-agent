@@ -2,24 +2,74 @@ import re
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
+SKILLS_DIR = REPO_ROOT / ".agents" / "skills"
+CLAUDE_SKILLS_DIR = REPO_ROOT / ".claude" / "skills"
 
 REQUIRED = {"adhoc-export", "data-check", "dashboard-fix", "data-sanity",
             "fix-access", "clickhouse-sql", "trino-iceberg", "superset",
             "superset-fixer", "superset-certifier", "task", "sheets"}
 
+NAME_RE = re.compile(r"^name:\s*(\S+)\s*$", re.MULTILINE)
+
 
 def test_all_required_skills_exist():
+    """Единственный источник скиллов — .agents/skills: Codex ищет их только
+    там, Claude Code — через симлинк из .claude/skills."""
     present = {p.name for p in SKILLS_DIR.iterdir() if p.is_dir()}
     assert REQUIRED.issubset(present), REQUIRED - present
 
 
-def test_every_skill_has_description_frontmatter():
+def test_every_skill_has_name_and_description_frontmatter():
+    """Codex требует name явно во frontmatter — Claude Code его не требует,
+    но лишнее поле ему не мешает."""
     for path in SKILLS_DIR.glob("*/SKILL.md"):
         text = path.read_text(encoding="utf-8")
         assert text.startswith("---"), path
         head = text.split("---")[1]
         assert "description:" in head, path
+        match = NAME_RE.search(head)
+        assert match, path
+        assert match.group(1) == path.parent.name, (
+            path, "name во frontmatter должен совпадать с именем каталога")
+
+
+def test_every_claude_skills_entry_is_a_symlink_not_a_copy():
+    """Копия вместо симлинка не сломает работу сразу, но разъедётся через
+    месяц с оригиналом в .agents/skills, и заметить это будет некому."""
+    entries = [p for p in CLAUDE_SKILLS_DIR.iterdir()
+               if not p.name.startswith(".")]
+    assert entries, "нечего проверять — .claude/skills пуст"
+    for path in entries:
+        assert path.is_symlink(), (path, "не симлинк")
+        target = path.resolve()
+        assert target.is_dir(), (path, "симлинк ведёт в никуда")
+        assert target.parent == SKILLS_DIR.resolve(), (
+            path, "симлинк ведёт не в .agents/skills")
+
+
+def test_claude_skills_symlinks_are_relative():
+    """Абсолютный путь сломается у всех, кроме того, кто его создал —
+    репозиторий клонируют в разные места."""
+    for path in CLAUDE_SKILLS_DIR.iterdir():
+        if path.name.startswith("."):
+            continue
+        raw_target = path.readlink()
+        assert not raw_target.is_absolute(), (path, raw_target)
+
+
+def test_no_skill_exists_in_two_copies_on_disk():
+    """Главная проверка: содержимое, доступное по обоим путям, — один и тот
+    же файл на диске (совпадающий inode), а не два одинаковых файла, которые
+    молча разъедутся после первой же правки через один из путей."""
+    for path in CLAUDE_SKILLS_DIR.iterdir():
+        if path.name.startswith("."):
+            continue
+        via_claude = path / "SKILL.md"
+        via_agents = SKILLS_DIR / path.name / "SKILL.md"
+        assert via_claude.exists(), via_claude
+        assert via_agents.exists(), via_agents
+        assert via_claude.samefile(via_agents), (
+            path.name, "SKILL.md существует в двух экземплярах на диске")
 
 
 def test_job_skills_require_data_sanity():

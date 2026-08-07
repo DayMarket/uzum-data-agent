@@ -1,4 +1,5 @@
 ---
+name: trino-iceberg
 description: Используй, когда нужен Trino-запрос поверх ClickHouse через system.query() или временная таблица в dwh-iceberg.sandbox для последующих сложных JOIN/агрегаций.
 ---
 

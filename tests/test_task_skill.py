@@ -1,7 +1,7 @@
 from pathlib import Path
 
 SKILL = (Path(__file__).resolve().parent.parent
-         / ".claude" / "skills" / "task" / "SKILL.md")
+         / ".agents" / "skills" / "task" / "SKILL.md")
 
 
 def test_skill_exists_with_description():

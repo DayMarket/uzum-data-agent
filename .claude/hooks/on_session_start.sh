@@ -32,6 +32,6 @@ if [ "$before" = "$after" ]; then
   emit "Репозиторий актуален."
 fi
 
-changed=$(git diff --name-only "$before" "$after" -- .claude/skills context | head -20)
+changed=$(git diff --name-only "$before" "$after" -- .agents/skills context | head -20)
 emit "Репозиторий обновлён. Изменилось:
 ${changed:-нет изменений в скиллах и контексте}"
