@@ -8,12 +8,30 @@
 #                             superset, trino, grafana, openmetadata,
 #                             growthbook, sheets), либо телеметрию:
 #                             ./setup.sh --add telemetry
+#   ./setup.sh --non-interactive
+#                           — без единого вопроса: значения только из .env,
+#                             по недостающим — список и выход с кодом 1
+#
+# Заполнить доступы файлом вместо вопросов: cp .env.example .env, впиши
+# значения, запусти ./setup.sh как обычно — он найдёт .env сам (или файл по
+# пути в $UZUM_ENV_FILE, если он лежит не в этой папке). Заполненные значения
+# не спрашиваются, но живая проверка всё равно выполняется и печатается —
+# смысл мастера не в том, чтобы просто принять значения, а в том, чтобы
+# показать, что каждый доступ реально работает. Что не заполнено — спросится
+# как обычно.
 set -uo pipefail
 
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS="$HOME/.config/uzum-ai/secrets.env"
 SETTINGS_LOCAL="$REPO_DIR/.claude/settings.local.json"
 SERVERS_LIST="clickhouse atlassian superset trino grafana openmetadata growthbook sheets"
+
+# Заполнено из .env одним из ask_*-хелперов ниже, но не введено человеком и
+# отсутствует в файле — только при --non-interactive (иначе просто спросили
+# бы). Список меток, а не имён переменных: тут читает человек.
+MISSING=()
+NONINTERACTIVE=0
+ENV_FILE=""
 
 # Коннекторы, включённые за этот запуск. Bash 3.2 (дефолтный на macOS) роняет
 # скрипт с "unbound variable" на "${ENABLED[@]}"/"${ENABLED[*]}", если массив
@@ -114,6 +132,135 @@ setup_helpers.write_enabled_servers('$SETTINGS_LOCAL', servers)
 "
 }
 
+# ── Заполнение доступов файлом (.env) вместо вопросов ───────────────────
+#
+# Ищем .env: сперва $UZUM_ENV_FILE (человек может держать файл вне рабочей
+# папки), потом .env в корне репозитория. Нет ни того, ни другого — ничего
+# не меняется, ведём себя ровно как раньше.
+find_env_file() {
+  if [ -n "${UZUM_ENV_FILE:-}" ]; then
+    if [ -f "$UZUM_ENV_FILE" ]; then
+      printf "%s" "$UZUM_ENV_FILE"
+    else
+      fail "UZUM_ENV_FILE указывает на несуществующий файл: $UZUM_ENV_FILE" >&2
+    fi
+    return
+  fi
+  if [ -f "$REPO_DIR/.env" ]; then
+    printf "%s" "$REPO_DIR/.env"
+  fi
+}
+
+# Читает .env тем же разборщиком, что и secrets.env (lib/envfile.py — второго
+# парсера нет, см. lib/setup_helpers.read_dotenv), поднимает права до 600,
+# если они были шире, и печатает найденные значения в формате KEY='value'
+# (envfile.format_line — та же функция, что пишет write_env). Эти строки
+# ниже читаются построчно и заводятся в переменные через read+eval, а не
+# просто `source .env` целиком: .env написан руками и может содержать что
+# угодно, включая бэктики — их нельзя отдавать шеллу на интерпретацию,
+# значение должно остаться литеральным текстом.
+load_env_file() {
+  local path="$1" tightened_marker
+  tightened_marker="$(mk_tmp)"
+  UZUM_DOTENV_PATH="$path" UZUM_TIGHTENED_MARKER="$tightened_marker" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import envfile, setup_helpers
+values, tightened = setup_helpers.read_dotenv(os.environ['UZUM_DOTENV_PATH'])
+if tightened:
+    open(os.environ['UZUM_TIGHTENED_MARKER'], 'w').write('1')
+for k, v in values.items():
+    sys.stdout.write(envfile.format_line(k, v))
+"
+  # >&2, не в стандартный вывод: вызывающий код перенаправляет stdout
+  # load_env_file в файл, который потом `source`-ит — сообщение сюда же
+  # испортило бы этот файл (была найдена именно так: "line N: ✗: command
+  # not found" при source).
+  if [ -s "$tightened_marker" ]; then
+    fail "права на $path были шире 600 — исправил" >&2
+  fi
+}
+
+# ask VAR "приглашение" ["дефолт"]
+# ask_secret VAR "приглашение" [обязателен: метка для --non-interactive]
+#
+# shellcheck (если запущен на этом файле) пометит `read -r "$__var"` как
+# SC2229 и использование $CH_USER/$CH_PASSWORD дальше по файлу как SC2153 —
+# оба ложные срабатывания: shellcheck не умеет проследить чтение в
+# переменную по имени, переданному строкой. Это стандартный приём для
+# bash 3.2 (дефолтный на macOS, где нет `local -n`/namerefs) — `read` внутри
+# вложенной функции пишет в переменную вызывающей функции благодаря
+# динамической области видимости bash, без eval. Проверено вручную:
+# ask вызывается из setup_clickhouse (CH_HOST и т.д. — глобальные) и из
+# setup_telemetry (T_HOST и т.д. — local), в обоих случаях значение
+# долетает до вызывающей функции.
+#
+# Значение уже есть (из .env, или переиграно из другого коннектора, как
+# TELEMETRY_* от рабочего ClickHouse) — не спрашиваем, используем как есть;
+# живая проверка ниже по коду всё равно выполнится по-настоящему. Значения
+# нет и вопросов не задаём (--non-interactive) — просто оставляем пустым:
+# позвать ask_required/ask_required_secret с меткой, если пустое значение
+# должно попасть в отчёт "чего не хватает".
+#
+# `read -r VAR <<< ""` в ветке --non-interactive, а не просто return: скрипт
+# работает под `set -u`, а VAR до этого места вообще не присвоена (это не
+# то же самое, что присвоена пустой строкой) — код ниже, который читает
+# "$VAR" (например `if [ -z "$GRAFANA_URL" ]`), уронил бы скрипт с "unbound
+# variable" на самом первом коннекторе без .env-значения. Такое же
+# присваивание по имени переменной, что и во всех ask*, без eval.
+ask() {
+  local __var="$1" __prompt="$2"
+  if [ -n "${!__var:-}" ]; then
+    return
+  fi
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    read -r "$__var" <<< ""
+    return
+  fi
+  read -rp "$__prompt" "$__var"
+}
+
+ask_secret() {
+  local __var="$1" __prompt="$2"
+  if [ -n "${!__var:-}" ]; then
+    return
+  fi
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    read -r "$__var" <<< ""
+    return
+  fi
+  read -rsp "$__prompt" "$__var"; echo
+}
+
+# Для значений, без которых конкретный шаг живой проверки не имеет смысла
+# (например, JIRA_TOKEN) — если и .env, и вопрос недоступны
+# (--non-interactive), значение попадает в MISSING для итогового отчёта.
+ask_required() {
+  local __var="$1" __prompt="$2" __label="$3"
+  if [ -n "${!__var:-}" ]; then
+    return
+  fi
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    MISSING+=("$__label")
+    read -r "$__var" <<< ""
+    return
+  fi
+  read -rp "$__prompt" "$__var"
+}
+
+ask_required_secret() {
+  local __var="$1" __prompt="$2" __label="$3"
+  if [ -n "${!__var:-}" ]; then
+    return
+  fi
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    MISSING+=("$__label")
+    read -r "$__var" <<< ""
+    return
+  fi
+  read -rsp "$__prompt" "$__var"; echo
+}
+
 check_environment() {
   say "Проверяю окружение…"
   if command -v claude >/dev/null 2>&1; then
@@ -184,12 +331,12 @@ setup_clickhouse() {
   say "── ClickHouse ── логин это корп-почта через дефис, пароль выдаётся заявкой в JSM"
   printf "  Складской кластер (WMS) — основной для операционной аналитики: wms-clickhouse.prod.um.internal\n"
   printf "  Общий DWH (продажи, финансы, маркетинг):                       dwh-clickhouse.prod.um.internal\n"
-  read -rp "  Хост [wms-clickhouse.prod.um.internal]: " CH_HOST
+  ask CH_HOST "  Хост [wms-clickhouse.prod.um.internal]: "
   CH_HOST=${CH_HOST:-wms-clickhouse.prod.um.internal}
-  read -rp "  Порт [8123]: " CH_PORT
+  ask CH_PORT "  Порт [8123]: "
   CH_PORT=${CH_PORT:-8123}
-  read -rp "  Логин: " CH_USER
-  read -rsp "  Пароль: " CH_PASSWORD; echo
+  ask_required CH_USER "  Логин: " "CH_USER (логин ClickHouse)"
+  ask_required_secret CH_PASSWORD "  Пароль: " "CH_PASSWORD (пароль ClickHouse)"
 
   # Пробуем каждую схему в свой файл — иначе при обрыве соединения на втором
   # запросе (например https, если сервер вообще не говорит по TLS) curl не
@@ -257,9 +404,13 @@ setup_clickhouse() {
 setup_telemetry() {
   say "── Телеметрия ── куда хуки пишут статистику работы (sandbox.ai_usage_*)"
   printf "  Таблицы живут на складском кластере — обычно это дефолт ниже.\n"
-  read -rp "  Хост телеметрии [wms-clickhouse.prod.um.internal]: " T_HOST
+  # Seed из .env (TELEMETRY_CH_* — так значения названы в secrets.env, а не
+  # T_HOST/T_PORT — те локальные для этой функции, см. put_env ниже).
+  T_HOST="${TELEMETRY_CH_HOST:-}"
+  ask T_HOST "  Хост телеметрии [wms-clickhouse.prod.um.internal]: "
   T_HOST=${T_HOST:-wms-clickhouse.prod.um.internal}
-  read -rp "  Порт [8123]: " T_PORT
+  T_PORT="${TELEMETRY_CH_PORT:-}"
+  ask T_PORT "  Порт [8123]: "
   T_PORT=${T_PORT:-8123}
 
   local T_USER T_PASSWORD
@@ -268,8 +419,10 @@ setup_telemetry() {
     T_PASSWORD="$CH_PASSWORD"
     ok "тот же хост, что и рабочий ClickHouse — беру уже проверенный логин $T_USER"
   else
-    read -rp "  Логин: " T_USER
-    read -rsp "  Пароль: " T_PASSWORD; echo
+    T_USER="${TELEMETRY_CH_USER:-}"
+    ask T_USER "  Логин: "
+    T_PASSWORD="${TELEMETRY_CH_PASSWORD:-}"
+    ask_secret T_PASSWORD "  Пароль: "
   fi
 
   local http_out https_out http_code https_code scheme
@@ -314,7 +467,7 @@ setup_telemetry() {
 # ── Jira / Confluence (общий токен) ─────────────────────────────────────
 setup_jira() {
   say "── Jira ── Профиль → Personal Access Tokens → Create token"
-  read -rsp "  Токен: " JIRA_TOKEN; echo
+  ask_required_secret JIRA_TOKEN "  Токен: " "JIRA_TOKEN (токен Jira)"
   local out code name
   out="$(mk_tmp)"
   code=$(curl_check "$out" 10 "https://jira.uzum.com/rest/api/2/myself" \
@@ -335,7 +488,7 @@ setup_jira() {
 # подключиться" — поэтому URL всё равно нужно записать, даже без кредов.
 setup_superset() {
   say "── Superset ── кредов не нужно, вход через Keycloak SSO в браузере при первом обращении"
-  read -rp "  URL Superset [https://bi.uzum.uz]: " SUPERSET_URL
+  ask SUPERSET_URL "  URL Superset [https://bi.uzum.uz]: "
   SUPERSET_URL=${SUPERSET_URL:-https://bi.uzum.uz}
   put_env SUPERSET_URL "$SUPERSET_URL"
   ENABLED+=("superset")
@@ -348,7 +501,7 @@ setup_superset() {
 # ошибкой вместо тихого молчания.
 setup_trino() {
   say "── Trino ── кредов не нужно, OAuth2 SSO в браузере при первом запросе"
-  read -rp "  Твой корп. email (для атрибуции запросов, Enter — пропустить): " TRINO_USER
+  ask TRINO_USER "  Твой корп. email (для атрибуции запросов, Enter — пропустить): "
   if [ -n "$TRINO_USER" ]; then
     put_env TRINO_USER "$TRINO_USER"
     ok "включён"
@@ -363,12 +516,12 @@ setup_trino() {
 # коннектор гарантированно не поднимется.
 setup_grafana() {
   say "── Grafana ── сервисный токен у платформы (URL приходит вместе с ним)"
-  read -rp "  URL Grafana (Enter — пропустить): " GRAFANA_URL
+  ask GRAFANA_URL "  URL Grafana (Enter — пропустить): "
   if [ -z "$GRAFANA_URL" ]; then
     fail "пропущено — подключить позже: ./setup.sh --add grafana"
     return
   fi
-  read -rsp "  Токен: " GRAFANA_TOKEN; echo
+  ask_required_secret GRAFANA_TOKEN "  Токен: " "GRAFANA_TOKEN (Grafana токен — GRAFANA_URL уже указан)"
   local out code org
   out="$(mk_tmp)"
   code=$(curl_check "$out" 10 "${GRAFANA_URL%/}/api/org" \
@@ -389,12 +542,12 @@ setup_grafana() {
 # без дефолта, брифом не спрашивался.
 setup_openmetadata() {
   say "── OpenMetadata ── Профиль → Access Token (URL — спроси в платформе, если нет под рукой)"
-  read -rp "  URL OpenMetadata (Enter — пропустить): " OMD_URL
+  ask OMD_URL "  URL OpenMetadata (Enter — пропустить): "
   if [ -z "$OMD_URL" ]; then
     fail "пропущено — подключить позже: ./setup.sh --add openmetadata"
     return
   fi
-  read -rsp "  Токен: " OMD_TOKEN; echo
+  ask_required_secret OMD_TOKEN "  Токен: " "OMD_TOKEN (OpenMetadata токен — OMD_URL уже указан)"
   local out code who
   out="$(mk_tmp)"
   code=$(curl_check "$out" 10 "${OMD_URL%/}/api/v1/users/loggedInUser" \
@@ -417,7 +570,7 @@ setup_openmetadata() {
 # было в брифе, и проверка перенесётся на первое обращение внутри сессии.
 setup_growthbook() {
   say "── GrowthBook ── Settings → API Keys → read-only ключ"
-  read -rsp "  Токен (Enter — пропустить): " GROWTHBOOK_TOKEN; echo
+  ask_secret GROWTHBOOK_TOKEN "  Токен (Enter — пропустить): "
   if [ -n "$GROWTHBOOK_TOKEN" ]; then
     put_env GROWTHBOOK_TOKEN "$GROWTHBOOK_TOKEN"
     ENABLED+=("growthbook")
@@ -434,7 +587,7 @@ setup_growthbook() {
 # битый JSON, не тот тип ключа) была видна сразу, а не при первом запросе.
 setup_sheets() {
   say "── Google Sheets ── файл сервисного аккаунта — у Насти"
-  read -rp "  Путь к файлу (Enter — пропустить): " GOOGLE_SA_FILE
+  ask GOOGLE_SA_FILE "  Путь к файлу (Enter — пропустить): "
   if [ -z "$GOOGLE_SA_FILE" ]; then
     fail "пропущено — подключить позже: ./setup.sh --add sheets"
     return
@@ -463,7 +616,7 @@ except Exception as e:
       return
       ;;
   esac
-  read -rp "  ID папки для таблиц (из URL: drive.google.com/drive/folders/ЭТОТ_ID): " GOOGLE_SHEETS_FOLDER_ID
+  ask_required GOOGLE_SHEETS_FOLDER_ID "  ID папки для таблиц (из URL: drive.google.com/drive/folders/ЭТОТ_ID): " "GOOGLE_SHEETS_FOLDER_ID (ID папки Google Sheets — GOOGLE_SA_FILE уже указан)"
   put_env GOOGLE_SA_FILE "$GOOGLE_SA_FILE"
   put_env GOOGLE_SHEETS_FOLDER_ID "$GOOGLE_SHEETS_FOLDER_ID"
   ENABLED+=("sheets")
@@ -489,29 +642,59 @@ run_server() {
 }
 
 # ── разбор аргументов ────────────────────────────────────────────────────
+# Цикл, а не одно `case "${1:-}"`: --non-interactive должен работать в любом
+# порядке рядом с --add NAME, а не только первым аргументом.
 MODE="full"
 ADD_SERVER=""
-case "${1:-}" in
-  --add)
-    MODE="add"
-    ADD_SERVER="${2:-}"
-    if [ -z "$ADD_SERVER" ]; then
-      printf "Использование: ./setup.sh --add <коннектор>\nДоступные: %s %s\n" "$SERVERS_LIST" "$EXTRAS_LIST" >&2
-      exit 1
-    fi
-    ;;
-  --help|-h)
-    cat <<EOF
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --add)
+      MODE="add"
+      ADD_SERVER="${2:-}"
+      if [ -z "$ADD_SERVER" ]; then
+        printf "Использование: ./setup.sh --add <коннектор>\nДоступные: %s %s\n" "$SERVERS_LIST" "$EXTRAS_LIST" >&2
+        exit 1
+      fi
+      shift 2
+      ;;
+    --non-interactive)
+      NONINTERACTIVE=1
+      shift
+      ;;
+    --help|-h)
+      cat <<EOF
 Использование:
-  ./setup.sh              полный мастер установки — все коннекторы за один заход
-  ./setup.sh --add NAME   настроить/переподключить один коннектор ($SERVERS_LIST)
-                          либо телеметрию: ./setup.sh --add telemetry
+  ./setup.sh                    полный мастер установки — все коннекторы за один заход
+  ./setup.sh --add NAME         настроить/переподключить один коннектор ($SERVERS_LIST)
+                                 либо телеметрию: ./setup.sh --add telemetry
+  ./setup.sh --non-interactive  без вопросов: значения только из .env, по
+                                 недостающим — список и код возврата 1
+                                 (сочетается с --add)
+
+Заполнить доступы файлом вместо вопросов: cp .env.example .env, впиши
+значения (или укажи путь к файлу через \$UZUM_ENV_FILE), запусти как обычно.
 EOF
-    exit 0
-    ;;
-esac
+      exit 0
+      ;;
+    *)
+      printf "Неизвестный аргумент: %s\nСправка: ./setup.sh --help\n" "$1" >&2
+      exit 1
+      ;;
+  esac
+done
 
 check_environment
+
+ENV_FILE="$(find_env_file)"
+if [ -n "$ENV_FILE" ]; then
+  say "Нашёл файл доступов: $ENV_FILE"
+  ENV_VARS_FILE="$(mk_tmp)"
+  load_env_file "$ENV_FILE" >"$ENV_VARS_FILE"
+  set -a
+  # shellcheck disable=SC1090
+  . "$ENV_VARS_FILE"
+  set +a
+fi
 
 if [ "$MODE" = "add" ]; then
   run_server "$ADD_SERVER"
@@ -528,6 +711,19 @@ else
 fi
 
 write_enabled
+
+if [ "$NONINTERACTIVE" = "1" ] && [ "${#MISSING[@]}" -gt 0 ]; then
+  say "Без вопросов (--non-interactive) не хватает значений:"
+  for m in "${MISSING[@]}"; do
+    fail "$m"
+  done
+  if [ -n "$ENV_FILE" ]; then
+    fail "впиши их в $ENV_FILE и запусти заново"
+  else
+    fail "заполни .env (шаблон — .env.example, или укажи путь через UZUM_ENV_FILE) и запусти заново"
+  fi
+  exit 1
+fi
 
 mkdir -p "$HOME/.local/bin"
 ln -sf "$REPO_DIR/bin/uzum" "$HOME/.local/bin/uzum"
@@ -556,3 +752,26 @@ cat <<'EOF'
 Если сломалось: /fix-access прямо в сессии
 Добавить доступ позже: ./setup.sh --add <коннектор>
 EOF
+
+# .env — тот же класс данных, что и $SECRETS (пароли, токены в открытом
+# виде), просто лежит внутри рабочей папки. Канонический файл секретов к
+# этому моменту уже записан (put_env писал в него по ходу установки), .env
+# больше не нужен — но удаляем только по явному согласию, не молча.
+if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
+  say "$ENV_FILE хранит пароли и токены в открытом виде."
+  printf "  Секреты уже записаны в %s — файл больше не нужен.\n" "$SECRETS"
+  if [ "$NONINTERACTIVE" = "1" ]; then
+    printf "  Удали %s вручную, когда будет удобно.\n" "$ENV_FILE"
+  else
+    read -rp "  Удалить $ENV_FILE сейчас? [y/N]: " DELETE_ENV
+    case "$DELETE_ENV" in
+      [yY]|[yY][eE][sS])
+        rm -f "$ENV_FILE"
+        ok "$ENV_FILE удалён"
+        ;;
+      *)
+        printf "  Оставил как есть — удали вручную, когда будет удобно.\n"
+        ;;
+    esac
+  fi
+fi
