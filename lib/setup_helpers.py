@@ -8,6 +8,7 @@
 import json
 import os
 import stat
+import time
 
 import envfile
 
@@ -207,6 +208,23 @@ def select_engine(available, requested=None, remembered=None):
     return None, "ambiguous"
 
 
+def should_remember_engine_choice(reason):
+    """Стоит ли ПЕРЕЗАПИСАТЬ запомненный выбор движка (bin/uzum) после
+    select_engine(). Находка ревью задачи Codex-6: bin/uzum сохранял выбор
+    в файл при ЛЮБОМ `reason`, включая "requested" — из-за этого разовый
+    `uzum --codex` при обычно используемом Claude Code молча переписывал
+    дефолт для всех следующих запусков без флага, хотя комментарий рядом
+    прямо говорил, что так делать нельзя (код и комментарий разошлись).
+
+    Правильно — сохранять ТОЛЬКО когда выбор был только что сделан человеком
+    в развилке "оба движка, ничего не решено" (`reason == "ambiguous"`,
+    после интерактивного вопроса). Явный флаг — одноразовый выбор для этого
+    запуска, не должен трогать дефолт. "remembered" уже лежит в файле —
+    перезаписывать нечего. "only_configured" и коды ошибок — там нет
+    неоднозначности, которую стоило бы запоминать."""
+    return reason == "ambiguous"
+
+
 def read_remembered_engine(path):
     """Запомненный выбор движка человеком (bin/uzum, оба движка настроены).
     Отсутствие файла — не ошибка, просто "ничего не запомнено"."""
@@ -230,6 +248,22 @@ def codex_home():
     return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
 
 
+# Первая строка каждого файла профиля, который пишет мастер — маркер
+# происхождения (находка ревью №5). hooks.json сливается бережно (структура
+# понятна — JSON по ключам), но профиль config.toml — непрозрачный текстовый
+# блок, который мы и так генерируем целиком; "слияние" для него не имеет
+# смысла, а асимметрия "хуки бережём, профиль просто затираем" ничем не
+# обоснована — оба файла в равной мере могут оказаться чужими (имя профиля
+# "uzum" — не невозможное совпадение с чужим инструментом или ручной
+# настройкой аналитика). Файл БЕЗ этого маркера считается чужим: не наш,
+# трогать/сравнивать по содержимому нельзя — только переименовать в сторону
+# и написать своё рядом, не молча стерев.
+CODEX_PROFILE_MARKER = (
+    "# uzum-data-agent: сгенерировано автоматически из connectors/registry.py "
+    "— правки руками потрёт следующий ./setup.sh.\n"
+)
+
+
 def deploy_codex_profile(generated_config_toml_path, codex_home_dir,
                           profile_name=CODEX_PROFILE_NAME):
     """Доставить .codex/config.toml (уже сгенерированный tools/render_
@@ -241,21 +275,35 @@ def deploy_codex_profile(generated_config_toml_path, codex_home_dir,
     на запись: там может быть чужое (доверие другим проектам, настройки
     другого инструмента), и оно там и останется. Пишет, только если
     содержимое реально изменилось (та же экономия mtime, что и в
-    tools/render_configs.py::_write). Возвращает True, если файл был
-    записан/обновлён."""
+    tools/render_configs.py::_write).
+
+    Файл профиля с ТЕМ ЖЕ ИМЕНЕМ уже на диске, но БЕЗ нашего маркера в
+    первой строке, — не наш файл: не перезаписывается молча, а переносится
+    рядом (`<profile>.config.toml.foreign-backup-<unix-время>`) перед тем,
+    как мы напишем свой. Ничего чужого не пропадает.
+
+    Возвращает (изменился_ли_файл: bool, путь_бэкапа_чужого|None)."""
     os.makedirs(codex_home_dir, exist_ok=True)
     target = os.path.join(codex_home_dir, "%s.config.toml" % profile_name)
     with open(generated_config_toml_path, encoding="utf-8") as f:
-        content = f.read()
+        content = CODEX_PROFILE_MARKER + f.read()
+
     current = None
     if os.path.exists(target):
         with open(target, encoding="utf-8") as f:
             current = f.read()
+
     if current == content:
-        return False
+        return False, None
+
+    backed_up_to = None
+    if current is not None and not current.startswith(CODEX_PROFILE_MARKER):
+        backed_up_to = "%s.foreign-backup-%d" % (target, int(time.time()))
+        os.rename(target, backed_up_to)
+
     with open(target, "w", encoding="utf-8") as f:
         f.write(content)
-    return True
+    return True, backed_up_to
 
 
 def codex_hook_definitions():

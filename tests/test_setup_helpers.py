@@ -165,6 +165,24 @@ def test_select_engine_none_available_is_reported_as_such():
     assert reason == "none_available"
 
 
+# ── Находка ревью №2/№4: когда bin/uzum вправе ПЕРЕЗАПИСАТЬ запомненный
+# выбор движка. Единственная реализация этой развилки — здесь, bin/uzum
+# сверяется с этой же функцией (через python3 -c), а не переигрывает
+# условие заново в bash: именно расхождение кода и комментария в отдельной
+# bash-копии этой логики и было находкой ревью.
+
+def test_should_remember_engine_choice_only_right_after_asking_interactively():
+    assert setup_helpers.should_remember_engine_choice("ambiguous") is True
+
+
+def test_should_remember_engine_choice_is_false_for_every_other_reason():
+    for reason in (
+        "requested", "remembered", "only_configured",
+        "none_available", "engine_not_available:codex", "engine_not_available:claude",
+    ):
+        assert setup_helpers.should_remember_engine_choice(reason) is False, reason
+
+
 def test_remembered_engine_round_trips_through_a_file(tmp_path):
     path = str(tmp_path / "state" / "engine")
     assert setup_helpers.read_remembered_engine(path) is None  # файла ещё нет
@@ -190,11 +208,14 @@ def test_deploy_codex_profile_writes_named_profile_file_not_base_config(tmp_path
     generated = tmp_path / "generated_config.toml"
     generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
 
-    changed = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+    changed, backed_up_to = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
 
     assert changed is True
+    assert backed_up_to is None  # ничего чужого не было — нечего беречь
     profile_path = codex_home / ("%s.config.toml" % setup_helpers.CODEX_PROFILE_NAME)
-    assert profile_path.read_text(encoding="utf-8") == 'default_permissions = "uzum"\n'
+    written = profile_path.read_text(encoding="utf-8")
+    assert written.startswith(setup_helpers.CODEX_PROFILE_MARKER)
+    assert 'default_permissions = "uzum"' in written
     # Базового config.toml мастер не создаёт и не трогает вообще.
     assert not (codex_home / "config.toml").exists()
 
@@ -225,8 +246,8 @@ def test_deploy_codex_profile_is_idempotent_when_content_unchanged(tmp_path):
     generated = tmp_path / "generated_config.toml"
     generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
 
-    first = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
-    second = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+    first, _ = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+    second, _ = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
 
     assert first is True
     assert second is False  # содержимое не изменилось — второй раз не пишем
@@ -239,11 +260,44 @@ def test_deploy_codex_profile_updates_when_registry_changes(tmp_path):
     setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
 
     generated.write_text('default_permissions = "uzum"\n[mcp_servers.trino]\n', encoding="utf-8")
-    changed = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+    changed, backed_up_to = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
 
     assert changed is True
+    assert backed_up_to is None  # это наш же файл (есть маркер) — не чужой, беречь нечего
     profile_path = codex_home / ("%s.config.toml" % setup_helpers.CODEX_PROFILE_NAME)
     assert "mcp_servers.trino" in profile_path.read_text(encoding="utf-8")
+
+
+# ── Находка ревью №5: чужой файл с тем же именем профиля не затирается молча ──
+#
+# Файл хуков (deploy_codex_hooks) сливается бережно, потому что hooks.json —
+# структурированный JSON, слияние по ключам осмысленно. config.toml профиля —
+# непрозрачный текстовый блоб (мы же его и генерируем целиком) — "слияние"
+# для него не имеет смысла, но молча ЗАТЕРЕТЬ чужой файл с тем же именем
+# профиля («uzum» — не невозможное совпадение) тоже нельзя: асимметрия с
+# hooks.json была необоснованной. Наш файл маркируется комментарием в первой
+# строке; если на диске уже есть файл с этим именем БЕЗ нашего маркера — это
+# не наш файл, и вместо тихой перезаписи он переименовывается в сторону
+# (backed_up_to), а не молча исчезает.
+
+def test_deploy_codex_profile_backs_up_foreign_file_with_the_same_profile_name(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    profile_path = codex_home / ("%s.config.toml" % setup_helpers.CODEX_PROFILE_NAME)
+    foreign_content = "# чей-то ручной профиль, не наш\nmodel = \"o3\"\n"
+    profile_path.write_text(foreign_content, encoding="utf-8")
+    generated = tmp_path / "generated_config.toml"
+    generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
+
+    changed, backed_up_to = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+
+    assert changed is True
+    assert backed_up_to is not None
+    # Чужое содержимое не пропало — лежит рядом, под другим именем, целиком.
+    from pathlib import Path
+    assert Path(backed_up_to).read_text(encoding="utf-8") == foreign_content
+    # А по прежнему пути теперь наш файл, с маркером.
+    assert profile_path.read_text(encoding="utf-8").startswith(setup_helpers.CODEX_PROFILE_MARKER)
 
 
 # ── Хуки Codex: слияние с $CODEX_HOME/hooks.json, не перезапись ────────────

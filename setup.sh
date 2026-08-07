@@ -751,7 +751,7 @@ run_server() {
     growthbook)   setup_growthbook ;;
     sheets)       setup_sheets ;;
     telemetry)    setup_telemetry ;;
-    codex-hooks)  render_engine_configs; deploy_codex_artifacts; check_codex_hook_trust ;;
+    codex-hooks)  run_codex_hooks_target ;;
     *)
       printf "Неизвестный коннектор: %s\nДоступные: %s %s\n" "$1" "$SERVERS_LIST" "$EXTRAS_LIST" >&2
       exit 1
@@ -783,6 +783,9 @@ render_engine_configs() {
 # докстринг deploy_codex_profile в lib/setup_helpers.py про то, почему не
 # слияние в базовый config.toml и не переключение $CODEX_HOME) и сливает
 # хуки телеметрии в $CODEX_HOME/hooks.json, не трогая чужие записи там.
+# Файл профиля с тем же именем, но без нашего маркера в первой строке —
+# не наш; переносится в сторону (foreign-backup-<время>), не затирается
+# молча (находка ревью №5 — та же бережность, что и у hooks.json).
 deploy_codex_artifacts() {
   local codex_home_dir out
   codex_home_dir="${CODEX_HOME:-$HOME/.codex}"
@@ -791,17 +794,24 @@ import os, sys
 sys.path.insert(0, '$REPO_DIR/lib')
 import setup_helpers
 home = os.environ['UZUM_CODEX_HOME_DIR']
-cfg_changed = setup_helpers.deploy_codex_profile(
+cfg_changed, backed_up_to = setup_helpers.deploy_codex_profile(
     '$REPO_DIR/.codex/config.toml', home)
 hooks_changed = setup_helpers.deploy_codex_hooks(home)
-print('профиль %s: %s' % (
-    os.path.join(home, '%s.config.toml' % setup_helpers.CODEX_PROFILE_NAME),
-    'обновлён' if cfg_changed else 'уже актуален'))
+profile_path = os.path.join(home, '%s.config.toml' % setup_helpers.CODEX_PROFILE_NAME)
+if backed_up_to:
+    print('ВНИМАНИЕ: %s уже существовал и не был нашим (нет маркера uzum-data-agent) — '
+          'сохранён как %s, не стёрт' % (profile_path, backed_up_to))
+print('профиль %s: %s' % (profile_path, 'обновлён' if cfg_changed else 'уже актуален'))
 print('хуки %s: %s' % (
     os.path.join(home, 'hooks.json'),
     'обновлены' if hooks_changed else 'уже на месте'))
 ")"
-  printf "%s\n" "$out" | while IFS= read -r line; do ok "$line"; done
+  printf "%s\n" "$out" | while IFS= read -r line; do
+    case "$line" in
+      ВНИМАНИЕ:*) fail "$line" ;;
+      *) ok "$line" ;;
+    esac
+  done
 }
 
 # После доставки — живая проверка факта "хуки Codex доверены", а не догадка
@@ -811,8 +821,23 @@ print('хуки %s: %s' % (
 # `codex exec`: она печатается ТОЛЬКО когда хук реально выполнился (см.
 # отчёт задачи — воспроизведено живым запуском что при отсутствии доверия
 # строки нет вовсе, ни намёка).
+#
+# НАХОДКА РЕВЬЮ (Critical): без `</dev/null` codex exec ждёт "дополнительный
+# ввод со стандартного ввода" в любом контексте, где стандартный ввод самого
+# setup.sh — не голый терминал (в т.ч. запуск не интерактивным человеком, а
+# из другого процесса) — зависает до срабатывания сторожевого таймера, и
+# ИМЕННО ЭТО (не отсутствие доверия) даёт «доверие не выдано». Тот самый
+# класс дефекта, ради поимки которого писалась вся проверка: выглядит как
+# рабочая сессия, а на самом деле нет. Промпт и так передан аргументом,
+# читать с stdin нечего — закрываем его явно.
+#
+# Сторожевой таймер (SIGKILL) и обычное "не доверено" теперь различимы:
+# после `wait` разбираем код возврата — 137 (128+9, соглашение bash для
+# завершения по SIGKILL) означает, что проверка не уложилась в отведённое
+# время, а не что доверие точно не выдано, и об этом сообщается отдельным,
+# явно другим текстом, а не тем же "доверие не выдано".
 check_codex_hook_trust() {
-  local codex_home_dir probe_out pid watchdog
+  local codex_home_dir probe_out status
   codex_home_dir="${CODEX_HOME:-$HOME/.codex}"
   if [ ! -f "$codex_home_dir/auth.json" ]; then
     fail "Codex не авторизован (нет $codex_home_dir/auth.json) — выполни 'codex login', затем ./setup.sh --add codex-hooks, чтобы проверить доверие хукам"
@@ -823,14 +848,21 @@ check_codex_hook_trust() {
     cd "$REPO_DIR" || exit 1
     CODEX_HOME="$codex_home_dir" codex exec -p "$CODEX_PROFILE_NAME" --skip-git-repo-check \
       "Выполни ровно одну shell-команду: echo hook-trust-probe. Затем остановись." \
-      >"$probe_out" 2>&1 &
-    pid=$!
-    ( sleep 90; kill -9 "$pid" 2>/dev/null ) &
-    watchdog=$!
-    wait "$pid" 2>/dev/null
-    kill "$watchdog" 2>/dev/null
-    wait "$watchdog" 2>/dev/null
+      </dev/null >"$probe_out" 2>&1 &
+    child_pid=$!
+    ( sleep 90; kill -9 "$child_pid" 2>/dev/null ) &
+    watchdog_pid=$!
+    wait "$child_pid" 2>/dev/null
+    child_status=$?
+    kill "$watchdog_pid" 2>/dev/null
+    wait "$watchdog_pid" 2>/dev/null
+    exit "$child_status"
   )
+  status=$?
+  if [ "$status" -eq 137 ]; then
+    fail "проверка доверия хукам Codex не уложилась в 90 секунд — похоже, зависла, а не «доверие не выдано». Проверь вручную из терминала: CODEX_HOME=\"$codex_home_dir\" codex exec -p $CODEX_PROFILE_NAME --skip-git-repo-check \"echo test\" </dev/null"
+    return
+  fi
   if grep -q "hook: SessionStart" "$probe_out" 2>/dev/null; then
     ok "доверие хукам Codex выдано — телеметрия будет писаться"
   else
@@ -840,6 +872,23 @@ check_codex_hook_trust() {
     printf "  На экране «Hooks need review» выбери «2. Trust all and continue».\n"
     printf "  Доверие сохранится навсегда для этой машины — проверить снова: ./setup.sh --add codex-hooks\n"
   fi
+}
+
+# Точка входа для `./setup.sh --add codex-hooks` — находка ревью (Important):
+# основной поток проверяет ENGINE_CODEX_FOUND перед доставкой/проверкой, а
+# этот путь — нет. Человек с одним только Claude Code, решивший посмотреть,
+# что за пункт "codex-hooks", без проверки получил бы созданный $CODEX_HOME
+# каталог, которого не просил, и сбивающее с толку «доверие не выдано»
+# вместо честного «Codex не установлен».
+run_codex_hooks_target() {
+  if [ "$ENGINE_CODEX_FOUND" != "1" ]; then
+    fail "Codex не установлен на этой машине — нечего настраивать (доверие хукам относится только к Codex)"
+    fail "Поставь: npm install -g @openai/codex — и запусти ./setup.sh --add codex-hooks ещё раз"
+    return
+  fi
+  render_engine_configs
+  deploy_codex_artifacts
+  check_codex_hook_trust
 }
 
 # ── разбор аргументов ────────────────────────────────────────────────────

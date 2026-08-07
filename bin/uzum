@@ -71,62 +71,75 @@ CODEX_FOUND=0
 command -v claude >/dev/null 2>&1 && CLAUDE_FOUND=1
 command -v codex  >/dev/null 2>&1 && CODEX_FOUND=1
 
-is_available() {
-  case "$1" in
-    claude) [ "$CLAUDE_FOUND" = "1" ] ;;
-    codex)  [ "$CODEX_FOUND" = "1" ] ;;
-    *) return 1 ;;
-  esac
-}
-
-if [ "$CLAUDE_FOUND" = "0" ] && [ "$CODEX_FOUND" = "0" ]; then
-  echo "Не найден ни Claude Code, ни Codex. Запусти ./setup.sh — он подскажет, что поставить."
-  exit 1
-fi
-
-if [ -n "$REQUESTED_ENGINE" ] && ! is_available "$REQUESTED_ENGINE"; then
-  echo "Запрошен --$REQUESTED_ENGINE, но его не видно в PATH на этой машине."
-  exit 1
-fi
-
 REMEMBERED_ENGINE=""
 if [ -f "$ENGINE_CHOICE_FILE" ]; then
   REMEMBERED_ENGINE="$(cat "$ENGINE_CHOICE_FILE" 2>/dev/null || true)"
 fi
 
-# Приоритет выбора движка: явный аргумент → запомненный (если ещё
-# доступен) → единственный настроенный → спросить (оба настроены, ничего
-# не решено заранее).
-ENGINE=""
-if [ -n "$REQUESTED_ENGINE" ]; then
-  ENGINE="$REQUESTED_ENGINE"
-elif [ -n "$REMEMBERED_ENGINE" ] && is_available "$REMEMBERED_ENGINE"; then
-  ENGINE="$REMEMBERED_ENGINE"
-elif [ "$CLAUDE_FOUND" = "1" ] && [ "$CODEX_FOUND" = "0" ]; then
-  ENGINE="claude"
-elif [ "$CODEX_FOUND" = "1" ] && [ "$CLAUDE_FOUND" = "0" ]; then
-  ENGINE="codex"
-fi
+# Приоритет выбора движка и решение "запоминать ли выбор" — ОДНА реализация
+# (lib/setup_helpers.py::select_engine/should_remember_engine_choice,
+# покрыта unit-тестами), а не переигранная копия той же развилки в bash.
+# Находка ревью (задача Codex-6): раньше bin/uzum содержал свою копию этой
+# логики бок о бок с комментарием "запоминаем только когда явного флага не
+# было" — а код на самом деле сохранял выбор при ЛЮБОМ запуске с обоими
+# движками, включая явный флаг; комментарий и код разошлись, и тесты этого
+# не поймали, потому что проверяли не тот файл (python-хелпер, не bash).
+# Здесь такой копии больше нет — bash только собирает вход и разбирает
+# результат.
+SELECT_OUT="$(
+  UZUM_REQUESTED="$REQUESTED_ENGINE" UZUM_REMEMBERED="$REMEMBERED_ENGINE" \
+  UZUM_CLAUDE_FOUND="$CLAUDE_FOUND" UZUM_CODEX_FOUND="$CODEX_FOUND" \
+  python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import setup_helpers
+available = []
+if os.environ.get('UZUM_CLAUDE_FOUND') == '1':
+    available.append('claude')
+if os.environ.get('UZUM_CODEX_FOUND') == '1':
+    available.append('codex')
+requested = os.environ.get('UZUM_REQUESTED') or None
+remembered = os.environ.get('UZUM_REMEMBERED') or None
+engine, reason = setup_helpers.select_engine(available, requested, remembered)
+print(engine or '')
+print(reason)
+print('1' if setup_helpers.should_remember_engine_choice(reason) else '')
+"
+)"
+ENGINE="$(printf '%s\n' "$SELECT_OUT" | sed -n '1p')"
+REASON="$(printf '%s\n' "$SELECT_OUT" | sed -n '2p')"
+SHOULD_REMEMBER="$(printf '%s\n' "$SELECT_OUT" | sed -n '3p')"
 
-if [ -z "$ENGINE" ]; then
-  # Оба движка настроены, и ничего не решено ни аргументом, ни прошлым
-  # запуском — не решаем молча за человека.
-  echo "Установлены оба движка: Claude Code и Codex."
-  read -rp "Какой запускать в этот раз? [claude/codex]: " ENGINE
-  case "$ENGINE" in
-    claude|codex) ;;
-    *)
-      echo "Не понял ответ. Запусти снова с явным выбором: uzum --claude или uzum --codex"
-      exit 1
-      ;;
-  esac
-fi
+case "$REASON" in
+  none_available)
+    echo "Не найден ни Claude Code, ни Codex. Запусти ./setup.sh — он подскажет, что поставить."
+    exit 1
+    ;;
+  engine_not_available:*)
+    echo "Запрошен --${REASON#engine_not_available:}, но его не видно в PATH на этой машине."
+    exit 1
+    ;;
+  ambiguous)
+    # Оба движка настроены, и ничего не решено ни аргументом, ни прошлым
+    # запуском — не решаем молча за человека.
+    echo "Установлены оба движка: Claude Code и Codex."
+    read -rp "Какой запускать в этот раз? [claude/codex]: " ENGINE
+    case "$ENGINE" in
+      claude|codex) ;;
+      *)
+        echo "Не понял ответ. Запусти снова с явным выбором: uzum --claude или uzum --codex"
+        exit 1
+        ;;
+    esac
+    ;;
+esac
 
-# Запоминаем выбор ТОЛЬКО когда он не был передан явным флагом на этот раз
-# и есть что выбирать (оба движка настроены) — иначе одноразовый
-# `uzum --codex` при обычно используемом Claude Code переписал бы дефолт
-# для всех следующих запусков без флага.
-if [ "$CLAUDE_FOUND" = "1" ] && [ "$CODEX_FOUND" = "1" ]; then
+# Запоминаем ТОЛЬКО когда should_remember_engine_choice(reason) сказал да —
+# явный флаг --codex/--claude одноразовый и не должен молча менять дефолт
+# для всех следующих запусков без флага. Решение целиком в python
+# (SHOULD_REMEMBER выше, до интерактивного вопроса), bash здесь ничего не
+# решает заново, только исполняет.
+if [ -n "$SHOULD_REMEMBER" ]; then
   mkdir -p "$STATE_DIR"
   printf "%s\n" "$ENGINE" >"$ENGINE_CHOICE_FILE"
 fi
