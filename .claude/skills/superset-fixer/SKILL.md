@@ -112,7 +112,8 @@ mcp__superset__get_chart_params_summary(chart_id=<id>)
 
 ```python
 mcp__superset__get_dataset(dataset_id=<id>)
-# Проверь таблицу в ClickHouse/Trino
+# Проверь таблицу в ClickHouse (clickhouse-wms или clickhouse-dwh — смотри
+# по колонке «Кластер» в context/marts.md, скилл clickhouse-sql) / Trino
 ```
 
 Подробная методика трассировки от чарта → датасет → таблица → витрина и её

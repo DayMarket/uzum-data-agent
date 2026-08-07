@@ -60,6 +60,10 @@ mcp__superset__get_dataset(dataset_id=<id>)
 Посмотри исходную таблицу и SQL датасета.
 
 ### Шаг 3: проверить таблицу в ClickHouse/Trino
+Выбери кластер ClickHouse по колонке «Кластер» в `context/marts.md` (см. также
+скилл `clickhouse-sql`): `clickhouse-wms` для складских/операционных таблиц,
+`clickhouse-dwh` для продаж/финансов/маркетинга. Реестр не помог — спроси
+человека, не перебирай оба коннектора подряд.
 ```sql
 -- таблица существует?
 SELECT * FROM system.tables WHERE name = '<table_name>'

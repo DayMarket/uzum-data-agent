@@ -16,7 +16,10 @@ description: Диагностика доступов. Используй, ког
    - **401 или 403 у Jira, Grafana, OpenMetadata** → истёк токен, перевыпустить
      по инструкции в `connectors/ACCESS.md`;
    - **Superset или Trino просит логин** → истекла SSO-сессия, откроется браузер;
-   - **ClickHouse отвергает пароль** → пароль меняется заявкой в JSM.
+   - **ClickHouse отвергает пароль** → пароль меняется заявкой в JSM. Учётки
+     `clickhouse-wms` и `clickhouse-dwh` независимые (два разных кластера) —
+     уточни, какой из двух коннекторов жалуется, прежде чем переподключать:
+     `./setup.sh --add clickhouse-wms` или `./setup.sh --add clickhouse-dwh`.
 5. **Если жалоба про телеметрию** («статистика не собирается», «в отчёте нет
    моих сессий») — посмотри очередь:
    `du -sh ~/.local/state/uzum-ai/queue && ls ~/.local/state/uzum-ai/queue | wc -l`

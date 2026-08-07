@@ -5,7 +5,8 @@
 ### 1. Таблица не найдена
 **Паттерн ошибки:** `Table 'schema.table_name' doesn't exist`
 **Причина:** таблицу переименовали, удалили или она никогда не создавалась
-**Проверка:** запроси `information_schema` через `clickhouse` или `trino`
+**Проверка:** запроси `information_schema` через `clickhouse-wms`/`clickhouse-dwh`
+(выбор кластера — по колонке «Кластер» в `context/marts.md`) или `trino`
 
 ### 2. Колонка не найдена
 **Паттерн ошибки:** `Column 'column_name' not found`

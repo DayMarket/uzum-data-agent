@@ -51,8 +51,14 @@ def test_adhoc_export_knows_where_to_put_the_result():
 # superset-fixer, superset-certifier читали дашборд/чарт/скриншот раньше,
 # чем звали data-sanity, а trino-iceberg/clickhouse-sql/superset вообще не
 # упоминали реестр.
+#
+# ClickHouse разведён на два коннектора (clickhouse-wms, clickhouse-dwh) —
+# детектор должен ловить оба новых имени, а не только старое "clickhouse":
+# скилл, который упоминает любой из двух реальных коннекторов, обязан пройти
+# ту же сверку с реестром, что и раньше.
 DATA_TOUCHING_TOOL_RE = re.compile(
-    r"mcp__(superset|trino|clickhouse)__[a-zA-Z_]+|`(superset|trino|clickhouse)`"
+    r"mcp__(superset|trino|clickhouse-wms|clickhouse-dwh)__[a-zA-Z_]+"
+    r"|`(superset|trino|clickhouse-wms|clickhouse-dwh)`"
 )
 
 # Скиллы, которые заведомо не выбирают данные сами — детектор ниже их не
