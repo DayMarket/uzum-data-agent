@@ -2,6 +2,7 @@
 
 > Дата: 07.08.2026. Машина: macOS 26.4 (aarch64), Node v22.22.3, npm 10.9.8.
 > Правило этого документа: если факт не подтверждён запуском — он помечен явно как предположение/непроверено. Ничего не выдаётся за факт по умолчанию.
+> **Обновление 07.08.2026 (вечер):** владелец выполнила `codex login` вручную, блокер по авторизации снят. Раздел 2, 3, часть раздела 5 и раздел "Формат транскрипта" переснял живым запуском (`codex exec`) вместо статического анализа бинаря. Старые статические находки оставлены как перепроверенные — где живой запуск их подтвердил, это отмечено явно; расхождения со статикой — тоже.
 
 ---
 
@@ -59,6 +60,22 @@ Notes
 
 **Что нужно, чтобы разблокировать:** либо `codex login` с браузерным OAuth от рабочего ChatGPT/OpenAI-аккаунта с оплаченной подпиской (интерактивный, у агента браузера нет), либо `OPENAI_API_KEY`, переданный через `printenv OPENAI_API_KEY | codex login --with-api-key`. Ни того ни другого в этой среде нет.
 
+**Обновление: блокер снят.** Владелец выполнила `codex login` вручную на этой машине:
+```bash
+$ codex login status
+Logged in using ChatGPT
+$ codex doctor | grep -A2 "✓ auth"
+  ✓ auth         auth is configured
+      auth storage mode        File
+      auth file                ~/.codex/auth.json
+      stored auth mode         chatgpt
+```
+Для экспериментов ниже (разделы 2, 3, часть 5) не трогал реальный `~/.codex` — поднял изолированный `CODEX_HOME` во временной папке и скопировал в него только `auth.json`, чтобы унаследовать авторизацию без риска для рабочего окружения:
+```bash
+cp ~/.codex/auth.json <temp>/codex-home-live/auth.json
+CODEX_HOME=<temp>/codex-home-live codex login status   # → Logged in using ChatGPT
+```
+
 **Способ установки для инструкции аналитикам:** `npm install -g @openai/codex` (альтернатива — `brew install --cask codex`, доступна в Homebrew, версия в кэше `0.146.1`, не проверял её живьём, т.к. уже стоит npm-версия и ставить вторую бессмысленно).
 
 ---
@@ -92,34 +109,76 @@ claude -p "<промт с Bash echo, Bash exit 9, Read несуществующ�
 {"session_id": "...", "transcript_path": "...", "hook_event_name": "SessionEnd", "reason": "other"}
 ```
 
-### Codex — частично проверено (без модели), частично не проверено (BLOCKED)
+### Codex — проверено живым запуском (обновление после снятия блокера)
 
-Живой сессии с моделью снять не удалось (см. п.1, BLOCKED). Но структуру hook-событий Codex удалось получить из **самого установленного бинаря** статическим анализом (`strings` по `codex.js`-таргету `codex-darwin-arm64/vendor/.../bin/codex`):
+Собрал точно такой же хук-логгер, зарегистрировал его в `hooks.json` изолированного `CODEX_HOME`:
+```json
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "python3 <scratch>/codex_logger.py"}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "python3 <scratch>/codex_logger.py"}]}],
+    "PostToolUse": [{"hooks": [{"type": "command", "command": "python3 <scratch>/codex_logger.py"}]}],
+    "SessionEnd": [{"hooks": [{"type": "command", "command": "python3 <scratch>/codex_logger.py"}]}]
+  }
+}
+```
 
+**Первая находка ещё до payload'ов — хуки Codex нужно явно доверить, иначе они молча не срабатывают.** Первый прогон `codex exec` в новом `CODEX_HOME` не записал ни одной строки в лог хука — не ошибка конфига, а встроенный защитный механизм: хуки, ещё не прошедшие проверку доверия, Codex просто не запускает и не сообщает об этом никак в обычном выводе. Обнаружил это через `codex --help`:
+```
+--dangerously-bypass-hook-trust
+    Run enabled hooks without requiring persisted hook trust for this invocation. DANGEROUS.
+```
+С этим флагом хуки заработали. **Это отдельный, важный для мастера установки факт**: генератор конфигов Codex должен либо провести пользователя через интерактивное доверие хукам (в интерактивном `codex`, не проверял отдельно), либо автоматизация (headless-запуски, CI, `codex exec`) должна использовать `--dangerously-bypass-hook-trust` осознанно — иначе хуки будут молча не работать, и это ещё один способ "колонка тихо остаётся пустой", тот же класс дефекта, что уже ловили на `https`/`tool_error`.
+
+Команда воспроизведения (успешный вызов):
 ```bash
-strings <бинарь-codex> | grep -oE "session_id|transcript_path|hook_event_name|tool_name|tool_input|tool_response|tool_use_id|duration_ms|exit_code|stderr|is_error"
+codex exec "Выполни ровно одну shell-команду: echo hello-codex-hook-test. Затем остановись." \
+  -s workspace-write --skip-git-repo-check --dangerously-bypass-hook-trust
 ```
 
-нашёл в одном непрерывном куске байт (сериализованные имена полей серде-структуры хука):
+Реальный `PostToolUse` (успех):
+```json
+{"session_id": "019fdcd6-258d-7873-b324-82bbef4736b7",
+ "turn_id": "019fdcd6-25bc-7f73-aa2a-fd3b7dd43106",
+ "transcript_path": ".../codex-home-live/sessions/2026/08/07/rollout-2026-08-07T19-27-29-019fdcd6-258d-7873-b324-82bbef4736b7.jsonl",
+ "cwd": ".../codex-project",
+ "hook_event_name": "PostToolUse",
+ "model": "gpt-5.6-sol",
+ "permission_mode": "bypassPermissions",
+ "tool_name": "Bash",
+ "tool_input": {"command": "echo hello-codex-hook-test-2"},
+ "tool_response": "hello-codex-hook-test-2\n",
+ "tool_use_id": "exec-7338f5f5-1024-486e-9d64-0182641355b0"}
 ```
-session_id turn_id agent_type transcript_path cwd hook_event_name model permission_mode
-trigger tool_name tool_input tool_use_id ... tool_response hookEventName permissionDecision
+
+`SessionStart`:
+```json
+{"session_id": "019fdcd6-258d-...", "transcript_path": ".../rollout-....jsonl", "cwd": "...", "hook_event_name": "SessionStart", "model": "gpt-5.6-sol", "permission_mode": "bypassPermissions", "source": "startup"}
 ```
-и отдельно (у другой структуры, `PostToolUseCommandOutputWire`): `duration_ms`/`durationMs`, `exit_code`/`exitCode`, `stderr`, `is_error`/`isError`, `success`.
 
-Это даёт основания полагать (**не факт, вывод из статического анализа кода, не из запуска**), что имена полей в Codex почти дословно совпадают с Claude Code — тот же `snake_case`, те же имена `session_id`, `transcript_path`, `tool_name`, `tool_input`, `tool_response`, `duration_ms`. Отдельного поля `tool_error` в строках бинаря не нашёл ни у Codex, ни (что важно) в реальном payload'е Claude Code — там текст ошибки, если он вообще доходит до хука, физически нет: в живом Claude Code `PostToolUse` в принципе не вызывается для упавших инструментов (см. п.3) — то есть колонка "текст ошибки" у обоих движков как минимум под вопросом, а не просто "неправильное имя поля".
+`SessionEnd`:
+```json
+{"session_id": "019fdcd6-258d-...", "transcript_path": ".../rollout-....jsonl", "cwd": "...", "hook_event_name": "SessionEnd", "reason": "other"}
+```
 
-### Таблица сравнения
+`PostToolUse` при падении инструмента (`exit 9`, воспроизведено, см. раздел 3):
+```json
+{"...": "...", "hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "exit 9"},
+ "tool_response": "", "tool_use_id": "exec-f44253d2-20ef-4636-9a93-786e39701991"}
+```
 
-| Поле | Claude Code (живой запуск) | Codex (статический анализ бинаря, НЕ живой запуск) | Совпадает? |
+### Таблица сравнения (обе стороны — живой запуск)
+
+| Поле | Claude Code (живой запуск) | Codex (живой запуск, `codex exec` + hook-логгер) | Совпадает? |
 |---|---|---|---|
-| ID сессии | `session_id`, есть в каждом событии | `session_id` — имя поля есть в бинаре | похоже да, но Codex-значение не проверено живьём |
-| Путь к транскрипту | `transcript_path`, абсолютный путь до `.jsonl` в `~/.claude/projects/...` | `transcript_path` — имя поля есть в бинаре | похоже да, но не проверено живьём |
-| Имя инструмента | `tool_name` | `tool_name` — есть в бинаре | похоже да, не проверено живьём |
-| Вход инструмента | `tool_input` (объект, специфичный для тула) | `tool_input` — есть в бинаре | похоже да, не проверено живьём |
-| Текст ошибки | **Поля `tool_error` в реальных событиях НЕТ.** `tool_response` содержит `stdout`/`stderr`/`interrupted`, но хук **не вызывается вовсе**, когда инструмент падает (см. п.3) | Отдельного `tool_error` в строках бинаря не нашёл; есть `stderr`, `is_error`/`isError`, `exit_code`/`exitCode` рядом с `PostToolUseCommandOutputWire` | НЕ ПРОВЕРЕНО для Codex; для Claude Code факт — поля с таким именем не существует, и хук на ошибке не срабатывает вовсе |
-| Длительность | `duration_ms`, только в `PostToolUse` при успехе | `duration_ms`/`durationMs` — есть в бинаре | похоже да, не проверено живьём |
-| Причина завершения | `reason` в `SessionEnd` (наблюдал только значение `"other"` при выходе из `-p`-режима) | `reason`-подобные строки встречаются в бинаре рядом с `SessionEnd`, но конкретный набор значений не вытащил | похоже да по имени поля, набор значений не проверен |
+| ID сессии | `session_id`, UUID v4 (`32190b20-ba76-4975-8ff7-...`) | `session_id`, тоже есть в каждом событии, но формат другой — time-ordered ID (`019fdcd6-258d-7873-...`, похож на UUIDv7) | имя поля совпадает, формат значения — нет |
+| Путь к транскрипту | `transcript_path` → `~/.claude/projects/<slug>/<session_id>.jsonl`, один плоский файл на проект | `transcript_path` → `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<timestamp>-<session_id>.jsonl`, раскладка по датам | имя поля совпадает, путь и раскладка — нет; оба JSONL |
+| Имя инструмента | `tool_name`, напр. `"Bash"`, `"Read"` | `tool_name`, в hook-payload тоже `"Bash"` (хотя в транскрипте это же событие называется `custom_tool_call` / `name: "exec"` — hook и транскрипт называют один и тот же вызов по-разному, см. раздел про транскрипт) | имя поля совпадает; значение в hook совпало по счастливой случайности словаря, но источники истины разные |
+| Вход инструмента | `tool_input`: `{"command": "...", "description": "..."}` | `tool_input`: `{"command": "..."}`, без `description` | имя поля совпадает, состав уже |
+| Текст ошибки | Поля `tool_error` нет вообще. `tool_response` — объект `{stdout, stderr, interrupted, isImage, noOutputExpected}`. При ошибке инструмента хук `PostToolUse` **не вызывается совсем** (см. раздел 3) | Поля `tool_error` тоже нет. `tool_response` — не объект, а **голая строка** (только stdout). При ошибке (`exit 9`) хук `PostToolUse` **вызывается**, но `tool_response` — пустая строка `""`, без кода выхода, без признака ошибки, без stderr (см. раздел 3, где на самом деле лежит текст ошибки) | НЕ совпадает ни по имени (`tool_error` нет нигде), ни по типу значения (`object` vs `string`), ни по поведению (не вызывается / вызывается пусто) |
+| Длительность | `duration_ms`, целое число мс, есть в `PostToolUse`, но только при успехе | Поля `duration_ms`/`durationMs` в `PostToolUse` **нет вообще** — ни при успехе, ни при ошибке. Длительность есть только в транскрипте, на уровне всего turn'а (`event_msg` с `type: "task_complete"`, поле `duration_ms`), не на уровне отдельного тула | НЕ совпадает: у Claude Code — в хуке, на уровне тула; у Codex — в хуке нет вовсе, есть только в транскрипте, на уровне turn'а |
+| Причина завершения | `reason` в `SessionEnd`, наблюдал `"other"` (выход из `-p`) | `reason` в `SessionEnd`, наблюдал **тоже** `"other"` (выход из `exec`) | имя поля и наблюдённое значение совпадают; полный набор значений не проверен ни там ни там |
+| Модель, `turn_id`, `permission_mode` | Отсутствуют как отдельные поля в этом виде (модель не передаётся в hook payload Claude Code) | Есть дополнительно: `model` (`"gpt-5.6-sol"`), `turn_id`, `permission_mode` (`"bypassPermissions"` — то же слово, что и у Claude Code, хотя флаг для получения этого режима был другой: `-s workspace-write`, а не `--dangerously-skip-permissions`) | Codex-специфичные лишние поля, у Claude Code их нет |
 
 ---
 
@@ -132,9 +191,43 @@ strings <бинарь-codex> | grep -oE "PreToolUse|PostToolUse[A-Za-z]*|Session
 ```
 Результат — ровно: `PermissionRequest, PostCompact, PostToolUse, PreCompact, PreToolUse, SessionEnd, SessionStart, Stop, SubagentStart, SubagentStop, UserPromptSubmit`. **`PostToolUseFailure` в списке нет** ни разу, ни как отдельное имя, ни как часть составной строки. Это статическое доказательство (дизассемблирование установленного бинаря 0.147.0), не живой запуск — но это самый надёжный источник, доступный без логина: сам код, который будет исполняться.
 
-**Живым запуском с падающим инструментом это подтвердить не смог** (нужна модель → нужна аутентификация → BLOCKED, см. п.1).
+**Обновление — проверено живым запуском на Codex после снятия блокера.** Вызвал заведомо падающий инструмент:
+```bash
+codex exec "Выполни ровно одну shell-команду: exit 9. Она упадёт с кодом 9 — это ожидаемо, зафиксируй результат. Затем остановись." \
+  -s workspace-write --skip-git-repo-check --dangerously-bypass-hook-trust
+```
+Живой вывод самого `codex exec` (видно по строкам `hook: ...`):
+```
+exec
+/bin/zsh -c 'exit 9' in .../codex-project
+ exited 9 in 0ms:
+hook: PostToolUse
+hook: PostToolUse Completed
+codex
+Команда завершилась с ожидаемым кодом `9`. Вывода нет.
+```
+**Факт: у Codex `PostToolUse` срабатывает и при падении инструмента** (в отличие от Claude Code, см. ниже) — событие `PostToolUseFailure` для этого не нужно, `PostToolUse` покрывает оба случая. Но:
 
-**Зато для Claude Code получил неожиданный и важный факт живым запуском**, который отвечает на смежный вопрос "что происходит при падении инструмента":
+**Текста ошибки/кода выхода в самом hook payload нет.** Реальный payload `PostToolUse` для упавшей команды:
+```json
+{"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "exit 9"},
+ "tool_response": "", "tool_use_id": "exec-f44253d2-20ef-4636-9a93-786e39701991"}
+```
+`tool_response` — пустая строка. Никакого `exit_code`, `is_error`, `stderr` в hook-событии нет, хотя эти имена полей и встречались в бинаре статическим анализом (структура `PostToolUseCommandOutputWire`) — на практике в `PostToolUse`-хуке они не заполняются вообще, во всяком случае для локального shell-тула в этой версии.
+
+**Где текст ошибки реально есть — в транскрипте (rollout JSONL), не в хуке.** Разобрал файл из `transcript_path` той же сессии и нашёл пару `response_item`:
+```json
+{"type": "response_item", "payload": {"type": "custom_tool_call", "name": "exec",
+  "input": "const r = await tools.exec_command({\"cmd\":\"exit 9\",...});\ntext(JSON.stringify(r));\n", ...}}
+{"type": "response_item", "payload": {"type": "custom_tool_call_output",
+  "output": [{"type": "input_text", "text": "Script completed\nWall time 0.1 seconds\nOutput:\n"},
+             {"type": "input_text", "text": "{\"chunk_id\":\"d5be48\",\"wall_time_seconds\":0.000002792,\"exit_code\":9,\"original_token_count\":0,\"output\":\"\"}"}], ...}}
+```
+Код выхода (`"exit_code":9`) лежит **внутри второго текстового элемента массива `output`, который сам является JSON-строкой** — то есть нужно распарсить транскрипт и раскодировать вложенный JSON, а не просто прочитать поле верхнего уровня.
+
+**Вывод для дизайна хуков (пункт риска из спеки "теряется главное: где падает"):** в Codex `PostToolUse` ловит сам факт падения (событие приходит), но не даёт код ошибки/текст — для колонки "где падает" нужно либо парсить транскрипт по `transcript_path` после каждого хука, либо смириться с тем, что в реальном времени (из хука) видно только "что инструмент назывался Х", без деталей ошибки.
+
+**Для Claude Code получил обратный по форме, но тоже важный факт живым запуском**, который отвечает на смежный вопрос "что происходит при падении инструмента":
 
 Изолированный тест — один Bash-вызов `exit 9` (гарантированно падает):
 ```bash
@@ -148,9 +241,12 @@ claude -p "вызови Bash 'exit 9' и сразу остановись" --dang
 3 Stop
 4 SessionEnd
 ```
-**`PostToolUse` не сработал вообще** — ни в этом изолированном тесте, ни в комбинированном тесте с тремя шагами (успешный echo → `PostToolUse` сработал; `exit 7` → не сработал; `Read` несуществующего файла → не сработал). Повторил трижды с одинаковым результатом. Значит в текущей версии Claude Code (2.1.224) при ошибке инструмента `PostToolUse` попросту не вызывается — ни под своим именем, ни под именем `PostToolUseFailure` (такого события в списке хуков Claude Code не существует в принципе, а `PostToolUse` в момент ошибки молчит). Текст ошибки в хуках Claude Code в моих тестах увидеть не удалось вообще — только в самом ответе модели, не в hook payload.
+**`PostToolUse` не сработал вообще** — ни в этом изолированном тесте, ни в комбинированном тесте с тремя шагами (успешный echo → `PostToolUse` сработал; `exit 7` → не сработал; `Read` несуществующего файла → не сработал). Повторил трижды с одинаковым результатом. Значит в текущей версии Claude Code (2.1.224) при ошибке инструмента `PostToolUse` попросту не вызывается — ни под своим именем, ни под именем `PostToolUseFailure` (такого события в списке хуков Claude Code не существует в принципе, а `PostToolUse` в момент ошибки молчит). Текст ошибки в хуках Claude Code в моих тестах увидеть не удалось вообще — только в самом ответе модели, не в hook payload; в транскрипте Claude Code (см. следующий раздел) текст ошибки, наоборот, есть — в `tool_result.content` с `is_error: true`.
 
-**Для Codex это осталось непроверенным фактом-предположением**: если поведение аналогично, ловить сбои из `PostToolUse` (как предлагает риск-таблица в спеке) может не сработать и для Codex тоже — но подтвердить или опровергнуть это можно только живой сессией с логином.
+**Итог по обоим движкам (оба — живой запуск, вопрос закрыт):**
+- Claude Code: `PostToolUse` при ошибке не вызывается вовсе → колонку "где падает" из хуков в реальном времени не построить, только постфактум разбором транскрипта.
+- Codex: `PostToolUse` при ошибке вызывается, но без деталей ошибки в payload → колонку "где падает" тоже не построить из одного хука, нужен разбор транскрипта по `transcript_path`, который хук как раз и даёт.
+- Практическое следствие одинаковое для дизайна: код хуков в общем ядре обязан после `PostToolUse` (Codex) или после `Stop`/`SessionEnd` (Claude Code, раз `PostToolUse` молчит) дочитывать транскрипт по `transcript_path`, а не полагаться на то, что текст ошибки придёт в самом событии хука.
 
 ---
 
@@ -238,6 +334,22 @@ CODEX_HOME=<temp> codex debug prompt-input
 ```
 т.е. Codex обнаружил скилл сам, по прямому пути `.agents/skills/`, без обращения к `.claude/skills`-симлинку (что и ожидалось — у Codex своё дерево обнаружения).
 
+**Обновление — то же самое подтверждено живой сессией с моделью (не только `debug prompt-input`).** В той же папке, где рядом лежат и `.agents/skills/recon-probe-skill`, и симлинк `.claude/skills/recon-probe-skill`, запустил:
+```bash
+codex exec "У тебя есть кастомный скилл recon-probe-skill? Используй его и процитируй строку." \
+  -s workspace-write --skip-git-repo-check --dangerously-bypass-hook-trust
+```
+Codex сам прочитал файл именно по прямому пути (видно из его же команды в логе):
+```
+exec
+/bin/zsh -lc "sed -n '1,240p' .agents/skills/recon-probe-skill/SKILL.md" in .../skilltest-src
+...
+codex
+Да, скилл найден и использован.
+> «Если ты видишь этот файл — симлинк или прямой путь сработал.»
+```
+**Проверка симметрии, которую просил координатор: Codex не обращается к `.claude/skills` и не путается от присутствия симлинка рядом** — он читает `.agents/skills/...` напрямую, симлинк для него просто нерелевантный файл в дереве проекта. Значит наличие `.claude/skills`-симлинков (нужных Claude Code) никак не мешает и не дублирует список скиллов у Codex.
+
 **Симлинк переживает `git clone`.** `git ls-files -s` показал режим `120000` (symlink) для `.claude/skills/recon-probe-skill`:
 ```
 100644 ... .agents/skills/recon-probe-skill/SKILL.md
@@ -255,19 +367,54 @@ $ cat .claude/skills/recon-probe-skill/SKILL.md   # читается через 
 
 ---
 
+## 6. Формат транскрипта: JSONL у обоих, структура — разная
+
+**Проверено живым запуском для обоих движков** — сравнил файл из `transcript_path` реальной сессии Claude Code и файл из `transcript_path` реальной сессии Codex (обе сессии — из тестов выше).
+
+### Claude Code
+
+Файл: `~/.claude/projects/<slug-от-пути-проекта>/<session_id>.jsonl`. Один JSON-объект на строку, верхнеуровневые `type`: `queue-operation`, `attachment`, `user`, `assistant`, `last-prompt`.
+
+Ключевое для парсинга: у строк типа `assistant` есть `message.id` (это ID сообщения от Anthropic API, например `msg_011CdoNQmtBMpN86SNWuBL9i`) — **один и тот же `message.id` может повторяться на нескольких соседних строках**, если один логический ответ модели разбит на несколько content-блоков (например, строка с `content:[{"type":"thinking",...}]` и следующая строка с `content:[{"type":"tool_use",...}]` у меня в тесте имели одинаковый `message.id`). Отсюда и правило дедупликации по `message.id`, о котором писал координатор: без него токены/использование по одному логическому ответу модели посчитаются дважды.
+
+Результат тула лежит в отдельной строке `type: "user"` с `message.content: [{"type": "tool_result", "tool_use_id": "...", "content": "...", "is_error": true|false}]` — то есть **код ошибки/факт ошибки в транскрипте Claude Code есть** (`is_error: true`, `content: "Exit code 7"` — снял живьём на тесте с `exit 7` из раздела 2), просто не долетает до hook payload.
+
+### Codex
+
+Файл: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<ISO-таймстамп>-<session_id>.jsonl`. Тоже один JSON-объект на строку, но структура другая: каждая строка — `{"timestamp": "...", "type": "<тип>", "payload": {...}}`, где `type` — один из `session_meta`, `event_msg`, `response_item`, `world_state`, `turn_context`.
+
+Наблюдённые вложенные типы:
+- `response_item` с `payload.type: "message"` — сообщения (developer/user/assistant), у каждого свой уникальный `payload.id` (`msg_...`), повторов на соседних строках не увидел (в отличие от Claude Code) — то есть классическая дедупликация "тот же message.id на нескольких строках" тут, похоже, не нужна.
+- `response_item` с `payload.type: "custom_tool_call"` / `"custom_tool_call_output"` — вызов инструмента и его результат — это **отдельный тип объекта, не вложенный content-блок внутри message**, в отличие от Claude Code, где `tool_use`/`tool_result` — это блоки внутри `message.content`.
+- `event_msg` с `payload.type: "token_count"` — **готовые агрегированные токены** (`total_token_usage`, `last_token_usage`) на каждом шаге, включая `cached_input_tokens`. Codex сам отдаёт куммулятивную сумму — не нужно суммировать/дедуплицировать по `message.id`, как у Claude Code.
+- `event_msg` с `payload.type: "task_complete"` — здесь лежит `duration_ms` **всего turn'а** (в тесте — `17377`), это единственное место, где вообще нашёл длительность живьём для Codex (в hook `PostToolUse` её нет, см. раздел 2).
+- Код ошибки инструмента — внутри `custom_tool_call_output.output`, причём как **JSON-строка внутри текстового элемента массива**, а не как отдельное поле верхнего уровня (пример — в разделе 3).
+
+### Итог для дизайна разбора транскрипта
+
+Формат — **разный настолько, что общий парсер транскрипта переиспользовать нельзя**, только общий факт "это JSONL, читаем построчно". Отличия, которые ломают прямое переиспользование логики Claude Code:
+1. Дедупликация по `message.id` — специфика Claude Code; в Codex-транскрипте увиденные `id` у `response_item` не повторялись, но токены и так агрегированы отдельным событием `token_count`, дедуплицировать нечего.
+2. Вызов тула — блок внутри `message.content` у Claude Code vs отдельный top-level `response_item` (`custom_tool_call`/`custom_tool_call_output`) у Codex.
+3. Ошибка/код выхода — `is_error`+`content` прямо в `tool_result` у Claude Code vs JSON-строка на два уровня вложенности внутри `output` у Codex.
+4. Путь и раскладка файла на диске — плоский файл на сессию у Claude Code vs раскладка по датам (`YYYY/MM/DD`) у Codex.
+
+Значит разбор транскрипта под "sandbox.ai_usage_sessions" придётся писать двумя отдельными парсерами с общим только на уровне "прочитать JSONL построчно", а не одним общим модулем с двумя конфигурациями полей.
+
+---
+
 ## Что проверить не удалось (и почему)
 
 | Что | Почему не проверено |
 |---|---|
-| Живой payload хуков Codex (`SessionStart`, `UserPromptSubmit`, `PostToolUse`, `SessionEnd`) с реальными значениями полей | Codex не авторизован (нет доступа к ChatGPT/OpenAI аккаунту с подпиской и нет `OPENAI_API_KEY`). Все hook-события в Codex требуют активной сессии с моделью — MCP-серверы стартуют без модели (см. п.4), но хуки на события сессии/тула — нет, `codex debug prompt-input` их не эмулирует, это просмотрщик промпта, не хуков. |
-| Реальное срабатывание (или несрабатывание) `PostToolUse` у Codex при падении инструмента | То же самое — нужна живая сессия с моделью, которая вызовет падающий инструмент |
-| Конкретные значения `session_id`/`transcript_path`/`duration_ms` и т.п. у Codex "вживую" | То же самое |
-| Полный набор значений поля `reason`/`stopReason` у обоих движков (видел только `"other"` у Claude Code) | Не воспроизвёл остальные пути завершения (logout, clear, ошибка) за отведённое время |
+| Полный набор значений поля `reason` в `SessionEnd` у обоих движков (видел только `"other"` у обоих — это единственный путь завершения, который даёт неинтерактивный режим, `claude -p` / `codex exec`) | Не воспроизвёл остальные пути завершения (logout, clear, обрыв по ошибке, ручной `/exit` в интерактивном режиме) за отведённое время у обоих движков |
+| Требуется ли `--dangerously-bypass-hook-trust` (или его аналог — интерактивное подтверждение) в обычном интерактивном `codex` (TUI), а не только в `codex exec` | Проверял только неинтерактивный `codex exec`; интерактивный режим с реальным терминалом не гонял (агент работает через непривязанный к TTY Bash) |
 | `brew install --cask codex` как альтернативный способ установки | Не устанавливал вторую копию — уже стоит npm-версия, ставить конфликтующую бессмысленно; факт наличия пакета в brew (`0.146.1`) подтверждён `brew info`, но сама установка этим способом не проверялась |
-| Поведение `codex login --with-api-key` "вживую" | Нет реального `OPENAI_API_KEY` для проверки — использовать выдуманный ключ бессмысленно, т.к. он не пройдёт реальную аутентификацию у OpenAI |
+| Поведение `codex login --with-api-key` "вживую" | Логин уже был сделан владельцем через `codex login` (браузерный ChatGPT OAuth) — способ через `OPENAI_API_KEY` отдельно не перепроверял, т.к. рабочего ключа нет и переавторизовывать рабочий аккаунт ради теста второго способа было бы разрушительно |
+| Полный список hook-событий Codex живьём (`PreToolUse`, `PermissionRequest`, `PreCompact`, `PostCompact`, `SubagentStart`, `SubagentStop`, `Stop`) | Координатор просил закрыть конкретно `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `SessionEnd` — их и снял. Остальные события из official-списка (раздел 3) подтверждены только статическим анализом бинаря, живым запуском не гонял |
+| Payload `PostToolUse` для инструментов, отличных от shell (например, чтение файла, MCP-тул) — только shell (`exec`) проверен живьём для Codex | Не успел прогнать все типы инструментов Codex за отведённое время; shell выбран как самый близкий аналог теста на Claude Code |
 
 ## Явно помеченные предположения (не факты)
 
-- Что имена полей хука Codex (`session_id`, `transcript_path`, `tool_name`, `tool_input`, `tool_response`, `duration_ms`) **в реальном payload'е** совпадают буквально с тем, что лежит в бинаре как строки сериализации serde-структуры — весьма вероятно, но не эквивалентно живому наблюдению: имя поля в бинаре доказывает, что оно *может* появиться в JSON с таким ключом, но не доказывает, при каких условиях оно появляется, чем заполняется и не пусто ли оно.
-- Что поведение Codex "PostToolUse не срабатывает при ошибке" аналогично Claude Code — это перенос наблюдения с одного движка на другой безо всякой проверки; так же вероятно и обратное.
-- Что набор значений `reason`/`stopReason` у Codex такой же, как подсказывают строки бинаря (`clear`, `logout`, `prompt_input_exit`, `other`) — эти строки в бинаре не нашёл, догадка не подтвердилась и не опровергнута.
+- Что набор значений `reason` у `SessionEnd` шире, чем наблюдённое `"other"`, и включает что-то вроде `clear`/`logout`/`prompt_input_exit` — предположение и для Claude Code, и для Codex, ни разу не подтверждённое живым запуском ни для одного из движков.
+- Что поведение `PostToolUse` для не-shell инструментов Codex (MCP-тулы, встроенные инструменты вроде чтения файлов) совпадает с поведением, снятым для shell/`exec` — перенос наблюдения с одного типа тула на все остальные без проверки.
+- Что `--dangerously-bypass-hook-trust` — единственный способ включить хуки в автоматизации; возможно, есть отдельная команда `codex` для постоянного "довериться" конкретному `hooks.json` без флага на каждый вызов (например, аналог `git config --global --add safe.directory`) — не искал специально, т.к. флаг решил задачу и на эксперимент времени не тратил.
