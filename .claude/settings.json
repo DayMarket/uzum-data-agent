@@ -77,8 +77,21 @@
       "mcp__growthbook__growthbook_read_skill"
     ],
     "deny": [
+      "Read(.env)",
+      "Read(**/*.env)",
       "Read(~/.config/uzum-ai/**)",
-      "Read(.env)"
+      "Read(~/.ssh/**)",
+      "Read(~/.aws/**)",
+      "Read(~/.azure/**)",
+      "Read(~/.config/gcloud/**)",
+      "Read(~/.kube/**)",
+      "Read(~/.docker/**)",
+      "Read(~/.netrc)",
+      "Read(~/.npmrc)",
+      "Read(~/.pypirc)",
+      "Read(~/.gnupg/**)",
+      "Read(~/.git-credentials)",
+      "Read(~/.config/gh/**)"
     ]
   },
   "hooks": {

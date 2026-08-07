@@ -115,6 +115,7 @@ deny на `~/.config/uzum-ai/**` и на `**/*.env` внутри репозит�
 должен перегенерироваться на каждой новой машине (`setup.sh`), это
 задокументировано в `tools/render_configs.py`.
 """
+import json
 import os
 import re
 import shutil
@@ -135,6 +136,7 @@ except ModuleNotFoundError:  # pragma: no cover - тесты гоняются п
 
 import render_configs  # noqa: E402
 from connectors.registry import CONNECTORS  # noqa: E402
+from known_secret_paths import KNOWN_SECRET_LOCATIONS  # noqa: E402
 
 TRINO_SRC = (REPO_ROOT / "connectors" / "trino_proxy.py").read_text(encoding="utf-8")
 SUPERSET_SRC = (REPO_ROOT / "connectors" / "superset_mcp.py").read_text(encoding="utf-8")
@@ -310,11 +312,15 @@ def _profile_filesystem_rules(repo_root):
 
 
 def test_secrets_home_and_dotenv_are_denied_in_the_permission_profile(tmp_path):
-    """Правило 2. Возможность, не имя: ищем правило по ПАТТЕРНУ пути (папка
-    секретов домашней директории / любой *.env внутри репозитория), а не по
-    буквальному значению строки — так тест не пропустит, если кто-то поменяет
-    формат пути, но продолжит ловить, если кто-то ослабит access с "deny" на
-    "read"/"write" для того же самого пути."""
+    """Правило 2 — список запрещённых мест, НЕ граница (см. большой докстринг
+    у `_codex_permission_profile_filesystem_rules` в render_configs.py про
+    неудавшуюся попытку "перевернуть модель" и почему она невозможна для
+    Codex с нашей структурой каталогов). Возможность, не имя: ищем правило
+    по ПАТТЕРНУ пути (папка секретов домашней директории / любой *.env НА
+    ВСЁМ ДИСКЕ, не только внутри репозитория), а не по буквальному значению
+    строки — так тест не пропустит, если кто-то поменяет формат пути, но
+    продолжит ловить, если кто-то ослабит access с "deny" на "read"/"write"
+    для того же самого пути."""
     rules = _profile_filesystem_rules(repo_root=tmp_path)
 
     home_secret_rules = [access for pattern, access in rules.items() if "uzum-ai" in pattern]
@@ -324,6 +330,42 @@ def test_secrets_home_and_dotenv_are_denied_in_the_permission_profile(tmp_path):
     env_rules = [access for pattern, access in rules.items() if pattern.endswith("*.env")]
     assert env_rules, "нет ни одного правила про *.env — детектор сломан"
     assert all(access == "deny" for access in env_rules), env_rules
+    # Правило должно быть глобальным (закрывать .env ЛЮБОГО проекта на
+    # диске), а не только внутри репозитория — находка ревью: до доработки
+    # оно было ограничено repo_root, и .env в постороннем каталоге читался
+    # свободно.
+    assert any(not pattern.startswith(str(tmp_path.resolve())) for pattern in
+                (p for p, a in rules.items() if a == "deny" and p.endswith("*.env"))), (
+        "правило про *.env ограничено repo_root — не защищает .env других проектов"
+    )
+
+
+def test_known_secret_locations_are_all_denied_in_the_permission_profile(tmp_path):
+    """Каждая запись из общего для обоих движков списка
+    (lib/known_secret_paths.py::KNOWN_SECRET_LOCATIONS) должна быть закрыта
+    в Codex-профиле — и как файл, и как папка (заранее не знаем, что это),
+    иначе новая запись в списке может тихо не долететь до реального
+    правила filesystem."""
+    rules = _profile_filesystem_rules(repo_root=tmp_path)
+    for location in KNOWN_SECRET_LOCATIONS:
+        assert rules.get(location) == "deny" or rules.get("%s/**" % location) == "deny", (
+            f"{location} не запрещён ни как файл, ни как папка в Codex-профиле"
+        )
+
+
+def test_claude_code_and_codex_deny_the_same_known_secret_locations():
+    """Находка ревью (доработка №3): список запрещённых мест обязан быть
+    ОДНИМ на оба движка — иначе они разойдутся в том, что именно защищено,
+    и это разойдётся молча (у каждого своя система тестов). Здесь сверяем
+    напрямую: для каждой записи из общего списка `.claude/settings.json`
+    должен содержать `Read(<location>/**)` или `Read(<location>)`."""
+    settings_path = REPO_ROOT / ".claude" / "settings.json"
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
+    claude_deny = settings.get("permissions", {}).get("deny", [])
+    for location in KNOWN_SECRET_LOCATIONS:
+        assert (f"Read({location}/**)" in claude_deny or f"Read({location})" in claude_deny), (
+            f"{location} есть в общем списке, но не запрещён в .claude/settings.json"
+        )
 
 
 def test_write_is_scoped_to_work_only(tmp_path):

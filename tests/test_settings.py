@@ -21,11 +21,15 @@ ClickHouse разведён на два коннектора (`clickhouse-wms`, 
 инструменты (`list_databases`/`list_tables`) в allow, `run_query` — нет.
 """
 import re
+import sys
 from pathlib import Path
 
 import json
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "lib"))
+from known_secret_paths import KNOWN_SECRET_LOCATIONS  # noqa: E402
+
 SETTINGS = json.loads((REPO_ROOT / ".claude" / "settings.json").read_text(encoding="utf-8"))
 ALLOW = SETTINGS.get("permissions", {}).get("allow", [])
 DENY = SETTINGS.get("permissions", {}).get("deny", [])
@@ -134,9 +138,19 @@ def test_secrets_paths_are_denied_to_read():
     текстом в ~/.config/uzum-ai/secrets.env (канонический файл) и в .env в
     корне репозитория (README: "хранит пароли в открытом виде"). Deny должен
     закрывать оба, иначе Read → WebFetch на произвольный адрес — рабочая
-    цепочка утечки."""
-    assert "Read(~/.config/uzum-ai/**)" in DENY
+    цепочка утечки.
+
+    Задача Codex-5, доработка №3 (ревью безопасности): список расширен с
+    двух путей до общеизвестных мест, где лежат чужие секреты (SSH-ключи,
+    облачные credentials и т.д.) — источник истины один на оба движка,
+    lib/known_secret_paths.py. Это по-прежнему СПИСОК запрещённых мест, не
+    граница: см. test_claude_code_and_codex_deny_the_same_known_secret_locations
+    в tests/test_codex_permissions.py, которая сверяет этот список с
+    Codex-профилем, и docstring known_secret_paths.py про то, что список не
+    претендует на полноту."""
     assert "Read(.env)" in DENY
+    for location in KNOWN_SECRET_LOCATIONS:
+        assert f"Read({location}/**)" in DENY or f"Read({location})" in DENY, location
 
 
 def test_hooks_survived_next_to_permissions():
