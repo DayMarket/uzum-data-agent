@@ -1,5 +1,14 @@
-sandbox_mode = "workspace-write"
-approval_policy = "on-request"
+default_permissions = "uzum"
+
+[permissions.uzum]
+description = "uzum-data-agent: чтение репозитория, запись только в work/, секреты (.env и ~/.config/uzum-ai) недоступны для чтения"
+extends = ":read-only"
+
+[permissions.uzum.filesystem]
+"~/.config/uzum-ai/**" = "deny"
+"/Users/anastasiabir/Desktop/uzum-data-agent/**/*.env" = "deny"
+"/Users/anastasiabir/Desktop/uzum-data-agent/**" = "read"
+"/Users/anastasiabir/Desktop/uzum-data-agent/work/**" = "write"
 
 [mcp_servers.atlassian]
 command = "uvx"

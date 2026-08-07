@@ -44,22 +44,64 @@ mcp-openmetadata, growthbook mcp) аннотации не объявлены Н�
 из-за которого не взлетел предыдущий пилот. Подробности и варианты решения —
 в отчёте задачи Codex-5 (raздел "что не удалось выразить").
 
-Отдельно, живым запуском проверено и то, что НЕ удалось выразить в принципе
-через `.codex/config.toml`, и это НЕ покрывается тестами ниже: чтение
-секретов (правило 2) и ограничение записи папкой work/ (правило 3) —
-`sandbox_mode` управляет только правами ЗАПИСИ shell-команд, чтение файлов
-(включая `.env` и `~/.config/uzum-ai/secrets.env`) им не ограничено ни в
-одном режиме (`read-only` включительно — имя означает «без права записи», не
-«ограниченное чтение»), а `approval_policy=untrusted` — самая строгая
-документированная политика — по официальному описанию флага (`codex exec
---help`) сама объявляет `cat`/`sed`/`ls` доверенными командами без
-подтверждения независимо от пути аргумента. Оба факта подтверждены живым
-запуском (см. отчёт). Экспериментальная файловая ACL-система `[permissions]`
-обнаружена в бинаре (поля filesystem/network с access read/write/deny), но
-не документирована, помечена внутри как несовместимая с `sandbox_mode`, и
-её точный TOML-синтaксис не установлен за разумное время проб через
-`--strict-config` — закладывать в профиль непроверенный синтаксис для
-требований безопасности значило бы имитировать защиту, а не создавать её.
+Правила 2 (запрет чтения секретов/.env) и 3 (запись только в work/) решает
+ДРУГОЙ, независимый рычаг: именованный профиль разрешений Codex
+(`default_permissions` + `[permissions.<имя>]`), а не `sandbox_mode`. Первая
+версия этой задачи пыталась выразить их через `sandbox_mode`/
+`approval_policy` и не смогла — `sandbox_mode` управляет только правом
+ЗАПИСИ shell-команд, чтение им не ограничено вовсе, а `approval_policy`
+держит `cat`/`sed`/`ls` доверенными независимо от пути. Найдено (и
+подтверждено официальным синтаксисом от координатора, перепроверено живым
+запуском заново): у Codex есть именованные профили `[permissions.<имя>]` с
+правилами `filesystem` (`read`/`write`/`deny` по пути), и `deny` там
+блокирует именно чтение — но **Codex не даёт сочетать `sandbox_mode` с
+именованным профилем: если в конфиге есть оба, профиль молча не
+применяется**. Это и объясняет, почему прошлая версия конфига (с
+`sandbox_mode`, без профиля) пропускала `cat .env` при любых настройках —
+профиля там не было вовсе, а `sandbox_mode` чтение не ограничивает.
+
+`.codex/config.toml` теперь задаёт `default_permissions = "uzum"` +
+`[permissions.uzum]` (`extends = ":read-only"`, три правила filesystem —
+deny на `~/.config/uzum-ai/**` и на `**/*.env` внутри репозитория, read на
+весь репозиторий, write только на `work/**`) и НЕ задаёт `sandbox_mode`/
+`[sandbox_workspace_write]` вовсе. Живым запуском (изолированный
+`CODEX_HOME`, реальный `.codex/config.toml` этого репозитория)
+проверено: `cat .env` и `cat ~/.config/uzum-ai/secrets.env` (с тестовым
+значением) отказывают ДО исполнения команды (файл ни разу не создаётся/не
+читается — проверено по факту на диске, не по тексту ответа модели);
+`echo x > outside.txt` (запись вне work/) не создаёт файл ни из корня
+репозитория, ни после `-C work`; `echo y > work/inside.txt` и чтение
+вложенных файлов репозитория при этом проходят нормально (exit 0,
+реальный вывод); MCP-инструменты (readOnlyHint) по-прежнему не сломаны.
+
+**Находка про `extends`, не запланированная, найдена самопроверкой.**
+Первая версия использовала `extends = ":workspace"` (как в примере
+координатора) — прошла все проверки в изолированной НЕ-git песочнице, но
+повторный прогон в НАСТОЯЩЕМ git-репозитории (эта же копия
+`uzum-data-agent`) показал, что запись вне `work/` всё равно проходит:
+`:workspace` даёт файлам ВНУТРИ git-репозитория неявное разрешение на
+запись, и явные правила `read`/`write` профиля его не отменяют — отменяет
+только `deny`, а `deny` на весь репозиторий убил бы и требуемое правилом 2
+чтение. Фикс — `extends = ":read-only"` (не даёт НИКАКОЙ записи по
+умолчанию), поверх которого `work/**` = write — единственный источник
+права записи. Живым запуском подтверждено в настоящем git-репозитории (не
+только в изолированной песочнице) — см. отчёт задачи Codex-5.
+
+**Важная находка про способ записи путей.** Первая попытка профиля
+использовала специальный ключ `:workspace_roots` (`{"work/**": "write"}`)
+вместо абсолютных путей — все прямые проверки прошли, но `-C work` (флаг
+"использовать эту папку как рабочий корень агента") пересчитывает
+`:workspace_roots` от НОВОГО корня, и запись за пределы `work/` (в старый
+корень репозитория) снова становится разрешённой: живой запуск, `echo z1 >
+../outside.txt` после `-C work` выполнился (`exit 0`, файл реально
+создан). С абсолютными путями (как сейчас в `tools/render_configs.py`) та
+же попытка `-C work` ничего не создаёт — `operation not permitted`.
+Абсолютный путь — цена этой устойчивости: он вычисляется в момент
+генерации из расположения `tools/render_configs.py` на диске, то есть
+`.codex/config.toml` перестаёт быть машинно-независимым для этого одного
+поля (остальное — команды коннекторов — по-прежнему относительные пути) и
+должен перегенерироваться на каждой новой машине (`setup.sh`), это
+задокументировано в `tools/render_configs.py`.
 """
 import re
 import sys
@@ -207,17 +249,98 @@ def test_generated_codex_toml_matches_current_file_on_disk():
     assert generated == current
 
 
-def test_sandbox_and_approval_defaults_are_not_dangerously_weak():
-    """`sandbox_mode`/`approval_policy` не решают правила 2 и 3 (см. докстринг
-    модуля) — но задают поведение shell-инструмента Codex (не MCP), и ослабить
-    их до `danger-full-access`/`never` означало бы дополнительно снять даже ту
-    защиту, что есть. Профиль обязан явно задавать оба поля, не полагаясь на
-    дефолт Codex (который меняется от версии к версии)."""
+def test_no_legacy_sandbox_mode_alongside_the_named_profile():
+    """Находка ревью координатора, подтверждённая живым запуском: Codex не
+    даёт сочетать `sandbox_mode`/`[sandbox_workspace_write]` с именованным
+    профилем разрешений — если заданы оба, профиль МОЛЧА не применяется.
+    Это и было причиной, почему первая версия задачи не могла выразить
+    правила 2/3: в конфиге стоял sandbox_mode, а он чтение не ограничивает
+    вовсе. Профиль обязан быть единственным источником политики
+    файловой системы."""
     config = _codex_config()
-    assert config.get("sandbox_mode") in ("read-only", "workspace-write"), config.get("sandbox_mode")
-    assert config.get("sandbox_mode") != "danger-full-access"
-    assert config.get("approval_policy") in ("untrusted", "on-request"), config.get("approval_policy")
-    assert config.get("approval_policy") != "never"
+    assert "sandbox_mode" not in config, config.get("sandbox_mode")
+    assert "sandbox_workspace_write" not in config
+    assert config.get("default_permissions") == render_configs.CODEX_PERMISSION_PROFILE_NAME
+
+
+def _profile_filesystem_rules(repo_root):
+    """Сгенерировать конфиг для ПРОИЗВОЛЬНОГО repo_root (временная папка
+    теста, не обязательно текущая машина) и вернуть таблицу
+    [permissions.<профиль>.filesystem] — так тест проверяет саму функцию
+    генератора (её ПОВЕДЕНИЕ), а не единственное застывшее значение,
+    привязанное к диску этой конкретной машины."""
+    config = tomllib.loads(render_configs.render_codex_toml(CONNECTORS, repo_root=repo_root))
+    profile_name = config["default_permissions"]
+    return config["permissions"][profile_name]["filesystem"]
+
+
+def test_secrets_home_and_dotenv_are_denied_in_the_permission_profile(tmp_path):
+    """Правило 2. Возможность, не имя: ищем правило по ПАТТЕРНУ пути (папка
+    секретов домашней директории / любой *.env внутри репозитория), а не по
+    буквальному значению строки — так тест не пропустит, если кто-то поменяет
+    формат пути, но продолжит ловить, если кто-то ослабит access с "deny" на
+    "read"/"write" для того же самого пути."""
+    rules = _profile_filesystem_rules(repo_root=tmp_path)
+
+    home_secret_rules = [access for pattern, access in rules.items() if "uzum-ai" in pattern]
+    assert home_secret_rules, "нет ни одного правила про ~/.config/uzum-ai — детектор сломан"
+    assert all(access == "deny" for access in home_secret_rules), home_secret_rules
+
+    env_rules = [access for pattern, access in rules.items() if pattern.endswith("*.env")]
+    assert env_rules, "нет ни одного правила про *.env — детектор сломан"
+    assert all(access == "deny" for access in env_rules), env_rules
+
+
+def test_write_is_scoped_to_work_only(tmp_path):
+    """Правило 3. Ищем ВСЕ правила с access="write" (возможность, не имя
+    конкретного пути) и проверяем, что каждое из них ограничено `work/` —
+    если кто-то добавит второе, более широкое правило write (например, на
+    весь репозиторий), тест упадёт, даже если правило про work/ останется
+    нетронутым."""
+    rules = _profile_filesystem_rules(repo_root=tmp_path)
+
+    write_patterns = [pattern for pattern, access in rules.items() if access == "write"]
+    assert write_patterns, "нет ни одного правила write — детектор сломан"
+    for pattern in write_patterns:
+        assert pattern.rstrip("/*").endswith("work"), (
+            f"правило write не ограничено work/: {pattern!r}"
+        )
+
+    repo_root_read_pattern = "%s/**" % str(tmp_path.resolve())
+    assert rules.get(repo_root_read_pattern) == "read", rules.get(repo_root_read_pattern)
+
+
+def test_permission_profile_does_not_extend_workspace():
+    """Регрессия на самую опасную находку доработки: `extends = ":workspace"`
+    даёт файлам ВНУТРИ git-репозитория неявное разрешение на запись, которое
+    явные правила `read`/`write` в filesystem НЕ отменяют (отменяет только
+    `deny`, а `deny` на весь репозиторий убил бы требуемое правилом 2
+    чтение). Профиль, который проходил все проверки в изолированной
+    не-git песочнице, молча пропускал запись вне work/ именно в НАСТОЯЩЕМ
+    git-репозитории — там, где он и должен работать. Явных write-правил в
+    filesystem это не касается (см. test_write_is_scoped_to_work_only) —
+    поэтому нужна отдельная проверка на сам `extends`, а не только на
+    список правил: без неё регрессия на `:workspace` осталась бы
+    незамеченной юнит-тестом (её поймал только живой запуск в реальном
+    репозитории, не изолированная песочница — см. отчёт задачи Codex-5)."""
+    config = _codex_config()
+    profile_name = config["default_permissions"]
+    extends = config["permissions"][profile_name]["extends"]
+    assert extends != ":workspace", extends
+    assert extends == ":read-only", extends
+
+
+def test_permission_profile_does_not_depend_on_workspace_roots_key():
+    """Регрессия на конкретную находку: первая версия профиля использовала
+    специальный ключ `:workspace_roots` для правила write на work/ — все
+    прямые проверки проходили, но `-C work` (смена рабочего корня агента)
+    пересчитывает `:workspace_roots` от НОВОГО корня, и запись за пределы
+    work/ становится разрешена снова (живая проверка в отчёте: `-C work` +
+    `echo z1 > ../outside.txt` создал файл при :workspace_roots и НЕ создал
+    при абсолютных путях). Абсолютные пути этой уязвимости не имеют, поэтому
+    :workspace_roots в правилах файловой системы использоваться не должен."""
+    raw = render_configs.render_codex_toml(CONNECTORS)
+    assert ":workspace_roots" not in raw
 
 
 def test_headless_bypass_flag_is_not_part_of_the_generated_profile():

@@ -142,56 +142,132 @@ def _codex_spec(connector: Connector):
     return connector.command, connector.args, connector.env
 
 
-# ── Codex: базовые настройки профиля (задача Codex-5, "разрешения") ────────
+# ── Codex: именованный профиль разрешений (задача Codex-5, "разрешения") ───
 #
 # У Codex нет allow/deny-списка инструментов, как у Claude Code
-# (.claude/settings.json) — только три рычага, и все три проверены живым
-# запуском (`codex exec` с изолированным CODEX_HOME, отчёт задачи Codex-5):
+# (.claude/settings.json) — только два независимых рычага, оба проверены
+# живым запуском (`codex exec` с изолированным CODEX_HOME, отчёт задачи
+# Codex-5):
 #
 # 1. Решение "спрашивать ли подтверждение на вызов конкретного
 #    MCP-инструмента" Codex принимает ИСКЛЮЧИТЕЛЬНО по полю
 #    `annotations.readOnlyHint`, которое отдаёт сам MCP-сервер в ответе на
-#    `tools/list` — ни sandbox_mode, ни approval_policy тут не участвуют
-#    (проверено во всех девяти комбинациях режим×политика, плюс отдельно
-#    доверие проекту). Поэтому это НЕ настраивается здесь — эти два поля
+#    `tools/list` — этот именованный профиль на MCP-вызовы не влияет
+#    (проверено отдельно: readOnlyHint-инструмент выполняется молча и с этим
+#    профилем тоже). Поэтому это НЕ настраивается здесь — оба поля
 #    прописаны непосредственно в connectors/trino_proxy.py и
-#    connectors/superset_mcp.py, у тех инструментов, что уже одобрены для
-#    Claude Code как read-only в .claude/settings.json. См.
-#    tests/test_codex_permissions.py.
+#    connectors/superset_mcp.py. См. tests/test_codex_permissions.py.
 #
-# 2. `sandbox_mode`/`approval_policy` ниже управляют ДРУГИМ: shell-командами,
-#    которые Codex выполняет сам (не через MCP) — обычный exec-инструмент
-#    агента. Здесь выставлен наименее опасный из документированных вариантов
-#    (workspace-write вместо danger-full-access, on-request вместо never),
-#    но это НЕ решает правила 2 (запрет чтения секретов/.env) и 3 (запись
-#    только в work/) — оба проверены живым запуском и НЕ выполняются: чтение
-#    файла любой shell-командой (cat/sed/...) не ограничено ни в одном
-#    режиме sandbox_mode ("read-only" означает "без права записи", не
-#    "чтение под контролем"), а approval_policy=untrusted по официальному
-#    описанию флага сама держит cat/sed/ls в списке команд, не требующих
-#    подтверждения, независимо от того, какой путь им передан. Подробности,
-#    что проверялось и что не удалось выразить — в отчёте задачи Codex-5.
+# 2. Правила 2 (запрет чтения секретов/.env) и 3 (запись только в work/)
+#    решает ИМЕННО именованный профиль ниже (`[permissions.<имя>]` +
+#    `default_permissions`), а НЕ `sandbox_mode`/`[sandbox_workspace_write]`
+#    — те два поля управляют легаси-песочницей для shell-команд и НАМЕРЕННО
+#    не заданы вообще: Codex не даёт их сочетать с именованным профилем —
+#    если задать оба, профиль молча не применяется (это и объясняет, почему
+#    первая версия этого файла — с sandbox_mode=workspace-write вместо
+#    профиля — не смогла выразить правила 2/3 вообще: `cat .env` проходил
+#    без единого вопроса при любом sandbox_mode/approval_policy, потому что
+#    ни один из них чтение не ограничивает в принципе, только запись).
 #
-# 3. `--dangerously-bypass-approvals-and-sandbox` (обход подтверждений в
-#    headless-режиме, `codex exec`) — это флаг ЗАПУСКА для автоматизации без
-#    терминала, а не часть профиля; в config.toml он не прописывается
-#    никогда — иначе профиль тихо восстановил бы дыру, которую чинит правило
-#    1. Не путать с `--dangerously-bypass-hook-trust` (это отдельный флаг про
-#    доверие хукам, см. docs/codex-facts.md, раздел 7).
-CODEX_BASE_SETTINGS = {
-    "sandbox_mode": "workspace-write",
-    "approval_policy": "on-request",
-}
+#    Профиль `uzum` наследует встроенный `:workspace` (`extends`) и поверх
+#    него задаёт три правила filesystem (проверено живым запуском,
+#    отчёт задачи Codex-5, обходы 1-4 из ревью):
+#      - `~/.config/uzum-ai/**` = deny — единственное место, где секреты
+#        лежат открытым текстом вне репозитория (см. connectors/ACCESS.md).
+#      - `<repo>/**/*.env` = deny — `.env` в корне репозитория и в любой
+#        вложенной папке (в т.ч. work/), той же цели.
+#      - `<repo>/**` = read, `<repo>/work/**` = write — читать можно весь
+#        репозиторий, писать только в work/.
+#    ВАЖНО: пути АБСОЛЮТНЫЕ, не через специальный ключ `:workspace_roots`.
+#    Первая попытка использовала `:workspace_roots = { "work/**" = "write",
+#    ... }` — она успешно проходила все прямые проверки, но не пережила
+#    запуск с `-C work` (или любой другой сменой рабочего корня агента):
+#    `:workspace_roots` пересчитывается от ТЕКУЩЕГО рабочего корня Codex, то
+#    есть `-C work` делает "work/" новым текущим корнем и запись за его
+#    пределами (в старый корень репозитория) снова разрешена — живая
+#    проверка, `echo z1 > ../outside.txt` после `-C work` прошла (exit 0,
+#    файл реально создан). Абсолютные пути этой уязвимости не имеют —
+#    тот же `-C work` с абсолютными путями в профиле не создал файл
+#    (`operation not permitted`, файла на диске нет). Абсолютный путь
+#    вычисляется в момент генерации из `_REPO_ROOT` (см. верх файла) — то
+#    есть меняется от машины к машине; `.codex/config.toml`, закоммиченный
+#    в git, отражает путь той машины, где его в последний раз
+#    регенерировали (`setup.sh`/`tools/render_configs.py`) — при клонировании
+#    на другую машину аналитик обязан прогнать генератор заново (то же
+#    самое, что уже верно для секретов и остального в setup.sh), иначе
+#    правило "работать в work/" будет ссылаться на чужой путь.
+#
+#    `--dangerously-bypass-approvals-and-sandbox` (обход подтверждений и
+#    песочницы в headless-режиме, `codex exec`) — флаг ЗАПУСКА для
+#    автоматизации без терминала, а не часть профиля; в config.toml он не
+#    прописывается никогда. Не путать с `--dangerously-bypass-hook-trust`
+#    (тот — про доверие хукам, см. docs/codex-facts.md, раздел 7).
+#
+#    ВТОРАЯ находка, ещё важнее первой: `extends = ":workspace"` НЕ подошёл
+#    как база профиля — живой запуск в изолированной песочнице (не git) с
+#    `extends=":workspace"` корректно блокировал запись вне work/, но ТОТ ЖЕ
+#    профиль в НАСТОЯЩЕМ git-репозитории (этот самый репозиторий) — нет:
+#    `echo x > outside.txt` в корне репозитория молча создавал файл, хотя
+#    правило `<repo>/work/**` = write было единственным write-правилом в
+#    профиле. Причина: `:workspace` сам по себе даёт файлам ВНУТРИ
+#    git-репозитория неявное разрешение на запись (видимо для обычных
+#    правок кода агентом), и явные правила `read`/`write` в профиле его не
+#    отменяют — отменяет только `deny`, а `deny` заодно убивает и чтение
+#    (правило 2 требует читать весь репозиторий, значит `deny` на весь
+#    репозиторий не годится). Фикс — базовый профиль `:read-only` (не даёт
+#    НИКАКОЙ записи по умолчанию), поверх которого правило `work/**` = write
+#    — единственный источник права записи. Проверено живым запуском заново
+#    в настоящем git-репозитории (не только в изолированной песочнице):
+#    запись вне work/ блокируется даже после `-C work`, запись в work/ и
+#    чтение всего репозитория по-прежнему работают. См. отчёт задачи
+#    Codex-5, раздел "доработка по ревью".
+CODEX_PERMISSION_PROFILE_EXTENDS = ":read-only"
+CODEX_PERMISSION_PROFILE_NAME = "uzum"
+CODEX_SECRETS_HOME_GLOB = "~/.config/uzum-ai/**"
 
 
-def _render_codex_base_settings() -> str:
-    lines = ["%s = %s" % (key, _toml_string(value)) for key, value in CODEX_BASE_SETTINGS.items()]
+def _codex_permission_profile_filesystem_rules(repo_root: Path) -> dict:
+    repo_abs = str(repo_root.resolve())
+    return {
+        CODEX_SECRETS_HOME_GLOB: "deny",
+        "%s/**/*.env" % repo_abs: "deny",
+        "%s/**" % repo_abs: "read",
+        "%s/work/**" % repo_abs: "write",
+    }
+
+
+def _render_codex_permission_profile(repo_root: Path) -> str:
+    """default_permissions + [permissions.<имя>] — см. докстринг выше про то,
+    почему это заменило sandbox_mode/approval_policy, а не дополнило их
+    (Codex не даёт сочетать именованный профиль с sandbox_mode — при обоих
+    сразу профиль молча не применяется)."""
+    lines = [
+        "default_permissions = %s" % _toml_string(CODEX_PERMISSION_PROFILE_NAME),
+        "",
+        "[permissions.%s]" % CODEX_PERMISSION_PROFILE_NAME,
+        "description = %s" % _toml_string(
+            "uzum-data-agent: чтение репозитория, запись только в work/, "
+            "секреты (.env и ~/.config/uzum-ai) недоступны для чтения"
+        ),
+        "extends = %s" % _toml_string(CODEX_PERMISSION_PROFILE_EXTENDS),
+        "",
+        "[permissions.%s.filesystem]" % CODEX_PERMISSION_PROFILE_NAME,
+    ]
+    for pattern, access in _codex_permission_profile_filesystem_rules(repo_root).items():
+        lines.append("%s = %s" % (_toml_string(pattern), _toml_string(access)))
     return "\n".join(lines)
 
 
-def render_codex_toml(connectors: Iterable[Connector]) -> str:
-    """Собрать .codex/config.toml (формат Codex) из реестра коннекторов."""
-    blocks = [_render_codex_base_settings()]
+def render_codex_toml(connectors: Iterable[Connector], repo_root: Path = None) -> str:
+    """Собрать .codex/config.toml (формат Codex) из реестра коннекторов.
+
+    `repo_root` по умолчанию — реальный корень этого репозитория
+    (`_REPO_ROOT`, вычисленный из расположения этого файла на диске);
+    параметр существует, чтобы тесты могли подставить временный путь и
+    не зависеть от того, где именно лежит рабочая копия при прогоне CI."""
+    if repo_root is None:
+        repo_root = _REPO_ROOT
+    blocks = [_render_codex_permission_profile(repo_root)]
     for connector in connectors:
         command, raw_args, env_items = _codex_spec(connector)
         args = [_codex_arg(a) for a in raw_args]
