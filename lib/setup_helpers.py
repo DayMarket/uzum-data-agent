@@ -93,3 +93,246 @@ def write_enabled_servers(path, servers):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
         f.write("\n")
+
+
+# ── Задача Codex-6: движки, доставка конфига Codex, хуки Codex ─────────────
+#
+# Мастер теперь настраивает Claude Code и/или Codex — какие реально стоят
+# на машине. Всё в этом разделе — стандартная библиотека, как и остальной
+# файл (setup.sh дёргает его до появления в системе хоть одного внешнего
+# пакета).
+#
+# Доставка конфига Codex — САМОЕ важное решение задачи (докопался
+# `docs/codex-facts.md`, факт 1): Codex НЕ читает `.codex/config.toml` из
+# папки репозитория сам по себе, только из `$CODEX_HOME`. Рассмотрены и
+# проверены живым запуском два варианта (см. отчёт задачи):
+#
+#   (а) слить наши настройки в $CODEX_HOME/config.toml, аккуратно, не
+#       затирая чужое — требует TOML-парсера, чтобы не потерять то, что там
+#       уже может быть (доверие другим проектам, настройки других
+#       инструментов), а стандартная библиотека Python 3.9 (минимальная
+#       версия, см. бриф задачи) TOML не читает вообще (`tomllib` — только
+#       3.11+, внешние пакеты сюда запрещены);
+#   (б) переключить $CODEX_HOME на папку репозитория — теряет авторизацию,
+#       которая физически лежит в $CODEX_HOME/auth.json;
+#
+# ни один не подошёл. Найден третий, штатный: `codex`/`codex exec`
+# документируют флаг `-p/--profile <имя>` — "Layer $CODEX_HOME/<name>.
+# config.toml on top of the base user config". Проверено живым запуском
+# (изолированный $CODEX_HOME, см. отчёт задачи): файл
+# `$CODEX_HOME/uzum.config.toml` со всем содержимым, которое генерирует
+# `tools/render_configs.py` (профиль разрешений + mcp_servers), применяется
+# ЦЕЛИКОМ через `-p uzum` — даже когда базового `config.toml` нет вовсе
+# (`sandbox: custom permissions` в баннере, `.env` недоступен, коннектор из
+# профиля виден в списке инструментов) и когда базовый `config.toml`
+# существует с посторонним содержимым (доверие другим проектам, другая
+# модель по умолчанию) — это содержимое остаётся на диске нетронутым.
+# Значит мастеру НЕ НУЖНО ни читать, ни парсить, ни писать базовый
+# config.toml вообще — ни TOML-парсер, ни риск затереть чужое.
+#
+# Профиль — не единственный кусок конфига. Хуки Codex живут в ОТДЕЛЬНОМ
+# файле `$CODEX_HOME/hooks.json`, и он НЕ профиль-специфичный (`codex
+# --help` не документирует layering по имени профиля для hooks.json,
+# только для config.toml) — то есть один hooks.json на ВСЕ проекты,
+# которые аналитик когда-либо откроет в Codex. Здесь слепая перезапись
+# реально опасна: на машине автора задачи в $CODEX_HOME уже жил чужой
+# hooks.json (сторонний инструмент, notify-хук на SessionStart/
+# UserPromptSubmit/Stop) — его нужно СЛИТЬ, не заменить.
+CODEX_PROFILE_NAME = "uzum"
+
+# Нет PostToolUseFailure — у Codex такого события не существует (проверено
+# запуском и статическим анализом бинаря, docs/codex-facts.md, раздел 3):
+# PostToolUse у Codex срабатывает и на успехе, и на сбое инструмента, в
+# отличие от Claude Code, где PostToolUse при сбое не вызывается вовсе.
+CODEX_HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse")
+
+
+def detect_engines(which):
+    """Какие из движков (`claude`, `codex`) есть в PATH этой машины.
+
+    `which` — обязательный параметр, не default `shutil.which`: вызывающий
+    код (setup.sh через python3 -c) всегда передаёт настоящий shutil.which
+    явно, а тесты — подставной, не завязанный на PATH машины, где гоняются
+    тесты (там оба движка, один или ни одного могут стоять одновременно).
+    Порядок результата фиксирован (claude, codex), не алфавитной сортировкой
+    множества — вывод не должен прыгать между запусками."""
+    engines = []
+    if which("claude"):
+        engines.append("claude")
+    if which("codex"):
+        engines.append("codex")
+    return engines
+
+
+def engines_setup_plan(available):
+    """Что настраивать, по списку обнаруженных движков (см. detect_engines).
+
+    Ни одного — блокирующая ошибка с командами установки ОБОИХ движков
+    (аналитик без единого инструмента ничем не воспользуется, и мы не
+    гадаем, какой из двух ему нужнее). Один — настраиваем его. Оба —
+    настраиваем оба. Возвращает (список_для_настройки, текст_ошибки|None)."""
+    if not available:
+        return [], (
+            "Не найден ни Claude Code, ни Codex — нужен хотя бы один.\n"
+            "  Claude Code: https://claude.com/code\n"
+            "  Codex:       npm install -g @openai/codex"
+        )
+    return list(available), None
+
+
+def select_engine(available, requested=None, remembered=None):
+    """Какой движок запускать (для bin/uzum). Приоритет:
+
+      1. Явный аргумент (`--codex`/`--claude`) — всегда побеждает. Если
+         запрошенного движка нет на машине — явная ошибка, а не тихий
+         откат на другой: иначе аналитик решит, что сессия пошла в Codex,
+         хотя на самом деле она ушла в Claude Code.
+      2. Запомненный с прошлого раза выбор — если движок всё ещё доступен
+         (мог быть удалён с машины со времени последнего запуска).
+      3. Единственный настроенный движок — если доступен только один.
+      4. Оба доступны, явного выбора и запоминания нет — не решаем молча
+         за человека, отдаём (None, "ambiguous"): bin/uzum должен спросить.
+
+    Возвращает (движок|None, причина — код для сообщения/логики вызывающего)."""
+    if requested:
+        if requested not in available:
+            return None, "engine_not_available:%s" % requested
+        return requested, "requested"
+    if remembered and remembered in available:
+        return remembered, "remembered"
+    if len(available) == 1:
+        return available[0], "only_configured"
+    if not available:
+        return None, "none_available"
+    return None, "ambiguous"
+
+
+def read_remembered_engine(path):
+    """Запомненный выбор движка человеком (bin/uzum, оба движка настроены).
+    Отсутствие файла — не ошибка, просто "ничего не запомнено"."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            value = f.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def write_remembered_engine(path, engine):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(engine + "\n")
+
+
+def codex_home():
+    """$CODEX_HOME, если аналитик его переопределил явно, иначе дефолт
+    самого Codex — ~/.codex (docs/codex-facts.md)."""
+    return os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+
+
+def deploy_codex_profile(generated_config_toml_path, codex_home_dir,
+                          profile_name=CODEX_PROFILE_NAME):
+    """Доставить .codex/config.toml (уже сгенерированный tools/render_
+    configs.py из connectors/registry.py — "существующий генератор" из
+    брифа задачи) туда, где Codex его реально видит: именованным профилем,
+    `$CODEX_HOME/<profile>.config.toml` (см. докстринг раздела выше).
+
+    НЕ трогает $CODEX_HOME/config.toml (базовый) вообще — ни на чтение, ни
+    на запись: там может быть чужое (доверие другим проектам, настройки
+    другого инструмента), и оно там и останется. Пишет, только если
+    содержимое реально изменилось (та же экономия mtime, что и в
+    tools/render_configs.py::_write). Возвращает True, если файл был
+    записан/обновлён."""
+    os.makedirs(codex_home_dir, exist_ok=True)
+    target = os.path.join(codex_home_dir, "%s.config.toml" % profile_name)
+    with open(generated_config_toml_path, encoding="utf-8") as f:
+        content = f.read()
+    current = None
+    if os.path.exists(target):
+        with open(target, encoding="utf-8") as f:
+            current = f.read()
+    if current == content:
+        return False
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(content)
+    return True
+
+
+def codex_hook_definitions():
+    """Наши записи для $CODEX_HOME/hooks.json — те же скрипты, что уже
+    пишет Claude Code (.claude/hooks/log_event.py, .claude/hooks/
+    log_session.py): lib/hook_payload.py и lib/transcript_codex.py уже
+    умеют оба движка (задача Codex-4), отдельного кода для Codex не нужно.
+    on_session_start.sh сюда сознательно не включён — он возвращает
+    Claude-Code-специфичный формат (`hookSpecificOutput.additionalContext`),
+    совместимость которого с Codex не проверена запуском; тянуть
+    непроверенное в основной, всегда исполняемый путь не стоит.
+
+    Команда — ОТНОСИТЕЛЬНЫЙ путь, не абсолютный, и это осознанный выбор, не
+    недосмотр: hooks.json у Codex — файл на весь $CODEX_HOME, общий для
+    ВСЕХ проектов, которые аналитик когда-либо откроет в Codex, а не
+    только для этого репозитория (в отличие от профиля config.toml выше,
+    который подключается явно флагом -p и поэтому безопасно "виден" только
+    тем, кто его явно запросил). Абсолютный путь заставил бы наш
+    hook-скрипт запускаться в КАЖДОЙ чужой сессии Codex на диске аналитика
+    и писать в нашу телеметрию чужую, не относящуюся к uzum-data-agent
+    работу. Относительный путь резолвится от рабочего каталога процесса
+    `codex` (docs/codex-facts.md, раздел 8) — bin/uzum всегда делает `cd` в
+    корень репозитория перед запуском движка, поэтому для сессий,
+    запущенных через `uzum`, путь резолвится верно; для сессий Codex в
+    ДРУГИХ проектах файла по этому относительному пути просто не будет —
+    хук тихо не сработает, и это и есть желаемое поведение (не наша
+    сессия, не наша телеметрия)."""
+    def entry(script):
+        return {"hooks": [{"type": "command", "command": "python3 .claude/hooks/%s" % script}]}
+
+    return {
+        "SessionStart": entry("log_session.py"),
+        "SessionEnd": entry("log_session.py"),
+        "UserPromptSubmit": entry("log_event.py"),
+        "PostToolUse": entry("log_event.py"),
+    }
+
+
+def merge_codex_hooks(existing, new_entries):
+    """Слить наши записи в уже существующую структуру hooks.json, не теряя
+    чужие. `existing` — распарсенный JSON (dict) текущего hooks.json, или
+    {}/None, если файла ещё не было. Идемпотентно: повторный вызов с той
+    же записью не создаёт дубликат (сравнение по значению), поэтому
+    повторный ./setup.sh не плодит копии хука при каждом перезапуске."""
+    merged = dict(existing) if existing else {}
+    hooks = dict(merged.get("hooks") or {})
+    for event, group in new_entries.items():
+        existing_groups = list(hooks.get(event) or [])
+        if group not in existing_groups:
+            existing_groups.append(group)
+        hooks[event] = existing_groups
+    merged["hooks"] = hooks
+    return merged
+
+
+def deploy_codex_hooks(codex_home_dir):
+    """Записать/дополнить $CODEX_HOME/hooks.json нашими хуками, не трогая
+    чужие записи (см. докстринг раздела выше — на машине автора задачи там
+    уже жил hooks.json стороннего инструмента). Битый существующий файл
+    (не наш формат, не наша забота чинить) не роняет установку — честнее
+    переписать его нашими хуками, чем упасть на разборе чужого JSON.
+    Возвращает True, если файл реально изменился."""
+    os.makedirs(codex_home_dir, exist_ok=True)
+    path = os.path.join(codex_home_dir, "hooks.json")
+    existing = {}
+    current_text = None
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            current_text = f.read()
+        try:
+            existing = json.loads(current_text)
+        except ValueError:
+            existing = {}
+    merged = merge_codex_hooks(existing, codex_hook_definitions())
+    new_text = json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
+    if current_text == new_text:
+        return False
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    return True

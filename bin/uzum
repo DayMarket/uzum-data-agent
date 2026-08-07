@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Запуск сессии: секреты в окружение, затем claude.
+# Запуск сессии: секреты в окружение, выбор движка (Claude Code или Codex),
+# переход в корень репозитория, запуск выбранного движка.
 #
 # setup.sh кладёт символическую ссылку на этот файл в ~/.local/bin/uzum,
 # поэтому просто `dirname "${BASH_SOURCE[0]}"` даёт ~/.local/bin, а не
@@ -27,6 +28,14 @@ SCRIPT_PATH="$(resolve_script_path "${BASH_SOURCE[0]}")"
 REPO_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
 
 SECRETS="$HOME/.config/uzum-ai/secrets.env"
+# Запомненный выбор движка (только когда оба настроены — см. ниже). Тот же
+# каталог, что уже использует UZUM_STATE_DIR в .claude/hooks/log_session.py
+# для состояния между сессиями — не секрет, обычный маркер-файл.
+STATE_DIR="${UZUM_STATE_DIR:-$HOME/.local/state/uzum-ai}"
+ENGINE_CHOICE_FILE="$STATE_DIR/engine"
+# Профиль, которым Codex подключает наш конфиг — см. lib/setup_helpers.py
+# (CODEX_PROFILE_NAME) и setup.sh (CODEX_PROFILE_NAME). Держи в синхроне.
+CODEX_PROFILE_NAME="uzum"
 
 if [ -f "$SECRETS" ]; then
   set -a
@@ -39,5 +48,106 @@ else
 fi
 
 export UZUM_USER="${CH_USER:-$USER}"
+
+# ── разбор --codex/--claude, остальное отдаём движку как есть ───────────
+# Массив ARGS, а не переприсваивание "$@": аргументы движка (пути, промпты)
+# могут содержать пробелы, IFS-разбиение их бы поломало.
+REQUESTED_ENGINE=""
+ARGS=()
+for a in "$@"; do
+  case "$a" in
+    --codex)  REQUESTED_ENGINE="codex" ;;
+    --claude) REQUESTED_ENGINE="claude" ;;
+    *) ARGS+=("$a") ;;
+  esac
+done
+
+# Какие движки реально стоят на этой машине — двумя флагами, не массивом:
+# на пустом массиве под `set -u` в bash 3.2 (дефолт на macOS) разворачивание
+# "${ARR[@]}" роняет скрипт с "unbound variable" (см. тот же приём и
+# комментарий в setup.sh, переменная ENABLED).
+CLAUDE_FOUND=0
+CODEX_FOUND=0
+command -v claude >/dev/null 2>&1 && CLAUDE_FOUND=1
+command -v codex  >/dev/null 2>&1 && CODEX_FOUND=1
+
+is_available() {
+  case "$1" in
+    claude) [ "$CLAUDE_FOUND" = "1" ] ;;
+    codex)  [ "$CODEX_FOUND" = "1" ] ;;
+    *) return 1 ;;
+  esac
+}
+
+if [ "$CLAUDE_FOUND" = "0" ] && [ "$CODEX_FOUND" = "0" ]; then
+  echo "Не найден ни Claude Code, ни Codex. Запусти ./setup.sh — он подскажет, что поставить."
+  exit 1
+fi
+
+if [ -n "$REQUESTED_ENGINE" ] && ! is_available "$REQUESTED_ENGINE"; then
+  echo "Запрошен --$REQUESTED_ENGINE, но его не видно в PATH на этой машине."
+  exit 1
+fi
+
+REMEMBERED_ENGINE=""
+if [ -f "$ENGINE_CHOICE_FILE" ]; then
+  REMEMBERED_ENGINE="$(cat "$ENGINE_CHOICE_FILE" 2>/dev/null || true)"
+fi
+
+# Приоритет выбора движка: явный аргумент → запомненный (если ещё
+# доступен) → единственный настроенный → спросить (оба настроены, ничего
+# не решено заранее).
+ENGINE=""
+if [ -n "$REQUESTED_ENGINE" ]; then
+  ENGINE="$REQUESTED_ENGINE"
+elif [ -n "$REMEMBERED_ENGINE" ] && is_available "$REMEMBERED_ENGINE"; then
+  ENGINE="$REMEMBERED_ENGINE"
+elif [ "$CLAUDE_FOUND" = "1" ] && [ "$CODEX_FOUND" = "0" ]; then
+  ENGINE="claude"
+elif [ "$CODEX_FOUND" = "1" ] && [ "$CLAUDE_FOUND" = "0" ]; then
+  ENGINE="codex"
+fi
+
+if [ -z "$ENGINE" ]; then
+  # Оба движка настроены, и ничего не решено ни аргументом, ни прошлым
+  # запуском — не решаем молча за человека.
+  echo "Установлены оба движка: Claude Code и Codex."
+  read -rp "Какой запускать в этот раз? [claude/codex]: " ENGINE
+  case "$ENGINE" in
+    claude|codex) ;;
+    *)
+      echo "Не понял ответ. Запусти снова с явным выбором: uzum --claude или uzum --codex"
+      exit 1
+      ;;
+  esac
+fi
+
+# Запоминаем выбор ТОЛЬКО когда он не был передан явным флагом на этот раз
+# и есть что выбирать (оба движка настроены) — иначе одноразовый
+# `uzum --codex` при обычно используемом Claude Code переписал бы дефолт
+# для всех следующих запусков без флага.
+if [ "$CLAUDE_FOUND" = "1" ] && [ "$CODEX_FOUND" = "1" ]; then
+  mkdir -p "$STATE_DIR"
+  printf "%s\n" "$ENGINE" >"$ENGINE_CHOICE_FILE"
+fi
+
+# Относительные пути коннекторов (MCP-серверы обоих движков) и хуков Codex
+# резолвятся от рабочего каталога процесса движка, не от расположения его
+# конфига (docs/codex-facts.md, раздел 8) — без cd сюда ни один локальный
+# коннектор (trino/superset/sheets/clickhouse-обёртка) не найдётся, если
+# запустить `uzum` не из корня репозитория.
 cd "$REPO_DIR" || exit 1
-exec claude "$@"
+
+if [ "$ENGINE" = "codex" ]; then
+  if [ "${#ARGS[@]}" -gt 0 ]; then
+    exec codex -p "$CODEX_PROFILE_NAME" "${ARGS[@]}"
+  else
+    exec codex -p "$CODEX_PROFILE_NAME"
+  fi
+else
+  if [ "${#ARGS[@]}" -gt 0 ]; then
+    exec claude "${ARGS[@]}"
+  else
+    exec claude
+  fi
+fi

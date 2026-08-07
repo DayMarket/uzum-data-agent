@@ -26,6 +26,18 @@ SECRETS="$HOME/.config/uzum-ai/secrets.env"
 SETTINGS_LOCAL="$REPO_DIR/.claude/settings.local.json"
 SERVERS_LIST="clickhouse-wms clickhouse-dwh atlassian superset trino grafana openmetadata growthbook sheets"
 
+# Профиль, которым Codex подключает наш конфиг: `codex -p uzum` /
+# `codex exec -p uzum`, слоем поверх $CODEX_HOME/config.toml — тот же
+# CODEX_PROFILE_NAME, что и в lib/setup_helpers.py (держи в синхроне).
+CODEX_PROFILE_NAME="uzum"
+
+# Заполняется определением движков ниже (check_environment). Двумя
+# отдельными флагами, не массивом — на пустом массиве под `set -u` bash 3.2
+# роняет скрипт (см. комментарий про ENABLED ниже), а тут значения читаются
+# ещё до того, как массивы вообще стоило бы заводить.
+ENGINE_CLAUDE_FOUND=0
+ENGINE_CODEX_FOUND=0
+
 # Заполнено из .env одним из ask_*-хелперов ниже, но не введено человеком и
 # отсутствует в файле — только при --non-interactive (иначе просто спросили
 # бы). Список меток, а не имён переменных: тут читает человек.
@@ -40,8 +52,9 @@ ENV_FILE=""
 ENABLED=()
 
 # Настраивается мастером, но не является MCP-сервером и не попадает в
-# enabledMcpjsonServers: телеметрия — это хуки, а не коннектор.
-EXTRAS_LIST="telemetry"
+# enabledMcpjsonServers: телеметрия и доставка Codex-хуков — это хуки и
+# конфиг, а не коннектор.
+EXTRAS_LIST="telemetry codex-hooks"
 
 # Смоук-тест складского ClickHouse (WMS) прошёл в этом запуске
 # (setup_clickhouse_wms). Нужен setup_telemetry: переиспользовать логин/пароль
@@ -283,12 +296,32 @@ ask_required_secret() {
 
 check_environment() {
   say "Проверяю окружение…"
+
+  # Движок теперь необязательно один: Claude Code остаётся, Codex
+  # добавляется. Мастер настраивает то, что реально стоит на машине — один,
+  # оба, или блокирующая ошибка, если нет ни одного (см. ниже, после
+  # остальных проверок окружения — команды установки понятнее печатать
+  # рядом, а не раньше python3/curl/uv, без которых мастер всё равно
+  # бесполезен).
   if command -v claude >/dev/null 2>&1; then
     ok "claude найден"
+    ENGINE_CLAUDE_FOUND=1
   else
-    fail "Claude Code не установлен: https://claude.com/code"
+    fail "Claude Code не найден в PATH"
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    ok "codex найден"
+    ENGINE_CODEX_FOUND=1
+  else
+    fail "Codex не найден в PATH"
+  fi
+  if [ "$ENGINE_CLAUDE_FOUND" = "0" ] && [ "$ENGINE_CODEX_FOUND" = "0" ]; then
+    fail "не найден ни один движок — нужен хотя бы один"
+    fail "Claude Code: https://claude.com/code"
+    fail "Codex:       npm install -g @openai/codex"
     exit 1
   fi
+
   if command -v python3 >/dev/null 2>&1; then
     ok "python3 найден"
   else
@@ -718,11 +751,95 @@ run_server() {
     growthbook)   setup_growthbook ;;
     sheets)       setup_sheets ;;
     telemetry)    setup_telemetry ;;
+    codex-hooks)  render_engine_configs; deploy_codex_artifacts; check_codex_hook_trust ;;
     *)
       printf "Неизвестный коннектор: %s\nДоступные: %s %s\n" "$1" "$SERVERS_LIST" "$EXTRAS_LIST" >&2
       exit 1
       ;;
   esac
+}
+
+# ── Codex: доставка конфига и хуков, проверка живым запуском ────────────
+#
+# "Конфиги обоих движков пишутся из общего реестра, через существующий
+# генератор" (бриф задачи) — существующий генератор это
+# tools/render_configs.py (connectors/registry.py, задача Codex-3). Он не
+# был подключён к мастеру установки вообще: .mcp.json и .codex/config.toml
+# лежали в git как статические файлы. Для .mcp.json это было безобидно
+# (секреты — подстановка ${VAR}, машинно-независимо), но
+# .codex/config.toml встраивает АБСОЛЮТНЫЙ путь к репозиторию в профиль
+# разрешений (tools/render_configs.py, `_codex_permission_profile_
+# filesystem_rules`) — у каждого аналитика он свой. Не перегенерировать
+# конфиг при установке значило доставить всем Codex-профиль с путём с
+# машины автора задачи, а не с их собственной.
+render_engine_configs() {
+  say "Обновляю .mcp.json и .codex/config.toml из connectors/registry.py…"
+  local out
+  out="$(python3 "$REPO_DIR/tools/render_configs.py" 2>&1)"
+  printf "  %s\n" "$out"
+}
+
+# Доставляет .codex/config.toml профилем ($CODEX_HOME/uzum.config.toml, см.
+# докстринг deploy_codex_profile в lib/setup_helpers.py про то, почему не
+# слияние в базовый config.toml и не переключение $CODEX_HOME) и сливает
+# хуки телеметрии в $CODEX_HOME/hooks.json, не трогая чужие записи там.
+deploy_codex_artifacts() {
+  local codex_home_dir out
+  codex_home_dir="${CODEX_HOME:-$HOME/.codex}"
+  out="$(UZUM_CODEX_HOME_DIR="$codex_home_dir" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import setup_helpers
+home = os.environ['UZUM_CODEX_HOME_DIR']
+cfg_changed = setup_helpers.deploy_codex_profile(
+    '$REPO_DIR/.codex/config.toml', home)
+hooks_changed = setup_helpers.deploy_codex_hooks(home)
+print('профиль %s: %s' % (
+    os.path.join(home, '%s.config.toml' % setup_helpers.CODEX_PROFILE_NAME),
+    'обновлён' if cfg_changed else 'уже актуален'))
+print('хуки %s: %s' % (
+    os.path.join(home, 'hooks.json'),
+    'обновлены' if hooks_changed else 'уже на месте'))
+")"
+  printf "%s\n" "$out" | while IFS= read -r line; do ok "$line"; done
+}
+
+# После доставки — живая проверка факта "хуки Codex доверены", а не догадка
+# (docs/codex-facts.md, раздел 7: без доверия headless-режим ничем не
+# сигналит, "команда же отработала" — тот же класс дефекта, что уже дважды
+# ловили на этом проекте). Сигнал — строка "hook: SessionStart" в выводе
+# `codex exec`: она печатается ТОЛЬКО когда хук реально выполнился (см.
+# отчёт задачи — воспроизведено живым запуском что при отсутствии доверия
+# строки нет вовсе, ни намёка).
+check_codex_hook_trust() {
+  local codex_home_dir probe_out pid watchdog
+  codex_home_dir="${CODEX_HOME:-$HOME/.codex}"
+  if [ ! -f "$codex_home_dir/auth.json" ]; then
+    fail "Codex не авторизован (нет $codex_home_dir/auth.json) — выполни 'codex login', затем ./setup.sh --add codex-hooks, чтобы проверить доверие хукам"
+    return
+  fi
+  probe_out="$(mk_tmp)"
+  (
+    cd "$REPO_DIR" || exit 1
+    CODEX_HOME="$codex_home_dir" codex exec -p "$CODEX_PROFILE_NAME" --skip-git-repo-check \
+      "Выполни ровно одну shell-команду: echo hook-trust-probe. Затем остановись." \
+      >"$probe_out" 2>&1 &
+    pid=$!
+    ( sleep 90; kill -9 "$pid" 2>/dev/null ) &
+    watchdog=$!
+    wait "$pid" 2>/dev/null
+    kill "$watchdog" 2>/dev/null
+    wait "$watchdog" 2>/dev/null
+  )
+  if grep -q "hook: SessionStart" "$probe_out" 2>/dev/null; then
+    ok "доверие хукам Codex выдано — телеметрия будет писаться"
+  else
+    fail "доверие хукам Codex ещё не выдано — телеметрия из Codex писаться НЕ БУДЕТ, пока это не исправить"
+    printf "  Сделай один раз: запусти просто 'codex -p %s' (не exec, обычный интерактивный запуск) в этой папке.\n" "$CODEX_PROFILE_NAME"
+    printf "  На первом экране подтверди доверие папке («1. Yes, continue»).\n"
+    printf "  На экране «Hooks need review» выбери «2. Trust all and continue».\n"
+    printf "  Доверие сохранится навсегда для этой машины — проверить снова: ./setup.sh --add codex-hooks\n"
+  fi
 }
 
 # ── разбор аргументов ────────────────────────────────────────────────────
@@ -749,11 +866,17 @@ while [ $# -gt 0 ]; do
       cat <<EOF
 Использование:
   ./setup.sh                    полный мастер установки — все коннекторы за один заход
-  ./setup.sh --add NAME         настроить/переподключить один коннектор ($SERVERS_LIST)
-                                 либо телеметрию: ./setup.sh --add telemetry
+  ./setup.sh --add NAME         настроить/переподключить один коннектор ($SERVERS_LIST),
+                                 телеметрию (./setup.sh --add telemetry) либо доставку
+                                 конфига/хуков Codex (./setup.sh --add codex-hooks)
   ./setup.sh --non-interactive  без вопросов: значения только из .env, по
                                  недостающим — список и код возврата 1
                                  (сочетается с --add)
+
+Настраивает Claude Code и/или Codex — какие из них реально стоят на этой
+машине (нужен хотя бы один). Оба движка используют один общий набор
+коннекторов и один файл секретов; конфиги обоих генерируются заново на
+каждом запуске из connectors/registry.py.
 
 Заполнить доступы файлом вместо вопросов: cp .env.example .env, впиши
 значения (или укажи путь к файлу через \$UZUM_ENV_FILE), запусти как обычно.
@@ -810,6 +933,26 @@ if [ "$NONINTERACTIVE" = "1" ] && [ "${#MISSING[@]}" -gt 0 ]; then
   exit 1
 fi
 
+# Конфиги обоих движков — из общего реестра коннекторов, через
+# tools/render_configs.py, всегда (полный мастер и --add тоже): дёшево,
+# идемпотентно, и без этого .codex/config.toml нёс бы путь к репозиторию с
+# чужой машины (см. докстринг render_engine_configs выше). После проверки
+# MISSING, не до неё — незачем генерировать и доставлять конфиг, если
+# установка всё равно сейчас оборвётся с ошибкой нехватки доступов.
+render_engine_configs
+
+# Codex: доставить конфиг и хуки туда, где движок их реально видит, и
+# проверить живым запуском, что доверие хукам выдано — только когда Codex
+# вообще стоит на машине, и только в полном прогоне мастера (--add одного
+# коннектора не должен каждый раз заново дёргать живой codex exec — это
+# настоящий запрос к модели, не бесплатный curl; для точечной перепроверки
+# есть ./setup.sh --add codex-hooks).
+if [ "$MODE" != "add" ] && [ "$ENGINE_CODEX_FOUND" = "1" ]; then
+  say "── Codex: доставка конфига и хуков ──"
+  deploy_codex_artifacts
+  check_codex_hook_trust
+fi
+
 mkdir -p "$HOME/.local/bin"
 ln -sf "$REPO_DIR/bin/uzum" "$HOME/.local/bin/uzum"
 chmod +x "$REPO_DIR/bin/uzum" "$REPO_DIR/setup.sh" 2>/dev/null || true
@@ -825,12 +968,30 @@ if ! command -v uzum >/dev/null 2>&1; then
 EOF
 fi
 
-cat <<'EOF'
+if [ "$ENGINE_CLAUDE_FOUND" = "1" ]; then
+  cat <<'EOF'
 
-ВАЖНО: при первом запуске Claude Code спросит, доверяешь ли ты этой папке —
-ответь «да» (Yes, proceed). Клонированный репозиторий не может сам одобрить
-свои же MCP-серверы: если ответить «нет» или пропустить диалог, ни один
-коннектор не поднимется, хотя всё настроено правильно.
+ВАЖНО (Claude Code): при первом запуске он спросит, доверяешь ли ты этой
+папке — ответь «да» (Yes, proceed). Клонированный репозиторий не может сам
+одобрить свои же MCP-серверы: если ответить «нет» или пропустить диалог,
+ни один коннектор не поднимется, хотя всё настроено правильно.
+EOF
+fi
+
+if [ "$ENGINE_CODEX_FOUND" = "1" ]; then
+  cat <<EOF
+
+ВАЖНО (Codex): при первом запуске (обычный интерактивный 'codex -p $CODEX_PROFILE_NAME',
+не exec) он спросит доверие папке, а следом отдельным экраном — доверие
+хукам («Hooks need review»). На нём выбери «2. Trust all and continue» —
+без этого телеметрия из Codex писаться не будет, и никакого другого
+сигнала об этом не будет (см. connectors/ACCESS.md). Мастер уже проверил
+это выше живым запуском — если он сообщил «доверие хукам ещё не выдано»,
+пройди диалог один раз и перепроверь: ./setup.sh --add codex-hooks
+EOF
+fi
+
+cat <<EOF
 
 Запускай:       uzum
 Первая задача:  /task <ключ задачи из Jira>

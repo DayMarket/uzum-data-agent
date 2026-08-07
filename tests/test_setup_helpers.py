@@ -1,4 +1,5 @@
 import json
+import os
 
 import setup_helpers
 
@@ -65,3 +66,285 @@ def test_tightens_permissions_of_preexisting_loose_directory(tmp_path):
     path = secrets_dir / "secrets.env"
     setup_helpers.write_env(str(path), {"CH_USER": "denis"})
     assert oct(secrets_dir.stat().st_mode)[-3:] == "700"
+
+
+# ── Задача Codex-6: движки, доставка конфига Codex, хуки Codex ─────────────
+
+def test_detect_engines_finds_only_whats_in_path():
+    """which — параметр ради теста: не бьёт по реальному PATH машины, где
+    гоняются тесты (там может стоять или не стоять ни один из движков)."""
+    def fake_which_both(name):
+        return "/usr/local/bin/%s" % name if name in ("claude", "codex") else None
+    assert setup_helpers.detect_engines(fake_which_both) == ["claude", "codex"]
+
+    def fake_which_only_codex(name):
+        return "/usr/local/bin/codex" if name == "codex" else None
+    assert setup_helpers.detect_engines(fake_which_only_codex) == ["codex"]
+
+    def fake_which_none(name):
+        return None
+    assert setup_helpers.detect_engines(fake_which_none) == []
+
+
+def test_engines_setup_plan_blocks_when_neither_engine_found():
+    """Ни один движок не найден — блокирующая ошибка с командами установки
+    ОБОИХ (не одного на выбор), чтобы аналитик не гадал, что ставить."""
+    to_configure, blocking_error = setup_helpers.engines_setup_plan([])
+    assert to_configure == []
+    assert blocking_error is not None
+    assert "claude.com/code" in blocking_error
+    assert "@openai/codex" in blocking_error
+
+
+def test_engines_setup_plan_configures_the_single_installed_engine():
+    to_configure, blocking_error = setup_helpers.engines_setup_plan(["codex"])
+    assert to_configure == ["codex"]
+    assert blocking_error is None
+
+
+def test_engines_setup_plan_configures_both_when_both_installed():
+    to_configure, blocking_error = setup_helpers.engines_setup_plan(["claude", "codex"])
+    assert to_configure == ["claude", "codex"]
+    assert blocking_error is None
+
+
+# ── Выбор движка для bin/uzum ───────────────────────────────────────────────
+
+def test_select_engine_explicit_argument_wins_over_everything():
+    engine, reason = setup_helpers.select_engine(
+        available=["claude", "codex"], requested="codex", remembered="claude")
+    assert engine == "codex"
+    assert reason == "requested"
+
+
+def test_select_engine_explicit_argument_for_engine_not_installed_is_an_error():
+    """Явно попросили движок, которого на этой машине нет — понятная
+    ошибка, а не тихий откат на другой движок (аналитик решит бы, что
+    Codex настроен, хотя на самом деле сессия ушла в Claude Code)."""
+    engine, reason = setup_helpers.select_engine(
+        available=["claude"], requested="codex", remembered=None)
+    assert engine is None
+    assert reason == "engine_not_available:codex"
+
+
+def test_select_engine_falls_back_to_remembered_choice():
+    engine, reason = setup_helpers.select_engine(
+        available=["claude", "codex"], requested=None, remembered="codex")
+    assert engine == "codex"
+    assert reason == "remembered"
+
+
+def test_select_engine_ignores_stale_remembered_choice_no_longer_installed():
+    """Запомненный движок мог быть удалён с машины со времени прошлого
+    запуска — не падаем на нём молча, идём дальше по правилам выбора."""
+    engine, reason = setup_helpers.select_engine(
+        available=["claude"], requested=None, remembered="codex")
+    assert engine == "claude"
+    assert reason == "only_configured"
+
+
+def test_select_engine_defaults_to_the_only_configured_engine():
+    engine, reason = setup_helpers.select_engine(
+        available=["codex"], requested=None, remembered=None)
+    assert engine == "codex"
+    assert reason == "only_configured"
+
+
+def test_select_engine_is_ambiguous_when_both_available_and_nothing_decided():
+    """Оба движка настроены, явного выбора и запомненного решения нет —
+    не решаем молча за человека: bin/uzum должен спросить."""
+    engine, reason = setup_helpers.select_engine(
+        available=["claude", "codex"], requested=None, remembered=None)
+    assert engine is None
+    assert reason == "ambiguous"
+
+
+def test_select_engine_none_available_is_reported_as_such():
+    engine, reason = setup_helpers.select_engine(available=[], requested=None, remembered=None)
+    assert engine is None
+    assert reason == "none_available"
+
+
+def test_remembered_engine_round_trips_through_a_file(tmp_path):
+    path = str(tmp_path / "state" / "engine")
+    assert setup_helpers.read_remembered_engine(path) is None  # файла ещё нет
+    setup_helpers.write_remembered_engine(path, "codex")
+    assert setup_helpers.read_remembered_engine(path) == "codex"
+    setup_helpers.write_remembered_engine(path, "claude")
+    assert setup_helpers.read_remembered_engine(path) == "claude"
+
+
+# ── Доставка конфига Codex: профиль $CODEX_HOME/uzum.config.toml ───────────
+#
+# Решение (см. отчёт задачи, факт 1 из брифа): НЕ сливать в
+# $CODEX_HOME/config.toml и НЕ переключать $CODEX_HOME на папку
+# репозитория. Вместо этого — штатный, задокументированный в `codex --help`
+# механизм профиля (`-p/--profile <имя>`: "Layer $CODEX_HOME/<name>.config.toml
+# on top of the base user config"), проверенный живым запуском (см. отчёт):
+# профиль применяется целиком, даже когда базового config.toml нет вовсе
+# или он занят чужим содержимым (доверие другим проектам, настройки другого
+# инструмента) — и это содержимое остаётся нетронутым.
+
+def test_deploy_codex_profile_writes_named_profile_file_not_base_config(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    generated = tmp_path / "generated_config.toml"
+    generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
+
+    changed = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+
+    assert changed is True
+    profile_path = codex_home / ("%s.config.toml" % setup_helpers.CODEX_PROFILE_NAME)
+    assert profile_path.read_text(encoding="utf-8") == 'default_permissions = "uzum"\n'
+    # Базового config.toml мастер не создаёт и не трогает вообще.
+    assert not (codex_home / "config.toml").exists()
+
+
+def test_deploy_codex_profile_does_not_touch_preexisting_base_config(tmp_path):
+    """Находка отчёта: на реальной машине $CODEX_HOME/config.toml уже может
+    быть занят — доверием к другим проектам, настройками другого
+    инструмента. Мастер обязан оставить его как есть."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    base_config = codex_home / "config.toml"
+    base_config.write_text(
+        '[projects."/Users/someone/other-project"]\ntrust_level = "trusted"\n',
+        encoding="utf-8",
+    )
+    generated = tmp_path / "generated_config.toml"
+    generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
+
+    setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+
+    assert base_config.read_text(encoding="utf-8") == (
+        '[projects."/Users/someone/other-project"]\ntrust_level = "trusted"\n'
+    )
+
+
+def test_deploy_codex_profile_is_idempotent_when_content_unchanged(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    generated = tmp_path / "generated_config.toml"
+    generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
+
+    first = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+    second = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+
+    assert first is True
+    assert second is False  # содержимое не изменилось — второй раз не пишем
+
+
+def test_deploy_codex_profile_updates_when_registry_changes(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    generated = tmp_path / "generated_config.toml"
+    generated.write_text('default_permissions = "uzum"\n', encoding="utf-8")
+    setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+
+    generated.write_text('default_permissions = "uzum"\n[mcp_servers.trino]\n', encoding="utf-8")
+    changed = setup_helpers.deploy_codex_profile(str(generated), str(codex_home))
+
+    assert changed is True
+    profile_path = codex_home / ("%s.config.toml" % setup_helpers.CODEX_PROFILE_NAME)
+    assert "mcp_servers.trino" in profile_path.read_text(encoding="utf-8")
+
+
+# ── Хуки Codex: слияние с $CODEX_HOME/hooks.json, не перезапись ────────────
+#
+# hooks.json — единственный, не профиль-специфичный файл на весь
+# $CODEX_HOME (в отличие от config.toml, у hooks.json нет механизма
+# layering по имени профиля — проверено: `codex --help` не упоминает такой
+# возможности для hooks). Он может быть уже занят другим инструментом —
+# так и оказалось на машине автора задачи (сторонний notify-хук). Слепая
+# перезапись стёрла бы чужие хуки.
+
+def test_codex_hook_definitions_cover_the_engine_portable_events():
+    """SessionStart/SessionEnd/UserPromptSubmit/PostToolUse — те же
+    события, что уже пишет Claude Code, и НЕТ PostToolUseFailure: у Codex
+    такого события не существует (docs/codex-facts.md, раздел 3) —
+    PostToolUse там срабатывает и на успехе, и на сбое."""
+    defs = setup_helpers.codex_hook_definitions()
+    assert set(defs) == {"SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse"}
+    for group in defs.values():
+        command = group["hooks"][0]["command"]
+        assert command.startswith("python3 .claude/hooks/")
+        assert not command.startswith("python3 /")  # путь относительный, не абсолютный
+
+
+def test_merge_codex_hooks_preserves_foreign_hooks_untouched():
+    foreign = {
+        "hooks": {
+            "SessionStart": [
+                {"hooks": [{"type": "command", "command": "some-other-tool-notify.sh"}]}
+            ],
+            "Stop": [
+                {"hooks": [{"type": "command", "command": "some-other-tool-notify.sh"}]}
+            ],
+        }
+    }
+    merged = setup_helpers.merge_codex_hooks(foreign, setup_helpers.codex_hook_definitions())
+
+    # Чужой SessionStart-хук на месте, наш добавлен рядом, не вместо.
+    session_start_commands = [h["hooks"][0]["command"] for h in merged["hooks"]["SessionStart"]]
+    assert "some-other-tool-notify.sh" in session_start_commands
+    assert any(c.startswith("python3 .claude/hooks/") for c in session_start_commands)
+    # Событие, которое мы вообще не трогаем (Stop), осталось как было.
+    assert merged["hooks"]["Stop"] == foreign["hooks"]["Stop"]
+
+
+def test_merge_codex_hooks_is_idempotent_no_duplicate_entries():
+    once = setup_helpers.merge_codex_hooks({}, setup_helpers.codex_hook_definitions())
+    twice = setup_helpers.merge_codex_hooks(once, setup_helpers.codex_hook_definitions())
+    assert twice == once
+    for event_hooks in twice["hooks"].values():
+        assert len(event_hooks) == 1
+
+
+def test_deploy_codex_hooks_merges_with_file_already_on_disk(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.write_text(json.dumps({
+        "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "foreign.sh"}]}]}
+    }), encoding="utf-8")
+
+    changed = setup_helpers.deploy_codex_hooks(str(codex_home))
+
+    assert changed is True
+    data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    assert data["hooks"]["Stop"] == [{"hooks": [{"type": "command", "command": "foreign.sh"}]}]
+    assert "PostToolUse" in data["hooks"]
+
+
+def test_deploy_codex_hooks_creates_file_when_none_exists(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    changed = setup_helpers.deploy_codex_hooks(str(codex_home))
+    assert changed is True
+    data = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+    assert set(data["hooks"]) == {"SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse"}
+
+
+def test_deploy_codex_hooks_is_idempotent_on_repeated_calls(tmp_path):
+    codex_home = tmp_path / "codex_home"
+    setup_helpers.deploy_codex_hooks(str(codex_home))
+    changed_again = setup_helpers.deploy_codex_hooks(str(codex_home))
+    assert changed_again is False
+
+
+def test_deploy_codex_hooks_tolerates_corrupt_existing_file(tmp_path):
+    """Битый hooks.json (не наш формат, не наша забота чинить) не должен
+    ронять установку — честнее переписать его нашими хуками, чем упасть."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    (codex_home / "hooks.json").write_text("{not valid json", encoding="utf-8")
+    changed = setup_helpers.deploy_codex_hooks(str(codex_home))
+    assert changed is True
+    data = json.loads((codex_home / "hooks.json").read_text(encoding="utf-8"))
+    assert "PostToolUse" in data["hooks"]
+
+
+def test_codex_home_respects_env_override(monkeypatch, tmp_path):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "custom-codex-home"))
+    assert setup_helpers.codex_home() == str(tmp_path / "custom-codex-home")
+
+
+def test_codex_home_defaults_to_dot_codex_under_home(monkeypatch):
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    assert setup_helpers.codex_home() == os.path.expanduser("~/.codex")
