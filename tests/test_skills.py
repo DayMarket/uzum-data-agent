@@ -42,6 +42,16 @@ def test_adhoc_export_knows_where_to_put_the_result():
     assert "sheets" in text
 
 
+def test_data_skills_stop_on_forbidden_salary_marts():
+    """Находка 4 финального ревью: витрины/дашборды, помеченные в реестре
+    «🚫 запрещено — правило 1», не должны быть тихо обойдены — adhoc-export,
+    data-check и data-sanity обязаны остановиться и сказать человеку."""
+    for name in ("adhoc-export", "data-check", "data-sanity"):
+        text = (SKILLS_DIR / name / "SKILL.md").read_text(encoding="utf-8")
+        assert "запрещено" in text, name
+        assert "правило 1" in text, name
+
+
 def test_readme_documents_how_to_run_the_suite_without_warnings():
     """Набор гоняется через uv с современным интерпретатором: зависимости
     коннекторов объявлены для `uv run`, а не для системного python3. Раньше

@@ -123,13 +123,56 @@ def test_registries_are_not_empty():
     assert len(_data_rows(CONTEXT / "dashboards.md")) > 20
 
 
+FORBIDDEN_MARK = "🚫 запрещено — правило 1"
+
+# Находка 4 финального ревью перед раздачей: golden.salary_dashboard_table,
+# golden.workers_salary_by_process, golden.salary_norms_for_productivity и
+# дашборд «Market Зарплатный дашборд» — зарплатные данные, запрещённые
+# правилом 1 в CLAUDE.md/context/rules.md. Реестр их не прячет (аналитик
+# должен видеть, что витрина/дашборд существуют), но помечает отчётливо, а не
+# оставляет колонку «доверие» пустой, как для обычных строк без суждения.
+FORBIDDEN_MARTS = {
+    "golden.salary_dashboard_table",
+    "golden.workers_salary_by_process",
+    "golden.salary_norms_for_productivity",
+}
+FORBIDDEN_DASHBOARDS_SUBSTR = "Market Зарплатный дашборд"
+
+
 def test_trust_column_is_left_for_humans():
     """Колонка «доверие» — человеческое суждение: генератор её не выдумывает.
-    Заполнены только те строки, что вели руками до этого."""
+    Заполнены только те строки, что вели руками до этого, плюс отдельно
+    учтённые зарплатные витрины/дашборд (см. FORBIDDEN_MARK)."""
     rows = _data_rows(CONTEXT / "marts.md")
     filled = [r for r in rows if len(r) > 3 and r[3]]
-    assert len(filled) <= 5, [r[0] for r in filled]
-    assert all(not r[3] for r in _data_rows(CONTEXT / "dashboards.md") if len(r) > 3)
+    non_forbidden_filled = [r for r in filled if r[3] != FORBIDDEN_MARK]
+    assert len(non_forbidden_filled) <= 2, [r[0] for r in non_forbidden_filled]
+    forbidden_filled = [r for r in filled if r[3] == FORBIDDEN_MARK]
+    assert {r[0] for r in forbidden_filled} == FORBIDDEN_MARTS
+
+    dash_rows = _data_rows(CONTEXT / "dashboards.md")
+    dash_filled = [r for r in dash_rows if len(r) > 3 and r[3]]
+    assert len(dash_filled) == 1, [r[0] for r in dash_filled]
+    assert dash_filled[0][3] == FORBIDDEN_MARK
+    assert FORBIDDEN_DASHBOARDS_SUBSTR in dash_filled[0][0]
+
+
+def test_forbidden_mark_is_explained_in_both_registry_headers():
+    """Пометку нельзя пропустить при беглом чтении — а нельзя пропустить и
+    то, что она означает: шапка реестра объясняет её текстом, не только
+    эмодзи в ячейке."""
+    for name in ("marts.md", "dashboards.md"):
+        text = (CONTEXT / name).read_text(encoding="utf-8")
+        assert FORBIDDEN_MARK in text
+        assert "правило 1" in text
+        assert "CLAUDE.md" in text
+
+
+def test_salary_marts_are_not_deleted_from_the_registry():
+    """Владелец: витрину не вычёркивать, а помечать — аналитик должен видеть,
+    что она существует, и понимать, почему агент к ней не идёт."""
+    names = {r[0] for r in _data_rows(CONTEXT / "marts.md")}
+    assert FORBIDDEN_MARTS <= names
 
 
 def test_manually_curated_rows_survived_the_rebuild():
@@ -148,11 +191,6 @@ def test_generator_has_no_main_that_can_wipe_a_registry():
     assert 'if __name__' not in source
 
 
-def test_registry_headers_do_not_promise_a_weekly_rebuild():
-    """Шапки обещали еженедельную пересборку генератором, которого нет."""
-    for name in ("marts.md", "dashboards.md", "metrics.md"):
-        text = (CONTEXT / name).read_text(encoding="utf-8")
-        assert "раз в неделю" not in text, name
 def test_no_owner_column_is_a_bare_number():
     """Находка 2 финального ревью: у дашборда 1727 в колонку owners затянуло
     число из промежуточного счётчика выгрузки (`12`) вместо имён. Ловим
@@ -166,3 +204,8 @@ def test_no_owner_column_is_a_bare_number():
             assert not re.fullmatch(r"\d+", owners), (name, row[0], owners)
 
 
+def test_registry_headers_do_not_promise_a_weekly_rebuild():
+    """Шапки обещали еженедельную пересборку генератором, которого нет."""
+    for name in ("marts.md", "dashboards.md", "metrics.md"):
+        text = (CONTEXT / name).read_text(encoding="utf-8")
+        assert "раз в неделю" not in text, name

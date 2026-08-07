@@ -11,6 +11,13 @@
 >
 > Какие витрины под дашбордом — бери живьём через коннектор `superset`
 > (`mcp__superset__get_dashboard`), а не из этого файла: он устаревает.
+>
+> **Доверие «🚫 запрещено — правило 1»** — зарплатные данные. Правило 1 в
+> `CLAUDE.md` и `context/rules.md` запрещает их трогать вообще: ни выгрузок,
+> ни агрегатов, ни «просто посмотреть». Дашборд остаётся в реестре, чтобы
+> было видно, что он существует и почему агент к нему не идёт — но задачу,
+> которая его касается, агент останавливает и отдаёт человеку, а не выполняет
+> в обход (см. скиллы `adhoc-export`, `data-check`, `data-sanity`).
 
 | Дашборд | Обновлён | Кто в owners | Доверие | Комментарий |
 |---|---|---|---|---|
@@ -57,7 +64,7 @@
 | [Market Динамическая маршрутизация Бухара](https://bi.uzum.uz/superset/dashboard/2614/) | 2026-06-16 | Kristina Silina |  |  |
 | [Market Дней до Out of stock](https://bi.uzum.uz/superset/dashboard/1129/) | 2025-11-13 | Rida Zabirova, Darya Mukhina, Bogdan Shevarenkov |  |  |
 | [Market Заполнение фильтров SKU](https://bi.uzum.uz/superset/dashboard/826/) | 2026-06-01 | Rida Zabirova, Aleksey Kubulashvili, Nikita Dubitskiy + ещё 4 |  |  |
-| [Market Зарплатный дашборд](https://bi.uzum.uz/superset/dashboard/1829/) | 2025-11-13 | Nikita Lyubchenko |  |  |
+| [Market Зарплатный дашборд](https://bi.uzum.uz/superset/dashboard/1829/) | 2025-11-13 | Nikita Lyubchenko | 🚫 запрещено — правило 1 | Зарплатные данные, агент не трогает — см. `CLAUDE.md`, правило 1 |
 | [Market Интегральная метрика качества ПВЗ WIP](https://bi.uzum.uz/superset/dashboard/2490/) | 2026-07-17 | Rida Zabirova |  |  |
 | [Market Нарушения сотрудников - невыходы](https://bi.uzum.uz/superset/dashboard/2138/) | 2026-06-04 | Rosina Karimova, Damir Mukhamedzhanov, Anton Bykov + ещё 1 |  |  |
 | [Market Новички Буст в топ](https://bi.uzum.uz/superset/dashboard/1384/) | 2025-11-13 | Rida Zabirova, Fazil Novanov |  |  |

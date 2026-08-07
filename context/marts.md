@@ -13,6 +13,13 @@
 > Витрины нет в списке — это не запрет ею пользоваться: список покрывает
 > Superset ядра OE, а не весь DWH. Напиши об этом в результате (см. скилл
 > `data-sanity`) и проверь таблицу запросом.
+>
+> **Доверие «🚫 запрещено — правило 1»** — зарплатные данные. Правило 1 в
+> `CLAUDE.md` и `context/rules.md` запрещает их трогать вообще: ни выгрузок,
+> ни агрегатов, ни «просто посмотреть». Витрина остаётся в реестре, чтобы было
+> видно, что она существует и почему агент к ней не идёт — но задачу, которая
+> её касается, агент останавливает и отдаёт человеку, а не выполняет в обход
+> (см. скиллы `adhoc-export`, `data-check`, `data-sanity`).
 
 | Витрина | Дашбордов | Кто строит | Доверие | Комментарий |
 |---|--:|---|---|---|
@@ -136,15 +143,15 @@
 | golden.order_timeline | 4 | Ilya Kadochnikov, Anton Bykov, Aleksandra Petrukhina + ещё 2 |  |  |
 | golden.orgchart | 4 | Pavel Sokal, Rosina Karimova, Ilya Kadochnikov |  |  |
 | golden.routes_data | 4 | Ilya Kadochnikov, Anton Bykov, Aleksandra Petrukhina + ещё 2 |  |  |
-| golden.salary_dashboard_table | 1 | Rosina Karimova |  |  |
-| golden.salary_norms_for_productivity | 3 | Pavel Sokal, Rosina Karimova, Ilya Kadochnikov |  |  |
+| golden.salary_dashboard_table | 1 | Rosina Karimova | 🚫 запрещено — правило 1 | Зарплатные данные, агент не трогает — см. `CLAUDE.md`, правило 1 |
+| golden.salary_norms_for_productivity | 3 | Pavel Sokal, Rosina Karimova, Ilya Kadochnikov | 🚫 запрещено — правило 1 | Зарплатные данные, агент не трогает — см. `CLAUDE.md`, правило 1 |
 | golden.sku_balance_v2 | 1 | Pavel Sokal, Yevgeniy Atroshenko, Ramil Gilfanov |  |  |
 | golden.table_by_okz_efficiency_selection | 1 | Ilya Kadochnikov, Aleksandra Petrukhina, Denis Platon |  |  |
 | golden.table_by_okz_efficiency_sort | 1 | Ilya Kadochnikov, Aleksandra Petrukhina, Denis Platon |  |  |
 | golden.table_by_okz_efficiency_sort_2 | 1 | Ilya Kadochnikov, Aleksandra Petrukhina, Denis Platon |  |  |
 | golden.vchl_employee_metrics_monthly | 3 | Rida Zabirova, Ilya Kadochnikov, Aleksandra Petrukhina + ещё 2 |  |  |
 | golden.warehouse_working_hours | 1 | Pavel Sokal, Rosina Karimova, Ilya Kadochnikov |  |  |
-| golden.workers_salary_by_process | 3 | Pavel Sokal, Rosina Karimova, Ilya Kadochnikov |  |  |
+| golden.workers_salary_by_process | 3 | Pavel Sokal, Rosina Karimova, Ilya Kadochnikov | 🚫 запрещено — правило 1 | Зарплатные данные, агент не трогает — см. `CLAUDE.md`, правило 1 |
 | golden.workers_workdays_absence | 1 | Rosina Karimova, Anton Bykov, Denis Platon |  |  |
 | marketing.cohort_mart | 1 | Ilya Kadochnikov, Aleksandra Petrukhina, Yevgeniy Atroshenko |  |  |
 | marketing.daily_metrics_plan_fact | 1 | Ilya Kadochnikov, Aleksandra Petrukhina, Yevgeniy Atroshenko |  |  |
