@@ -80,6 +80,34 @@ def missing_keys(values, required):
     return [key for key in required if not values.get(key)]
 
 
+def read_enabled_servers(path):
+    """Список одобренных MCP-серверов — обратная сторона write_enabled_servers.
+
+    Тот же файл (`.claude/settings.local.json`), по которому Claude Code
+    решает, какие серверы поднимать. Нужен генератору конфига Codex: у Codex
+    отдельного гейта нет, поэтому гейтом служит сам config.toml, и список
+    включённых обязан быть ОДИН на оба движка — иначе аналитик, настроивший
+    только WMS, в каждой сессии Codex получал бы запуск всех девяти серверов.
+
+    Различает два разных состояния, и вызывающий код обязан их различать
+    тоже:
+      None       — выбор не сделан: файла нет, он битый, или ключа в нём нет
+                   (например, `setup.sh` ещё ни разу не отработал);
+      []         — выбор сделан, и не включено ничего.
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    servers = data.get("enabledMcpjsonServers")
+    if not isinstance(servers, list):
+        return None
+    return [s for s in servers if isinstance(s, str)]
+
+
 def write_enabled_servers(path, servers):
     """Записать список одобренных MCP-серверов, не трогая прочие настройки."""
     data = {}

@@ -46,6 +46,34 @@ def test_keeps_other_local_settings(tmp_path):
     assert data["enabledMcpjsonServers"] == ["trino"]
 
 
+def test_read_enabled_servers_round_trips_what_the_wizard_wrote(tmp_path):
+    """Список включённых коннекторов — один на оба движка: Claude Code берёт
+    его отсюда сам, генератор конфига Codex — через эту функцию."""
+    path = tmp_path / "settings.local.json"
+    setup_helpers.write_enabled_servers(str(path), ["trino", "superset"])
+    assert setup_helpers.read_enabled_servers(str(path)) == ["superset", "trino"]
+
+
+def test_read_enabled_servers_distinguishes_no_choice_from_empty_choice(tmp_path):
+    """None («выбор не сделан») и [] («выбрано ничего») — разные состояния, и
+    генератор конфига Codex ведёт себя в них по-разному: в первом случае
+    пишет все коннекторы, во втором — ни одного."""
+    missing = tmp_path / "нет-такого.json"
+    assert setup_helpers.read_enabled_servers(str(missing)) is None
+
+    empty_choice = tmp_path / "empty.json"
+    empty_choice.write_text(json.dumps({"enabledMcpjsonServers": []}), encoding="utf-8")
+    assert setup_helpers.read_enabled_servers(str(empty_choice)) == []
+
+    no_key = tmp_path / "no_key.json"
+    no_key.write_text(json.dumps({"permissions": {}}), encoding="utf-8")
+    assert setup_helpers.read_enabled_servers(str(no_key)) is None
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{не json", encoding="utf-8")
+    assert setup_helpers.read_enabled_servers(str(broken)) is None
+
+
 def test_creates_secrets_directory_with_closed_permissions(tmp_path):
     """Находка ревью задачи 9: файл секретов был 600, но сам каталог
     (~/.config/uzum-ai) создавался с правами по умолчанию — любой процесс

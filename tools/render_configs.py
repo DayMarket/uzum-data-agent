@@ -69,6 +69,7 @@ if str(_REPO_ROOT) not in sys.path:
 if str(_REPO_ROOT / "lib") not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT / "lib"))
 
+import setup_helpers  # noqa: E402
 from connectors.registry import Connector, EnvVar, ProjectScript, StaticEnv  # noqa: E402
 from known_secret_paths import KNOWN_SECRET_LOCATIONS  # noqa: E402
 
@@ -375,15 +376,40 @@ def _render_codex_permission_profile(repo_root: Path) -> str:
     return "\n".join(lines)
 
 
-def render_codex_toml(connectors: Iterable[Connector], repo_root: Path = None) -> str:
+def render_codex_toml(connectors: Iterable[Connector], repo_root: Path = None,
+                       enabled=None) -> str:
     """Собрать .codex/config.toml (формат Codex) из реестра коннекторов.
 
     `repo_root` по умолчанию — реальный корень этого репозитория
     (`_REPO_ROOT`, вычисленный из расположения этого файла на диске);
     параметр существует, чтобы тесты могли подставить временный путь и
-    не зависеть от того, где именно лежит рабочая копия при прогоне CI."""
+    не зависеть от того, где именно лежит рабочая копия при прогоне CI.
+
+    `enabled` — список коннекторов, которые аналитик реально включил при
+    установке. Источник тот же, что и у Claude Code:
+    `.claude/settings.local.json` → `enabledMcpjsonServers` (его пишет
+    `setup.sh`, читает `setup_helpers.read_enabled_servers`). У Claude Code
+    гейт лежит отдельно от `.mcp.json`, поэтому там в конфиге всегда все
+    девять; у Codex отдельного гейта НЕТ — гейтом служит сам config.toml,
+    значит фильтровать надо здесь. Без этого аналитик, настроивший один
+    только WMS, получал бы в каждой сессии Codex запуск всех девяти
+    серверов: `clickhouse_proxy.py` падает с SystemExit на отсутствующих
+    `CH_DWH_*`, а `npx`/`uvx` тянут пакеты — первый запуск выглядит
+    сломанным при полностью корректной установке.
+
+    `enabled=None` (выбор не сделан: `settings.local.json` нет, он битый или
+    в нём нет ключа) — пишем ВСЕ коннекторы. Осознанный выбор: None
+    означает «мы не знаем, что включено», а не «не включено ничего», и это
+    ровно то состояние, в котором генератор запускают руками до/вне
+    `setup.sh`. Отдать в этом случае пустой конфиг значило бы молча лишить
+    Codex всех инструментов — тот же класс тихой поломки, который здесь и
+    чинится, только зеркальный. Пустой СПИСОК (`[]`) — это уже сделанный
+    выбор «ничего не включено», и он честно даёт конфиг без коннекторов."""
     if repo_root is None:
         repo_root = _REPO_ROOT
+    if enabled is not None:
+        allowed = set(enabled)
+        connectors = [c for c in connectors if c.id in allowed]
     blocks = [_render_codex_permission_profile(repo_root)]
     for connector in connectors:
         command, raw_args, env_items = _codex_spec(connector)
@@ -410,6 +436,15 @@ def render_codex_toml(connectors: Iterable[Connector], repo_root: Path = None) -
 
 
 # ── CLI: пишет оба файла на диск ────────────────────────────────────────────
+
+def enabled_connector_ids(repo_root: Path):
+    """Что аналитик реально включил при установке — из того же файла, по
+    которому это решает Claude Code. Отдельная функция, а не строка внутри
+    main(): именно на «читаем не тот файл / не тот ключ» такая проводка и
+    ломается молча, а так она покрыта тестом."""
+    return setup_helpers.read_enabled_servers(
+        str(repo_root / ".claude" / "settings.local.json"))
+
 
 def _write(path: Path, content: str) -> bool:
     """Записать файл, если содержимое изменилось. Возвращает True, если
@@ -438,8 +473,9 @@ def main(argv=None) -> int:
     mcp_json_path = repo_root / ".mcp.json"
     codex_toml_path = repo_root / ".codex" / "config.toml"
 
+    enabled = enabled_connector_ids(repo_root)
     mcp_json = render_mcp_json(CONNECTORS)
-    codex_toml = render_codex_toml(CONNECTORS)
+    codex_toml = render_codex_toml(CONNECTORS, enabled=enabled)
 
     if args.check:
         stale = []
@@ -463,6 +499,14 @@ def main(argv=None) -> int:
         print("Обновлено: %s" % ", ".join(changed))
     else:
         print("Оба конфига уже соответствуют connectors/registry.py")
+
+    if enabled is None:
+        print("Codex: коннекторов в конфиге — все %d "
+              "(список включённых ещё не записан в .claude/settings.local.json)"
+              % len(CONNECTORS))
+    else:
+        print("Codex: коннекторов в конфиге — %d из %d "
+              "(по .claude/settings.local.json)" % (len(enabled), len(CONNECTORS)))
     return 0
 
 

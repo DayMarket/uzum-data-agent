@@ -120,6 +120,63 @@ def test_clickhouse_codex_launches_the_proxy_wrapper_with_the_right_cluster_arg(
     assert codex_servers["clickhouse-dwh"]["args"] == ["run", "connectors/clickhouse_proxy.py", "dwh"]
 
 
+# ── Гейт: Codex поднимает только то, что аналитик включил ────────────────
+#
+# Находка ревью (Important): мастер писал выбор аналитика в
+# .claude/settings.local.json → enabledMcpjsonServers, и Claude Code поднимал
+# только выбранное, а в .codex/config.toml уходили все девять безусловно. У
+# Codex отдельного гейта нет — гейтом служит сам config.toml. Аналитик,
+# настроивший только WMS, в каждой сессии Codex получал запуск девяти
+# серверов: clickhouse_proxy.py падает на отсутствующих CH_DWH_*, npx/uvx
+# тянут пакеты. Первый запуск выглядит сломанным при корректной установке.
+
+def test_codex_toml_contains_only_the_enabled_connectors():
+    servers = tomllib.loads(
+        render_configs.render_codex_toml(CONNECTORS, enabled=["clickhouse-wms", "trino"])
+    )["mcp_servers"]
+    assert set(servers) == {"clickhouse-wms", "trino"}
+
+
+def test_codex_toml_without_a_list_keeps_all_connectors():
+    """Осознанный выбор для «список не задан» (None): пишем всё. None — это
+    «мы не знаем, что включено» (settings.local.json нет/битый/без ключа), а
+    не «не включено ничего»; пустой конфиг в этом случае молча лишил бы Codex
+    всех инструментов."""
+    servers = tomllib.loads(
+        render_configs.render_codex_toml(CONNECTORS, enabled=None)
+    )["mcp_servers"]
+    assert set(servers) == EXPECTED_IDS
+
+
+def test_codex_toml_with_an_empty_list_has_no_connectors_but_keeps_the_profile():
+    """Пустой СПИСОК — это уже сделанный выбор «ничего не включено», и он
+    отличается от None. Профиль разрешений при этом остаётся: он не про
+    коннекторы, а про файловую систему."""
+    config = tomllib.loads(render_configs.render_codex_toml(CONNECTORS, enabled=[]))
+    assert "mcp_servers" not in config
+    assert config["default_permissions"] == render_configs.CODEX_PERMISSION_PROFILE_NAME
+
+
+def test_mcp_json_always_lists_all_nine_regardless_of_the_enabled_list():
+    """У Claude Code гейт лежит ОТДЕЛЬНО от .mcp.json (сам
+    enabledMcpjsonServers), поэтому фильтровать .mcp.json нельзя — иначе
+    коннектор, включённый позже через ./setup.sh --add, не найдётся."""
+    assert set(_mcp_json_servers()) == EXPECTED_IDS
+
+
+def test_enabled_list_is_read_from_the_same_file_claude_code_uses(tmp_path):
+    """Проводка, а не только фильтр: генератор обязан брать список из того же
+    файла и того же ключа, что пишет мастер и читает Claude Code."""
+    settings = tmp_path / ".claude" / "settings.local.json"
+    settings.parent.mkdir(parents=True)
+    settings.write_text(json.dumps({"enabledMcpjsonServers": ["superset"]}), encoding="utf-8")
+    assert render_configs.enabled_connector_ids(tmp_path) == ["superset"]
+
+
+def test_enabled_list_is_none_when_the_analyst_has_not_chosen_yet(tmp_path):
+    assert render_configs.enabled_connector_ids(tmp_path) is None
+
+
 # ── Секреты ───────────────────────────────────────────────────────────────
 
 def test_no_literal_secrets_in_mcp_json():
