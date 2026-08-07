@@ -17,12 +17,10 @@
       "Bash(du:*)",
       "mcp__clickhouse__list_databases",
       "mcp__clickhouse__list_tables",
-      "mcp__clickhouse__run_query",
       "mcp__trino__list_catalogs",
       "mcp__trino__list_schemas",
       "mcp__trino__list_tables",
       "mcp__trino__describe_table",
-      "mcp__trino__execute_query",
       "mcp__superset__list_dashboards",
       "mcp__superset__list_dashboard_charts",
       "mcp__superset__list_charts",
@@ -35,7 +33,6 @@
       "mcp__superset__get_chart_screenshot",
       "mcp__superset__get_dataset",
       "mcp__superset__get_dataset_summary",
-      "mcp__superset__sql_query",
       "mcp__superset__refresh_token",
       "mcp__atlassian__jira_search",
       "mcp__atlassian__jira_get_issue",
@@ -76,6 +73,10 @@
       "mcp__openmetadata__get_sample_data",
       "mcp__growthbook__growthbook_list_skills",
       "mcp__growthbook__growthbook_read_skill"
+    ],
+    "deny": [
+      "Read(~/.config/uzum-ai/**)",
+      "Read(.env)"
     ]
   },
   "hooks": {
