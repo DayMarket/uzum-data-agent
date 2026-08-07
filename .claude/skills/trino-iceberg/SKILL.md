@@ -4,6 +4,15 @@ description: Используй, когда нужен Trino-запрос пов
 
 # Trino + ClickHouse Optimization
 
+## Проверка реестра — обязательно до первого запроса
+
+Прежде чем писать или выполнять запрос к конкретной витрине/таблице,
+сверься с `context/marts.md`. Витрина помечена «🚫 запрещено — правило 1» —
+останавливаешься сразу: не пишешь SQL, не создаёшь temp-таблицу в
+`dwh-iceberg.sandbox`, не запрашиваешь через `system.query()`. Скажи
+человеку, что задача касается зарплатных данных и почему (правило 1,
+`CLAUDE.md`), и на этом всё.
+
 ## The system.query() Pattern
 
 **CRITICAL:** When querying `dwh-clickhouse` from Trino, **always** create a temp table first in `dwh-iceberg.sandbox`.
