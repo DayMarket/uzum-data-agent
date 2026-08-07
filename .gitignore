@@ -4,6 +4,15 @@ work/
 # локальная конфигурация Claude Code (включённые MCP-серверы)
 .claude/settings.local.json
 
+# Codex: config.toml генерируется tools/render_configs.py и содержит
+# абсолютные пути к локальным коннекторам (у Codex нет аналога
+# ${CLAUDE_PROJECT_DIR:-.} — подстановка ${VAR} в config.toml не работает
+# вообще, см. docs/codex-facts.md, раздел 4) — путь верен только на диске
+# конкретного аналитика, поэтому в отличие от .mcp.json файл не в git, как
+# .claude/settings.local.json выше. Пишется установкой (setup.sh) заново на
+# каждой машине.
+.codex/config.toml
+
 # сгенерированное
 __pycache__/
 *.pyc

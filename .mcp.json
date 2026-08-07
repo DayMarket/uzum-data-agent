@@ -2,7 +2,9 @@
   "mcpServers": {
     "atlassian": {
       "command": "uvx",
-      "args": ["mcp-atlassian"],
+      "args": [
+        "mcp-atlassian"
+      ],
       "env": {
         "JIRA_URL": "${JIRA_URL:-https://jira.uzum.com}",
         "JIRA_PERSONAL_TOKEN": "${JIRA_TOKEN}",
@@ -12,7 +14,11 @@
     },
     "clickhouse-wms": {
       "command": "uvx",
-      "args": ["--with", "pyarrow", "mcp-clickhouse"],
+      "args": [
+        "--with",
+        "pyarrow",
+        "mcp-clickhouse"
+      ],
       "env": {
         "MCP_TRANSPORT": "stdio",
         "CLICKHOUSE_HOST": "${CH_WMS_HOST}",
@@ -26,7 +32,11 @@
     },
     "clickhouse-dwh": {
       "command": "uvx",
-      "args": ["--with", "pyarrow", "mcp-clickhouse"],
+      "args": [
+        "--with",
+        "pyarrow",
+        "mcp-clickhouse"
+      ],
       "env": {
         "MCP_TRANSPORT": "stdio",
         "CLICKHOUSE_HOST": "${CH_DWH_HOST}",
@@ -40,7 +50,10 @@
     },
     "trino": {
       "command": "uv",
-      "args": ["run", "${CLAUDE_PROJECT_DIR:-.}/connectors/trino_proxy.py"],
+      "args": [
+        "run",
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/trino_proxy.py"
+      ],
       "env": {
         "TRINO_HOST": "${TRINO_HOST:-trino.prod-data.internal.daymarket.uz}",
         "TRINO_CATALOG": "${TRINO_CATALOG:-dwh-iceberg}"
@@ -48,14 +61,19 @@
     },
     "superset": {
       "command": "uv",
-      "args": ["run", "${CLAUDE_PROJECT_DIR:-.}/connectors/superset_mcp.py"],
+      "args": [
+        "run",
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/superset_mcp.py"
+      ],
       "env": {
         "SUPERSET_URL": "${SUPERSET_URL}"
       }
     },
     "grafana": {
       "command": "uvx",
-      "args": ["mcp-grafana"],
+      "args": [
+        "mcp-grafana"
+      ],
       "env": {
         "GRAFANA_URL": "${GRAFANA_URL}",
         "GRAFANA_SERVICE_ACCOUNT_TOKEN": "${GRAFANA_TOKEN}"
@@ -63,8 +81,17 @@
     },
     "openmetadata": {
       "command": "uvx",
-      "args": ["--with", "fastmcp<2.4", "--with", "pydantic<2.9",
-               "--from", "mcp-openmetadata", "python", "-m", "mcp_openmetadata.server"],
+      "args": [
+        "--with",
+        "fastmcp<2.4",
+        "--with",
+        "pydantic<2.9",
+        "--from",
+        "mcp-openmetadata",
+        "python",
+        "-m",
+        "mcp_openmetadata.server"
+      ],
       "env": {
         "OPENMETADATA_URI": "${OMD_URL}",
         "OPENMETADATA_JWT_TOKEN": "${OMD_TOKEN}"
@@ -72,14 +99,20 @@
     },
     "growthbook": {
       "command": "npx",
-      "args": ["-y", "@growthbook/mcp"],
+      "args": [
+        "-y",
+        "@growthbook/mcp"
+      ],
       "env": {
         "GB_API_KEY": "${GROWTHBOOK_TOKEN}"
       }
     },
     "sheets": {
       "command": "uv",
-      "args": ["run", "${CLAUDE_PROJECT_DIR:-.}/connectors/sheets_mcp.py"],
+      "args": [
+        "run",
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/sheets_mcp.py"
+      ],
       "env": {
         "GOOGLE_SERVICE_ACCOUNT_FILE": "${GOOGLE_SA_FILE}",
         "GOOGLE_SHEETS_FOLDER_ID": "${GOOGLE_SHEETS_FOLDER_ID}"
