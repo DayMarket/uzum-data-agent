@@ -34,8 +34,10 @@ Netbird обязателен: прод ClickHouse, Trino, OpenMetadata и Grafan
 
 ## Что должно быть на машине, кроме `uv`
 
-- `mcp-grafana` — Go-бинарь (`brew install mcp-grafana`), пакета с таким именем
-  на PyPI нет. Сервер читает токен из `GRAFANA_SERVICE_ACCOUNT_TOKEN`.
+- `mcp-grafana` отдельно ставить не нужно — пакет есть на PyPI, `.mcp.json`
+  запускает его как `uvx mcp-grafana` (тот же Go-бинарь, что кладёт
+  `brew install mcp-grafana`, просто через `uv`, без ручной установки).
+  Сервер читает токен из `GRAFANA_SERVICE_ACCOUNT_TOKEN`.
 - `npx` (Node.js 18+, `brew install node`) — только для GrowthBook: официальный
   сервер это npm-пакет `@growthbook/mcp`, питоновского аналога нет.
 - OpenMetadata запускается модулем (`python -m mcp_openmetadata.server`), у пакета

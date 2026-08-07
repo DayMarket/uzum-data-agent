@@ -308,16 +308,11 @@ check_environment() {
     fail "Поставь: curl -LsSf https://astral.sh/uv/install.sh | sh — и запусти ./setup.sh заново"
     exit 1
   fi
-  # mcp-grafana — не PyPI-пакет, а Go-бинарь (репозиторий grafana/mcp-grafana,
-  # в homebrew-core). Раньше .mcp.json запускал его как `uvx mcp-grafana` —
-  # такого пакета на PyPI нет, коннектор не поднимался ни у кого, при этом
-  # смоук-тест токена ниже честно печатал «вижу организацию».
-  # Не фатально: без Grafana остальные семь коннекторов работают.
-  if command -v mcp-grafana >/dev/null 2>&1; then
-    ok "mcp-grafana найден"
-  else
-    fail "mcp-grafana не найден — коннектор grafana не поднимется. Поставь: brew install mcp-grafana"
-  fi
+  # mcp-grafana — пакет есть на PyPI (bin/mcp-grafana внутри wheel — тот же
+  # Go-бинарь, что ставит `brew install mcp-grafana`), поэтому `.mcp.json`
+  # запускает его как `uvx mcp-grafana`, как остальные пять серверов через
+  # `uvx`: отдельной проверки бинаря тут не нужно — её делает проверка `uv`
+  # выше, `uvx` сам скачает пакет при первом запуске.
   # npx нужен только growthbook: официальный сервер GrowthBook — npm-пакет
   # @growthbook/mcp (node >= 18), питоновского аналога нет.
   if command -v npx >/dev/null 2>&1; then

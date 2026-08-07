@@ -68,24 +68,31 @@ def test_local_scripts_exist():
 
 
 def test_no_server_is_launched_from_a_nonexistent_pypi_package():
-    """Находка финального ревью: `uvx mcp-grafana` и `uvx mcp-growthbook` —
-    пакетов с такими именами на PyPI нет (проверено `uvx ... --help`:
-    "was not found in the package registry"), а `uvx mcp-openmetadata`
-    ставится, но не даёт исполняемого файла ("does not provide any
-    executables"). Установка при этом проходила зелёной — коннекторы просто
-    не поднимались в сессии.
+    """`uvx mcp-growthbook` — пакета с таким именем на PyPI нет (это
+    npm-пакет, `@growthbook/mcp`, запускается через `npx`), а `uvx
+    mcp-openmetadata` ставится, но не даёт исполняемого файла ("does not
+    provide any executables") — нужен запуск модулем.
+
+    mcp-grafana, наоборот, на PyPI ЕСТЬ: находка финального ревью перед
+    раздачей репозитория, что здесь было наоборот записано неверно ("пакета
+    нет, нужен brew install"). Проверено запуском: `uvx mcp-grafana
+    --version` ставит пакет и печатает `v1.0.0` — тот же бинарь, что кладёт
+    `brew install mcp-grafana` (тот же апстрим, grafana/mcp-grafana, та же
+    версия). Поэтому grafana запускается как `uvx mcp-grafana`, так же, как
+    остальные пакетные серверы — без обязательного `brew install`.
     """
     servers = CONFIG["mcpServers"]
-    assert servers["grafana"]["command"] == "mcp-grafana", (
-        "mcp-grafana — Go-бинарь (brew install mcp-grafana), не PyPI-пакет"
-    )
+    assert servers["grafana"]["command"] == "uvx"
+    assert servers["grafana"]["args"] == ["mcp-grafana"]
     assert servers["growthbook"]["command"] == "npx"
     assert "@growthbook/mcp" in servers["growthbook"]["args"]
     omd_args = servers["openmetadata"]["args"]
     assert omd_args[-2:] == ["-m", "mcp_openmetadata.server"], (
         "у mcp-openmetadata нет console script — только запуск модулем"
     )
-    for server in servers.values():
+    for name, server in servers.items():
+        if name == "grafana":
+            continue
         assert server["args"][:1] != ["mcp-grafana"]
         assert server["args"][:1] != ["mcp-growthbook"]
 

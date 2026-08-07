@@ -6,7 +6,7 @@
 ## Установка
 
 Что должно стоять до установки (любым из двух путей ниже): `uv`
-(`brew install uv`), `mcp-grafana` (`brew install mcp-grafana`) и Node.js 18+
+(`brew install uv`, им же поднимается `mcp-grafana` через `uvx`) и Node.js 18+
 (`brew install node`, нужен только GrowthBook). Мастер проверит и скажет,
 чего не хватает.
 
