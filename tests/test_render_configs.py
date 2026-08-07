@@ -14,6 +14,7 @@
 """
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -272,24 +273,69 @@ def test_toml_writer_escapes_control_characters_and_round_trips():
     assert parsed["value"] == tricky
 
 
-# ── Сверка с текущим .mcp.json / .codex/config.toml ─────────────────────
+# ── Сверка с текущим .mcp.json ──────────────────────────────────────────
 
 def test_generated_mcp_json_matches_current_file_on_disk():
     """Главная проверка задачи: перенос в registry.py точный. Сравниваем как
     данные (не текстом), чтобы разница в порядке ключей не считалась
-    расхождением — как и разрешено в задании."""
+    расхождением — как и разрешено в задании.
+
+    Так можно только с `.mcp.json`: он машинно-независим (подстановка
+    `${VAR}`, относительные пути, все девять коннекторов). Для
+    `.codex/config.toml` такой же сверки НЕТ и быть не может — см. ниже."""
     current = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))
     generated = json.loads(render_configs.render_mcp_json(CONNECTORS))
     assert generated == current
 
 
-def test_generated_codex_toml_matches_current_file_on_disk():
-    """Тот же принцип, что и для .mcp.json, теперь применим и к Codex: с
-    относительными путями config.toml больше не привязан к диску конкретного
-    аналитика (см. .gitignore — файл больше не исключён), поэтому его можно
-    держать в git и ловить расхождение с реестром так же."""
-    current_path = REPO_ROOT / ".codex" / "config.toml"
-    assert current_path.exists(), ".codex/config.toml должен быть сгенерирован и закоммичен"
-    current = tomllib.loads(current_path.read_text(encoding="utf-8"))
-    generated = tomllib.loads(render_configs.render_codex_toml(CONNECTORS))
-    assert generated == current
+# ── .codex/config.toml: свойство генератора, а не состояние диска ────────
+#
+# Раньше здесь стояла сверка «сгенерированное совпадает с закоммиченным
+# .codex/config.toml». Она была зелёной ровно на одной машине — той, где
+# файл последний раз регенерировали: профиль разрешений содержит абсолютный
+# путь к репозиторию, поэтому на клоне по любому другому пути тест падал.
+# То есть проверка подтверждала состояние ноутбука автора, а не свойство
+# кода — тот же класс дефекта, который на этом проекте ловили уже не раз.
+# Файл теперь в .gitignore (промежуточный артефакт установки), а проверяется
+# то, что от генератора реально требуется.
+
+def test_codex_toml_is_not_tracked_by_git():
+    """Регрессия на находку Critical: пока `.codex/config.toml` лежал в git,
+    рабочее дерево у каждого аналитика было навсегда «грязным» по
+    отслеживаемому файлу (setup.sh перегенерирует его под свой путь), и
+    `git pull --ff-only` в хуке старта сессии обрывался — скиллы переставали
+    обновляться, а сессия сообщала «работать можно, но скиллы могут быть
+    устаревшими» каждый раз."""
+    result = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", ".codex/config.toml"],
+        cwd=str(REPO_ROOT), capture_output=True, text=True,
+    )
+    assert result.returncode != 0, (
+        ".codex/config.toml снова отслеживается git — это ломает git pull "
+        "у аналитика, файл должен оставаться в .gitignore"
+    )
+
+
+def test_codex_profile_paths_stay_inside_the_given_repo_root(tmp_path):
+    """Свойство генератора: при заданном корне все абсолютные пути профиля
+    лежат ВНУТРИ этого корня. Именно это и было сломано — закоммиченный файл
+    нёс путь чужой машины, и правило «писать только в work/» указывало не
+    туда. Тест обязан проходить на клоне по произвольному пути, поэтому
+    корень задаётся явно (tmp_path), а не берётся с диска."""
+    config = tomllib.loads(render_configs.render_codex_toml(CONNECTORS, repo_root=tmp_path))
+    rules = config["permissions"][config["default_permissions"]]["filesystem"]
+
+    rooted = [p for p, access in rules.items() if access in ("read", "write")]
+    assert rooted, "нет ни одного правила read/write — сломан детектор"
+    for pattern in rooted:
+        assert pattern.startswith("%s/" % tmp_path.resolve()), pattern
+
+
+def test_codex_toml_connector_section_does_not_depend_on_repo_root(tmp_path):
+    """Обратная половина того же свойства: от корня зависит ТОЛЬКО профиль
+    разрешений. Команды и переменные коннекторов машинно-независимы — если
+    в них когда-нибудь просочится абсолютный путь, тест это заметит."""
+    a = tomllib.loads(render_configs.render_codex_toml(CONNECTORS, repo_root=tmp_path / "a"))
+    b = tomllib.loads(render_configs.render_codex_toml(CONNECTORS, repo_root=tmp_path / "b"))
+    assert a["mcp_servers"] == b["mcp_servers"]
+    assert a["permissions"] != b["permissions"]

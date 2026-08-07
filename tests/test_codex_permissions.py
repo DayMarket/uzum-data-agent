@@ -113,7 +113,10 @@ deny на `~/.config/uzum-ai/**` и на `**/*.env` внутри репозит�
 `.codex/config.toml` перестаёт быть машинно-независимым для этого одного
 поля (остальное — команды коннекторов — по-прежнему относительные пути) и
 должен перегенерироваться на каждой новой машине (`setup.sh`), это
-задокументировано в `tools/render_configs.py`.
+задокументировано в `tools/render_configs.py`. Отсюда же следует, что файла
+нет в git (`.gitignore`) и что тесты не сверяют его с диском: проверяется
+поведение генератора при заданном корне, а не застывшее значение с одной
+машины.
 """
 import json
 import os
@@ -260,12 +263,30 @@ def _codex_config():
     return tomllib.loads(text)
 
 
-def test_generated_codex_toml_matches_current_file_on_disk():
-    current_path = REPO_ROOT / ".codex" / "config.toml"
-    assert current_path.exists()
-    current = tomllib.loads(current_path.read_text(encoding="utf-8"))
-    generated = tomllib.loads(render_configs.render_codex_toml(CONNECTORS))
-    assert generated == current
+def test_permission_profile_never_carries_a_path_from_another_root(tmp_path):
+    """Раньше здесь стояла сверка сгенерированного с закоммиченным
+    `.codex/config.toml`. Она проходила ровно на той машине, где файл в
+    последний раз регенерировали, — профиль содержит абсолютный путь к
+    репозиторию, и на клоне по другому пути тест падал. Файл теперь в
+    .gitignore (промежуточный артефакт установки), а проверяется само
+    свойство: ни одно правило профиля не ссылается на путь за пределами
+    того корня, для которого профиль сгенерирован. Исключение —
+    общесистемные правила: глобальный `*.env` и общеизвестные хранилища
+    секретов из lib/known_secret_paths.py, они по замыслу шире репозитория
+    и покрыты отдельными тестами выше."""
+    rules = _profile_filesystem_rules(repo_root=tmp_path)
+    root = str(tmp_path.resolve())
+    system_wide = set(KNOWN_SECRET_LOCATIONS) | {
+        "%s/**" % location for location in KNOWN_SECRET_LOCATIONS
+    } | {"/**/*.env"}
+
+    for pattern in rules:
+        if pattern in system_wide:
+            continue
+        assert pattern.startswith("%s/" % root), (
+            "правило %r не относится ни к этому корню, ни к общесистемному "
+            "списку — похоже, в профиль просочился путь с чужой машины" % pattern
+        )
 
 
 def test_no_legacy_sandbox_mode_alongside_the_named_profile():
