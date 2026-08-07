@@ -131,7 +131,20 @@ def test_detects_claude_from_realistic_flat_project_path():
 
 
 def test_detect_engine_survives_missing_transcript_path():
-    assert hook_payload.detect_engine({"session_id": "s"}) == "claude"
+    """Ревью-находка 4 (задача Codex-4): раньше отсутствие transcript_path
+    молча трактовалось как Claude Code — тот же класс ошибки, что и провал
+    с permission_mode, только слоем ниже. Теперь это отдельное, видимое в
+    данных состояние ("unknown"), а не тихая догадка. Ни в одном реальном
+    payload'е обоих движков (docs/codex-facts.md, раздел 2) transcript_path
+    не отсутствовал — это защитный случай, не наблюдаемый на практике."""
+    assert hook_payload.detect_engine({"session_id": "s"}) == "unknown"
+
+
+def test_detect_engine_returns_unknown_for_unrecognized_transcript_path():
+    """Путь есть, но не похож ни на Codex (rollout-*.jsonl), ни на Claude
+    Code (.claude/projects/...) — тоже "unknown", не молчаливый Claude."""
+    payload = {"session_id": "s", "transcript_path": "/var/log/something-else.jsonl"}
+    assert hook_payload.detect_engine(payload) == "unknown"
 
 
 # --- normalize: session_id / transcript_path / tool_name -------------------
@@ -163,9 +176,18 @@ def test_claude_duration_ms_is_read_when_present():
 def test_claude_duration_ms_degrades_to_zero_when_missing_or_bad():
     """Существующее, покрытое тестами (tests/test_log_event.py) поведение
     Claude Code: поле в схеме есть, но конкретное значение может быть
-    битым/отсутствовать — это не то же самое, что "поля нет в принципе"."""
-    assert hook_payload.normalize({"tool_name": "Bash"})["duration_ms"] == 0
-    assert hook_payload.normalize({"duration_ms": "не число"})["duration_ms"] == 0
+    битым/отсутствовать — это не то же самое, что "поля нет в принципе".
+
+    transcript_path задан по реальной раскладке Claude Code (docs/codex-facts.md,
+    раздел 2) специально — иначе detect_engine() честно вернёт "unknown"
+    (ревью-находка 4) и тест проверял бы не то поведение, что заявлено."""
+    claude_path = "/Users/x/.claude/projects/slug/s.jsonl"
+    assert hook_payload.normalize(
+        {"tool_name": "Bash", "transcript_path": claude_path}
+    )["duration_ms"] == 0
+    assert hook_payload.normalize(
+        {"duration_ms": "не число", "transcript_path": claude_path}
+    )["duration_ms"] == 0
 
 
 def test_codex_duration_ms_is_none_not_zero():

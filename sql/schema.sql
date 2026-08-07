@@ -67,10 +67,34 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events ON CLUSTER default
     tool_name   LowCardinality(String),
     mcp_server  LowCardinality(String),
     duration_ms UInt32,
+    -- ok сохранён для обратной совместимости с уже существующими запросами:
+    -- 0 означает ТОЛЬКО подтверждённый отказ (как и раньше — для Claude
+    -- Code третьего состояния не бывает в принципе). Он больше не
+    -- единственный источник правды про исход — см. колонку outcome.
     ok          UInt8,
+    -- Ревью-находка 3 (задача Codex-4): исход вызова, три состояния, а не
+    -- два. У Codex значительная доля вызовов заканчивается тем, что мы не
+    -- смогли прочитать транскрипт вовремя (гонка хук/запись на диск — см.
+    -- отчёт задачи) — раньше такая строка писалась как ok=1/error_text="",
+    -- неотличимо от настоящего подтверждённого успеха, и "процент падений"
+    -- Codex был смещён в оптимистичную сторону молча. DEFAULT 'ok' — не
+    -- потому что неизвестность где-то реже встречается, а потому что все
+    -- строки, вставленные до этой колонки, — от Claude Code, у которого
+    -- исход всегда детерминирован (см. .claude/hooks/log_event.py).
+    -- "Сколько упало": countIf(outcome = 'failed'). "Какая доля непроверяема
+    -- (не путать с успехом)": countIf(outcome = 'unknown').
+    outcome     LowCardinality(String) DEFAULT 'ok',
     error_text  String,
-    -- Признак движка — то же назначение и то же значение по умолчанию,
-    -- что у sandbox.ai_usage_sessions.engine, см. комментарий там.
+    -- Признак движка — то же назначение, что у sandbox.ai_usage_sessions.engine,
+    -- см. комментарий там. Дополнительно к 'claude'/'codex' здесь возможно
+    -- 'unknown' — lib/hook_payload.detect_engine() не опознал событие ни по
+    -- одному из двух известных форматов транскрипта (ревью-находка 4,
+    -- задача Codex-4): раньше такое событие молча помечалось 'claude', что
+    -- было тем же классом ошибки, что и провал с permission_mode чуть выше
+    -- по хронологии задачи, только на уровень ниже. DEFAULT остаётся
+    -- 'claude', а не 'unknown', ровно по той же причине, что и у outcome:
+    -- он про историю уже вставленных строк (до Codex-порта), а не про то,
+    -- как код должен угадывать на новых, непонятных событиях.
     engine      LowCardinality(String) DEFAULT 'claude',
     inserted_at DateTime('UTC') DEFAULT now()
 )
@@ -111,13 +135,37 @@ ORDER BY (jira_key, drafted_at);
 --    ALTER TABLE sandbox.ai_usage_sessions DELETE WHERE user = 'schema-check';
 --    ALTER TABLE sandbox.ai_usage_verdicts DELETE WHERE user = 'schema-check';
 --
--- 3. Признак движка (задача Codex-4, порт под Codex): добавить колонку
---    engine в sessions и events. DEFAULT 'claude' закрывает и старые строки
---    (ADD COLUMN ... DEFAULT в MergeTree отдаёт значение по умолчанию при
---    чтении для строк, записанных до миграции, без переписи данных на
---    диске), и новые вставки от Claude Code, которые ещё не обновили хуки.
+-- 3. Признак движка и исход вызова (задача Codex-4, порт под Codex):
+--    добавить колонку engine в sessions и events, колонку outcome — в
+--    events. DEFAULT закрывает и старые строки (ADD COLUMN ... DEFAULT в
+--    MergeTree отдаёт значение по умолчанию при чтении для строк,
+--    записанных до миграции, без переписи данных на диске), и новые
+--    вставки от Claude Code, которые ещё не обновили хуки.
+--
+--    Перед миграцией проверен фактом риск "формат вставки строгий, лишнее
+--    поле — ошибка" (ревью-находка 2): вставил в ЖИВУЮ таблицу sandbox.
+--    ai_usage_events (ДО этой миграции, колонки engine ещё нет) строку с
+--    лишним полем "engine" через тот же путь, что использует lib/telemetry.py
+--    (INSERT ... FORMAT JSONEachRow). Ответ сервера — 200, строка вставлена,
+--    лишнее поле молча отброшено. Причина — `input_format_skip_unknown_fields`
+--    на этом кластере равен 1 (проверено: `SELECT value FROM system.settings
+--    WHERE name = 'input_format_skip_unknown_fields'` → 1, changed=0, то
+--    есть это действующее значение по умолчанию, а не разовая настройка
+--    сессии). Риск был реальным по конструкции запроса (в lib/telemetry.py
+--    это поведение нигде явно не задано), но не сработал на практике на
+--    этом конкретном кластере — задокументировано здесь, чтобы в следующий
+--    раз не проверять заново на другом кластере с других значением по
+--    умолчанию.
 --
 --    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default
 --        ADD COLUMN IF NOT EXISTS engine LowCardinality(String) DEFAULT 'claude';
 --    ALTER TABLE sandbox.ai_usage_events ON CLUSTER default
 --        ADD COLUMN IF NOT EXISTS engine LowCardinality(String) DEFAULT 'claude';
+--    ALTER TABLE sandbox.ai_usage_events ON CLUSTER default
+--        ADD COLUMN IF NOT EXISTS outcome LowCardinality(String) DEFAULT 'ok';
+--
+--    Применено 07.08.2026, напрямую по HTTP с кредами
+--    mcp_servers["uzum-wms-clickhouse-write"] из .mcp.json (write-MCP-сервер
+--    в рабочей сессии не поднят, но креды к нему есть) — подтверждено
+--    чтением DESCRIBE TABLE после миграции и вставкой+чтением тестовой
+--    строки с обеими новыми колонками, см. отчёт задачи.

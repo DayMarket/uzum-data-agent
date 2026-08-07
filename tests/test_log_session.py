@@ -306,12 +306,29 @@ CODEX_TRANSCRIPT = str(
 
 
 def test_claude_session_row_has_engine_claude(tmp_path):
+    """Путь должен реально выглядеть как раскладка Claude Code
+    (.claude/projects/<slug>/<id>.jsonl, docs/codex-facts.md, раздел 2) —
+    иначе detect_engine() честно вернёт "unknown" (ревью-находка 4, задача
+    Codex-4), а не "claude" по умолчанию, и тест проверял бы не то, что
+    заявлено в его названии."""
+    claude_dir = tmp_path / ".claude" / "projects" / "slug"
+    claude_dir.mkdir(parents=True)
+    row = log_session.build_session_row(
+        {"session_id": "s", "transcript_path": _write_transcript(claude_dir),
+         "hook_event_name": "SessionEnd", "reason": "clear"},
+        {},
+    )
+    assert row["engine"] == "claude"
+
+
+def test_unrecognized_transcript_produces_session_engine_unknown_not_claude(tmp_path):
+    """Ревью-находка 4: раньше это молча становилось engine == 'claude'."""
     row = log_session.build_session_row(
         {"session_id": "s", "transcript_path": _write_transcript(tmp_path),
          "hook_event_name": "SessionEnd", "reason": "clear"},
         {},
     )
-    assert row["engine"] == "claude"
+    assert row["engine"] == "unknown"
 
 
 def test_codex_session_row_has_engine_codex_and_real_counts():

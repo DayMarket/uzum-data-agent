@@ -227,6 +227,12 @@ def build_session_row(payload, secrets):
     # lib/transcript_codex.py, докстринг модуля). Разбор Claude Code
     # (read_transcript() ниже в этом файле) не трогаем — он покрыт тестами
     # и уже дважды чинился; для Codex — отдельная функция в lib/transcript_codex.py.
+    # engine может быть ENGINE_CLAUDE, ENGINE_CODEX или ENGINE_UNKNOWN
+    # (ревью-находка 4, задача Codex-4 — detect_engine() больше не сводит
+    # неопознанное к Claude Code молча, это видно в колонке engine строки).
+    # На выбор ПАРСЕРА транскрипта это не влияет: для ENGINE_UNKNOWN нет
+    # третьего парсера, и наилучшая попытка — разобрать как Claude Code
+    # (исторически самый частый формат), не роняя сессию вовсе.
     engine = hook_payload.detect_engine(payload)
     if engine == hook_payload.ENGINE_CODEX:
         text, agg = transcript_codex.read_transcript(payload.get("transcript_path", ""), secrets)

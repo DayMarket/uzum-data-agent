@@ -42,6 +42,17 @@ import os
 
 ENGINE_CLAUDE = "claude"
 ENGINE_CODEX = "codex"
+# Ревью-находка 4 (см. отчёт задачи): раньше «не смогли опознать» молча
+# сливалось с ENGINE_CLAUDE — тот же класс ошибки, что и провал с
+# permission_mode, только слоем ниже. Теперь это отдельное, видимое в
+# данных состояние, а не тихая догадка.
+ENGINE_UNKNOWN = "unknown"
+
+# Структурный маркер пути транскрипта Claude Code (docs/codex-facts.md,
+# раздел 2, строка «Путь к транскрипту»): ~/.claude/projects/<slug>/<id>.jsonl.
+# Используется как ПОЗИТИВНЫЙ признак «это точно Claude Code», а не как
+# запасной вариант по умолчанию — см. detect_engine().
+_CLAUDE_PATH_MARKER = ".claude/projects/"
 
 # Поле turn_id: наблюдалось только у Codex (docs/codex-facts.md, раздел 2)
 # и не наблюдалось в живых Claude Code payload'ах (см. ниже, включая
@@ -91,16 +102,32 @@ def detect_engine(payload):
     обоих движков такого не встречалось, это защита на случай битого
     события, а не основной путь.
 
-    Если ничего не сработало — движок Claude Code: он же движок по
-    умолчанию для существующих строк (см. sql/schema.sql, миграция признака
-    движка) и для событий, которых в фактах не снимали живьём.
+    РЕВЬЮ-НАХОДКА 4 (см. отчёт задачи): раньше «ничего не сработало» молча
+    возвращало ENGINE_CLAUDE — тот же класс ошибки, из-за которого
+    переписывалось определение движка чуть выше (permission_mode), только
+    слоем ниже: там ошибочно СЧИТАЛИ Codex-ом то, что было Claude Code,
+    здесь — ошибочно СЧИТАЛИ Claude Code тем, что не опознано вовсе. ENGINE
+    CLAUDE возвращается ТОЛЬКО при позитивном совпадении с известным путём
+    Claude Code (`.claude/projects/` в transcript_path — см.
+    _CLAUDE_PATH_MARKER). Если ни один из известных форматов не совпал —
+    ENGINE_UNKNOWN, отдельное видимое в данных состояние, а не тихая
+    подстановка. Существующие строки, вставленные до этой колонки, всё
+    равно помечаются 'claude' в схеме (DEFAULT 'claude', sql/schema.sql) —
+    это факт про историю данных (движка Codex тогда не было), а не про то,
+    как detect_engine() должен угадывать на будущих, непонятных событиях.
     """
     transcript_path = payload.get("transcript_path") or ""
     if transcript_path:
-        return ENGINE_CODEX if os.path.basename(transcript_path).startswith("rollout-") else ENGINE_CLAUDE
+        if os.path.basename(transcript_path).startswith("rollout-"):
+            return ENGINE_CODEX
+        if _CLAUDE_PATH_MARKER in transcript_path:
+            return ENGINE_CLAUDE
+        # Путь есть, но не похож ни на один из двух известных форматов —
+        # не гадаем.
+        return ENGINE_UNKNOWN
     if _CODEX_TURN_ID_KEY in payload:
         return ENGINE_CODEX
-    return ENGINE_CLAUDE
+    return ENGINE_UNKNOWN
 
 
 def _claude_duration_ms(payload):
@@ -126,21 +153,25 @@ def normalize(payload):
     error_text — всегда "" (текст ошибки не приходит в hook payload Codex
     ни при каком событии; его достаёт отдельно lib/transcript_codex.py по
     transcript_path — вызывающий код делает это сам, когда он ему нужен,
-    normalize() не читает файлы с диска)."""
+    normalize() не читает файлы с диска). Для ENGINE_UNKNOWN — та же
+    консервативная пара (None/"") : раз не опознали, по какой из двух схем
+    разбирать событие, применять ни ту, ни другую нельзя — это было бы той
+    же угадайкой, что и раньше молчаливое сведение к Claude Code."""
     engine = detect_engine(payload)
     tool_name = payload.get("tool_name", "") or ""
     session_id = payload.get("session_id", "") or ""
     transcript_path = payload.get("transcript_path", "") or ""
 
-    if engine == ENGINE_CODEX:
-        duration_ms = None
-        error_text = ""
-    else:
+    if engine == ENGINE_CLAUDE:
         duration_ms = _claude_duration_ms(payload)
         # Поле называется "error", не "tool_error" — схема события
         # PostToolUseFailure зашита в самом Claude Code (см. комментарий в
         # .claude/hooks/log_event.py). Поля tool_error не существует.
         error_text = payload.get("error", "") or ""
+    else:
+        # ENGINE_CODEX или ENGINE_UNKNOWN — см. докстринг выше.
+        duration_ms = None
+        error_text = ""
 
     return {
         "session_id": session_id,
