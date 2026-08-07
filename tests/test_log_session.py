@@ -294,6 +294,68 @@ def test_transcript_truncated_to_tail_when_over_size_cap(tmp_path, monkeypatch):
     assert "OE-777" in text
 
 
+# --- Codex-4: признак движка, второй разбор транскрипта --------------------
+
+
+CODEX_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "codex"
+# Имя сохранено таким же, каким его пишет сам Codex (префикс "rollout-") —
+# это тот же признак движка, что использует lib/hook_payload.detect_engine().
+CODEX_TRANSCRIPT = str(
+    CODEX_FIXTURES / "rollout-2026-08-07T20-49-54-019fdd21-9868-7633-a9ca-63122c263433.jsonl"
+)
+
+
+def test_claude_session_row_has_engine_claude(tmp_path):
+    row = log_session.build_session_row(
+        {"session_id": "s", "transcript_path": _write_transcript(tmp_path),
+         "hook_event_name": "SessionEnd", "reason": "clear"},
+        {},
+    )
+    assert row["engine"] == "claude"
+
+
+def test_codex_session_row_has_engine_codex_and_real_counts():
+    """Настоящий транскрипт живого запуска Codex (см. докстринг
+    tests/test_transcript_codex.py): два хода, два реальных промпта, два
+    вызова инструментов."""
+    payload = {
+        "session_id": "019fdd21-9868-7633-a9ca-63122c263433",
+        "transcript_path": CODEX_TRANSCRIPT,
+        "cwd": "/tmp/codex-project",
+        "hook_event_name": "SessionEnd",
+        "reason": "other",
+    }
+    row = log_session.build_session_row(payload, {})
+    assert row["engine"] == "codex"
+    assert row["n_prompts"] == 2
+    assert row["n_tools"] == 2
+    assert row["tokens_in"] == 58109
+
+
+def test_row_columns_match_the_table_schema_for_codex_engine():
+    """Тот же страж, что test_row_columns_match_the_table_schema выше, но
+    по пути определения движка Codex — набор ключей не должен зависеть от
+    того, каким парсером транскрипта построена строка."""
+    schema = (REPO_ROOT / "sql" / "schema.sql").read_text(encoding="utf-8")
+    body = schema.split("CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions", 1)[1]
+    body = body.split("(", 1)[1].split("ENGINE", 1)[0]
+    columns = set()
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("--") or line.startswith("(") or line.startswith(")"):
+            continue
+        columns.add(line.split()[0])
+    columns.discard("inserted_at")
+
+    row = log_session.build_session_row(
+        {"session_id": "019fdd21-9868-7633-a9ca-63122c263433",
+         "transcript_path": CODEX_TRANSCRIPT, "hook_event_name": "SessionEnd",
+         "reason": "other"},
+        {},
+    )
+    assert set(row) == columns
+
+
 def test_session_end_removes_started_at_marker_file(tmp_path, monkeypatch):
     """Находка 6 (minor): файл started-<session_id> не должен копиться
     бессрочно — убираем его после того, как SessionEnd перенёс время старта

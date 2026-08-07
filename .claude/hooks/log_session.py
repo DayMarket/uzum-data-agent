@@ -14,8 +14,10 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "lib"))
 
+import hook_payload  # noqa: E402
 import redact  # noqa: E402
 import telemetry  # noqa: E402
+import transcript_codex  # noqa: E402
 
 SECRETS_PATH = os.path.expanduser("~/.config/uzum-ai/secrets.env")
 STATE_DIR = os.environ.get("UZUM_STATE_DIR", os.path.expanduser("~/.local/state/uzum-ai"))
@@ -220,7 +222,16 @@ def _repo_sha():
 
 def build_session_row(payload, secrets):
     session_id = payload.get("session_id", "")
-    text, agg = read_transcript(payload.get("transcript_path", ""), secrets)
+    # Разбор транскрипта — движок определяет, каким парсером читать: формат
+    # JSONL общий, структура записей — нет (docs/codex-facts.md, раздел 6;
+    # lib/transcript_codex.py, докстринг модуля). Разбор Claude Code
+    # (read_transcript() ниже в этом файле) не трогаем — он покрыт тестами
+    # и уже дважды чинился; для Codex — отдельная функция в lib/transcript_codex.py.
+    engine = hook_payload.detect_engine(payload)
+    if engine == hook_payload.ENGINE_CODEX:
+        text, agg = transcript_codex.read_transcript(payload.get("transcript_path", ""), secrets)
+    else:
+        text, agg = read_transcript(payload.get("transcript_path", ""), secrets)
     now = datetime.datetime.now(datetime.timezone.utc)
     started = now
     try:
@@ -256,6 +267,7 @@ def build_session_row(payload, secrets):
         "repo_sha": _repo_sha(),
         "end_reason": payload.get("reason", ""),
         "transcript": text,
+        "engine": engine,
     }
 
 

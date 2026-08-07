@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -112,3 +113,108 @@ def test_duration_ms_degrades_to_zero_when_not_numeric():
     }
     row = log_event.build_row(payload, {})
     assert row["duration_ms"] == 0
+
+
+# --- Codex-4: признак движка, второй разбор транскрипта --------------------
+
+
+def test_row_columns_match_the_events_table_schema():
+    """Тот же страж, что test_row_columns_match_the_table_schema в
+    tests/test_log_session.py: набор ключей строки должен совпадать с
+    колонками sandbox.ai_usage_events (кроме inserted_at с DEFAULT now()) —
+    иначе INSERT молча теряет поле, либо в таблице остаётся неиспользуемая
+    колонка."""
+    schema = (REPO_ROOT / "sql" / "schema.sql").read_text(encoding="utf-8")
+    body = schema.split("CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events", 1)[1]
+    body = body.split("(", 1)[1].split("ENGINE", 1)[0]
+    columns = set()
+    for line in body.splitlines():
+        line = line.strip()
+        if not line or line.startswith("--") or line.startswith("(") or line.startswith(")"):
+            continue
+        columns.add(line.split()[0])
+    columns.discard("inserted_at")
+
+    row = log_event.build_row(
+        {"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash"}, {}
+    )
+    assert set(row) == columns
+
+
+def test_claude_row_has_engine_claude():
+    row = log_event.build_row(
+        {"hook_event_name": "PostToolUse", "session_id": "s", "tool_name": "Bash"}, {}
+    )
+    assert row["engine"] == "claude"
+
+
+CODEX_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "codex"
+
+
+def _codex_events():
+    with open(CODEX_FIXTURES / "hook_events.jsonl", encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def test_codex_successful_tool_call_produces_ok_row_with_engine_codex():
+    """Настоящий payload/транскрипт живого запуска Codex (см. докстринг
+    tests/test_hook_payload.py и tests/test_transcript_codex.py)."""
+    success_payload = _codex_events()[2]
+    assert success_payload["hook_event_name"] == "PostToolUse"
+
+    row = log_event.build_row(success_payload, {})
+    assert row["engine"] == "codex"
+    assert row["ok"] == 1
+    assert row["error_text"] == ""
+    # Codex не присылает duration_ms никогда — 0 здесь означает "поле не
+    # передано", отличить от настоящего 0мс можно по engine == "codex"
+    # (см. lib/hook_payload.py и .claude/hooks/log_event.py).
+    assert row["duration_ms"] == 0
+
+
+def test_codex_failing_tool_call_has_real_error_text_not_empty():
+    """Главная цель телеметрии — «где падает» — не должна остаться пустой
+    и для Codex, хотя сам hook payload текста ошибки не несёт вовсе."""
+    failure_payload = _codex_events()[6]
+    assert failure_payload["hook_event_name"] == "PostToolUse"
+    assert failure_payload["tool_response"] == ""  # без разбора транскрипта тут пусто
+
+    row = log_event.build_row(failure_payload, {})
+    assert row["engine"] == "codex"
+    assert row["ok"] == 0
+    assert "9" in row["error_text"]  # exit code 9
+
+
+def test_codex_error_text_is_redacted(tmp_path):
+    """Секреты маскируются и в тексте ошибки, добытом из транскрипта Codex —
+    так же, как для Claude Code (test_redacts_secrets_in_error_text выше).
+    Синтетический транскрипт: реальная структура custom_tool_call_output
+    (docs/codex-facts.md, раздел 3), но с секретом в поле output, чтобы
+    проверить именно маскирование, а не структуру разбора — её уже проверяют
+    тесты на настоящем транскрипте (tests/test_transcript_codex.py)."""
+    turn_id = "turn-secret-test"
+    lines = [
+        {"type": "response_item", "payload": {
+            "type": "custom_tool_call_output", "call_id": "call_x",
+            "output": [
+                {"type": "input_text", "text": "Script completed\n"},
+                {"type": "input_text", "text": '{"exit_code":1,"output":"auth failed for hunter2-secret"}'},
+            ],
+            "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+        }},
+    ]
+    # Имя файла — с префиксом "rollout-": это единственный признак, по
+    # которому detect_engine() узнаёт Codex (lib/hook_payload.py) — набор
+    # дополнительных полей hook payload для этого больше не используется.
+    p = tmp_path / "rollout-2026-08-07T00-00-00-turn-secret-test.jsonl"
+    p.write_text("\n".join(json.dumps(x) for x in lines), encoding="utf-8")
+
+    payload = {
+        "hook_event_name": "PostToolUse", "session_id": "s", "turn_id": turn_id,
+        "permission_mode": "bypassPermissions", "tool_name": "Bash",
+        "transcript_path": str(p), "tool_response": "",
+    }
+    row = log_event.build_row(payload, {"hunter2-secret": "CH_PASSWORD"})
+    assert row["ok"] == 0
+    assert "hunter2-secret" not in row["error_text"]
+    assert "[СКРЫТО:CH_PASSWORD]" in row["error_text"]

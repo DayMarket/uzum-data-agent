@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
     repo_sha     String,
     end_reason   LowCardinality(String),
     transcript   String CODEC(ZSTD(3)),
+    -- Признак движка: 'claude' | 'codex'. DEFAULT 'claude' — не потому что
+    -- Claude Code как-то привилегирован, а потому что все строки, вставленные
+    -- до этой колонки, реально от него: Codex-порта тогда не было (см.
+    -- docs/superpowers/specs/2026-08-07-codex-port-design.md, задача Codex-4).
+    -- Значение пишет .claude/hooks/log_session.py по hook_payload.detect_engine() —
+    -- по содержимому события, не по переменной окружения.
+    engine       LowCardinality(String) DEFAULT 'claude',
     inserted_at  DateTime('UTC') DEFAULT now()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_sessions', '{replica}')
@@ -62,6 +69,9 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_events ON CLUSTER default
     duration_ms UInt32,
     ok          UInt8,
     error_text  String,
+    -- Признак движка — то же назначение и то же значение по умолчанию,
+    -- что у sandbox.ai_usage_sessions.engine, см. комментарий там.
+    engine      LowCardinality(String) DEFAULT 'claude',
     inserted_at DateTime('UTC') DEFAULT now()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_events', '{replica}')
@@ -100,3 +110,14 @@ ORDER BY (jira_key, drafted_at);
 --    ALTER TABLE sandbox.ai_usage_events   DELETE WHERE user = 'schema-check';
 --    ALTER TABLE sandbox.ai_usage_sessions DELETE WHERE user = 'schema-check';
 --    ALTER TABLE sandbox.ai_usage_verdicts DELETE WHERE user = 'schema-check';
+--
+-- 3. Признак движка (задача Codex-4, порт под Codex): добавить колонку
+--    engine в sessions и events. DEFAULT 'claude' закрывает и старые строки
+--    (ADD COLUMN ... DEFAULT в MergeTree отдаёт значение по умолчанию при
+--    чтении для строк, записанных до миграции, без переписи данных на
+--    диске), и новые вставки от Claude Code, которые ещё не обновили хуки.
+--
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default
+--        ADD COLUMN IF NOT EXISTS engine LowCardinality(String) DEFAULT 'claude';
+--    ALTER TABLE sandbox.ai_usage_events ON CLUSTER default
+--        ADD COLUMN IF NOT EXISTS engine LowCardinality(String) DEFAULT 'claude';
