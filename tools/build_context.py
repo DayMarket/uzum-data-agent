@@ -18,9 +18,12 @@ import sys
 
 HEADER = ("# Реестр витрин\n\n"
           "> Колонки «доверие» и «комментарий» заполняются руками и при\n"
-          "> пересборке сохраняются (tools/build_context.py).\n\n"
-          "| Витрина | Дашбордов | Кто строит | Доверие | Комментарий |\n"
-          "|---|--:|---|---|---|\n")
+          "> пересборке сохраняются (tools/build_context.py). «Кластер» —\n"
+          "> факт (WMS/DWH/оба/не найдена/не ClickHouse), а не суждение, и\n"
+          "> при пересборке пересчитывается заново, как «Дашбордов» и «Кто\n"
+          "> строит».\n\n"
+          "| Витрина | Дашбордов | Кто строит | Кластер | Доверие | Комментарий |\n"
+          "|---|--:|---|---|---|---|\n")
 
 
 def split_table_row(line):
@@ -91,8 +94,8 @@ def read_trust(path):
             if len(cells) > 0 and cells[-1] == "":
                 cells = cells[:-1]
 
-            if len(cells) < 4:
-                print(f"Warning: line {line_num} has {len(cells)} columns, expected at least 4: {line_stripped}", file=sys.stderr)
+            if len(cells) < 5:
+                print(f"Warning: line {line_num} has {len(cells)} columns, expected at least 5: {line_stripped}", file=sys.stderr)
                 continue
 
             name = cells[0]
@@ -101,9 +104,12 @@ def read_trust(path):
             if name.startswith("-") or name in ("Витрина", "Метрика", "Дашборд"):
                 continue
 
-            trust_val = cells[3].strip()
+            # cells: Витрина, Дашбордов, Кто строит, Кластер, Доверие, Комментарий…
+            # «Кластер» — факт, пересчитывается заново при каждой пересборке
+            # (как «Дашбордов»/«Кто строит»), поэтому read_trust его не хранит.
+            trust_val = cells[4].strip()
             # Остальные колонки склеиваем в комментарий (может быть несколько полей с |)
-            comment = " | ".join(cells[4:]).strip() if len(cells) > 4 else ""
+            comment = " | ".join(cells[5:]).strip() if len(cells) > 5 else ""
 
             trust[name] = (trust_val, comment)
         except Exception as e:
@@ -119,7 +125,7 @@ def render_marts(rows, trust=None):
     for row in rows:
         saved_trust, saved_note = trust.get(row["name"], (row.get("trust", ""),
                                                           row.get("note", "")))
-        out.append("| %s | %s | %s | %s | %s |\n" % (
+        out.append("| %s | %s | %s | %s | %s | %s |\n" % (
             row["name"], row.get("domain", ""), row.get("owner", ""),
-            saved_trust, saved_note))
+            row.get("cluster", ""), saved_trust, saved_note))
     return "".join(out)

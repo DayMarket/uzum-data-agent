@@ -9,17 +9,17 @@ import build_context
 def test_renders_markdown_table():
     out = build_context.render_marts([
         {"name": "golden.efficiency_mart", "domain": "OPH", "owner": "Ops",
-         "trust": "доверяем", "note": ""},
+         "cluster": "WMS", "trust": "доверяем", "note": ""},
     ])
-    assert "| golden.efficiency_mart | OPH | Ops | доверяем |  |" in out
+    assert "| golden.efficiency_mart | OPH | Ops | WMS | доверяем |  |" in out
     assert out.startswith("# Реестр витрин")
 
 
 def test_preserves_trust_from_existing_file(tmp_path):
     existing = tmp_path / "marts.md"
     existing.write_text(
-        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Доверие | Комментарий |\n"
-        "|---|---|---|---|---|\n| a.b | X | Y | с оговоркой | дубли |\n",
+        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Кластер | Доверие | Комментарий |\n"
+        "|---|---|---|---|---|---|\n| a.b | X | Y | WMS | с оговоркой | дубли |\n",
         encoding="utf-8",
     )
     trust = build_context.read_trust(str(existing))
@@ -34,9 +34,9 @@ def test_preserves_pipe_in_comment(tmp_path):
     """Вертикальная черта внутри комментария не должна быть разделителем."""
     existing = tmp_path / "marts.md"
     existing.write_text(
-        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Доверие | Комментарий |\n"
-        "|---|---|---|---|---|\n"
-        "| a.b | X | Y | доверяем | есть дубли \\| дубль-2 |\n",
+        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Кластер | Доверие | Комментарий |\n"
+        "|---|---|---|---|---|---|\n"
+        "| a.b | X | Y | WMS | доверяем | есть дубли \\| дубль-2 |\n",
         encoding="utf-8",
     )
     trust = build_context.read_trust(str(existing))
@@ -46,12 +46,12 @@ def test_preserves_pipe_in_comment(tmp_path):
 
 
 def test_handles_extra_columns_in_comment(tmp_path, capsys):
-    """Больше 5 колонок — лишние склеиваются в комментарий."""
+    """Больше 6 колонок — лишние склеиваются в комментарий."""
     existing = tmp_path / "marts.md"
     existing.write_text(
-        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Доверие | Комментарий |\n"
-        "|---|---|---|---|---|\n"
-        "| a.b | X | Y | доверяем | часть1 | часть2 | часть3 |\n",
+        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Кластер | Доверие | Комментарий |\n"
+        "|---|---|---|---|---|---|\n"
+        "| a.b | X | Y | WMS | доверяем | часть1 | часть2 | часть3 |\n",
         encoding="utf-8",
     )
     trust = build_context.read_trust(str(existing))
@@ -63,8 +63,8 @@ def test_warns_about_malformed_rows(tmp_path, capsys):
     """Строка с недостаточным числом колонок должна вызвать предупреждение."""
     existing = tmp_path / "marts.md"
     existing.write_text(
-        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Доверие | Комментарий |\n"
-        "|---|---|---|---|---|\n"
+        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Кластер | Доверие | Комментарий |\n"
+        "|---|---|---|---|---|---|\n"
         "| a.b | X | Y |\n",
         encoding="utf-8",
     )
@@ -81,9 +81,9 @@ def test_skips_headers_of_other_registries(tmp_path):
     """Заголовки других реестров (Метрика, Дашборд) не попадают в данные."""
     existing = tmp_path / "marts.md"
     existing.write_text(
-        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Доверие | Комментарий |\n"
-        "|---|---|---|---|---|\n"
-        "| a.b | X | Y | доверяем | ok |\n"
+        "# Реестр витрин\n\n| Витрина | Домен | Владелец | Кластер | Доверие | Комментарий |\n"
+        "|---|---|---|---|---|---|\n"
+        "| a.b | X | Y | WMS | доверяем | ok |\n"
         "\n# Реестр метрик\n\n| Метрика | Домен | Владелец | Доверие | Комментарий |\n"
         "|---|---|---|---|---|\n"
         "| Метрика | X | Y | поверим | это не витрина |\n",
@@ -142,12 +142,17 @@ FORBIDDEN_DASHBOARDS_SUBSTR = "Market Зарплатный дашборд"
 def test_trust_column_is_left_for_humans():
     """Колонка «доверие» — человеческое суждение: генератор её не выдумывает.
     Заполнены только те строки, что вели руками до этого, плюс отдельно
-    учтённые зарплатные витрины/дашборд (см. FORBIDDEN_MARK)."""
+    учтённые зарплатные витрины/дашборд (см. FORBIDDEN_MARK).
+
+    marts.md: Витрина, Дашбордов, Кто строит, Кластер, Доверие, Комментарий —
+    «доверие» это r[4] (в dashboards.md колонки «Кластер» нет, там «доверие»
+    остаётся r[3], см. ниже).
+    """
     rows = _data_rows(CONTEXT / "marts.md")
-    filled = [r for r in rows if len(r) > 3 and r[3]]
-    non_forbidden_filled = [r for r in filled if r[3] != FORBIDDEN_MARK]
+    filled = [r for r in rows if len(r) > 4 and r[4]]
+    non_forbidden_filled = [r for r in filled if r[4] != FORBIDDEN_MARK]
     assert len(non_forbidden_filled) <= 2, [r[0] for r in non_forbidden_filled]
-    forbidden_filled = [r for r in filled if r[3] == FORBIDDEN_MARK]
+    forbidden_filled = [r for r in filled if r[4] == FORBIDDEN_MARK]
     assert {r[0] for r in forbidden_filled} == FORBIDDEN_MARTS
 
     dash_rows = _data_rows(CONTEXT / "dashboards.md")
