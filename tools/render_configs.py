@@ -22,12 +22,26 @@ Codex (.codex/config.toml) — TOML, `[mcp_servers.<id>]`. Подстановк�
 (StaticEnv) идут в `env`-таблицу текстом — им неоткуда утечь, потому что в
 реестре у них и так нет ничего, кроме этого текста.
 
+Путь к локальным скриптам (ProjectScript) пишется ОДИНАКОВО в обоих форматах
+— относительным. У Claude Code это всегда было так через макрос
+`${CLAUDE_PROJECT_DIR:-.}/<path>`. Для Codex раньше эта функция считала путь
+абсолютным по аналогии с фактом про ${VAR} — предположение, не проверенное
+запуском, и оно оказалось неверным: относительный путь в `args` разрешается
+относительно рабочего каталога, из которого запущен сам `codex`, и это
+проверено живым MCP-рукопожатием (см. отчёт задачи Codex-3). Раз оба формата
+теперь используют относительный путь без каких-либо машинно-зависимых
+данных, `.codex/config.toml` больше не привязан к конкретному диску — можно
+класть в git и сверять с тем, что лежит на диске, тем же способом, что и
+.mcp.json.
+
 TOML пишем сами: в проекте разрешена только стандартная библиотека для слоя,
 который выполняется до установки зависимостей (см. бриф задачи) — внешний
 пакет вроде tomli_w сюда не тянем. Формат данных, которые тут встречаются
 (command — строка, args — список строк, env — таблица строка→строка,
 env_vars — список строк), простой: полный TOML-парсер не нужен, нужен только
-корректный писатель для этого подмножества.
+корректный писатель для этого подмножества — включая экранирование
+управляющих символов (перевод строки и т.п.) в TOML basic string, без этого
+случайное значение с `\n` внутри дало бы файл, который Codex не распарсит.
 """
 from __future__ import annotations
 
@@ -54,7 +68,7 @@ def _mcp_json_env_value(item: EnvVar) -> str:
     return "${%s}" % item.source
 
 
-def _mcp_json_arg(item, repo_root: Path = None) -> str:  # noqa: ARG001 - repo_root не нужен здесь, симметрии ради
+def _mcp_json_arg(item) -> str:
     if isinstance(item, ProjectScript):
         return "${CLAUDE_PROJECT_DIR:-.}/%s" % item.path
     return item
@@ -82,48 +96,69 @@ def render_mcp_json(connectors: Iterable[Connector]) -> str:
 
 # ── Codex: .codex/config.toml ───────────────────────────────────────────────
 
+# TOML basic-string escapes для управляющих символов (TOML spec, "Basic
+# Strings"). Символы, для которых спецификация не даёт короткого escape
+# (\b \t \n \f \r \" \\), кодируются \u00XX. У нас таких значений в реестре
+# сегодня нет, но писатель обязан не производить битый файл, если появятся.
+_TOML_SHORT_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _toml_string(value: str) -> str:
-    """TOML basic string — экранируем только то, что реально встречается в
-    наших данных (обратный слэш, двойная кавычка); значений с переводом
-    строки или управляющими символами в реестре нет."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return '"%s"' % escaped
+    out = []
+    for ch in value:
+        if ch in _TOML_SHORT_ESCAPES:
+            out.append(_TOML_SHORT_ESCAPES[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return '"%s"' % "".join(out)
 
 
 def _toml_array(values: Iterable[str]) -> str:
     return "[%s]" % ", ".join(_toml_string(v) for v in values)
 
 
-def _codex_arg(item, repo_root: Path) -> str:
+def _codex_arg(item) -> str:
     if isinstance(item, ProjectScript):
-        # ${VAR}/макросы Claude Code у Codex не подставляются — путь должен
-        # быть абсолютным уже на момент генерации.
-        return str(repo_root / item.path)
+        return item.path
     return item
 
 
-def render_codex_toml(connectors: Iterable[Connector], repo_root: Path) -> str:
-    """Собрать .codex/config.toml (формат Codex) из реестра коннекторов.
+def _codex_spec(connector: Connector):
+    """(command, args, env) для рендера Codex — своя ветка (`connector.codex`),
+    если она задана (сейчас только у clickhouse-wms/clickhouse-dwh, см.
+    докстринг registry.py, "РЕШЁННАЯ НАХОДКА"), иначе общая с Claude Code."""
+    if connector.codex is not None:
+        return connector.codex.command, connector.codex.args, connector.codex.env
+    return connector.command, connector.args, connector.env
 
-    repo_root нужен, чтобы посчитать абсолютный путь для ProjectScript-
-    аргументов локальных коннекторов (trino/superset/sheets) — у Codex нет
-    аналога `${CLAUDE_PROJECT_DIR:-.}`.
-    """
-    repo_root = Path(repo_root)
+
+def render_codex_toml(connectors: Iterable[Connector]) -> str:
+    """Собрать .codex/config.toml (формат Codex) из реестра коннекторов."""
     blocks = []
     for connector in connectors:
-        args = [_codex_arg(a, repo_root) for a in connector.args]
+        command, raw_args, env_items = _codex_spec(connector)
+        args = [_codex_arg(a) for a in raw_args]
         lines = [
             "[mcp_servers.%s]" % connector.id,
-            "command = %s" % _toml_string(connector.command),
+            "command = %s" % _toml_string(command),
             "args = %s" % _toml_array(args),
         ]
 
-        env_vars = [item.target for item in connector.env if isinstance(item, EnvVar)]
+        env_vars = [item.target for item in env_items if isinstance(item, EnvVar)]
         if env_vars:
             lines.append("env_vars = %s" % _toml_array(env_vars))
 
-        static_env = [item for item in connector.env if isinstance(item, StaticEnv)]
+        static_env = [item for item in env_items if isinstance(item, StaticEnv)]
         if static_env:
             lines.append("")
             lines.append("[mcp_servers.%s.env]" % connector.id)
@@ -164,7 +199,7 @@ def main(argv=None) -> int:
     codex_toml_path = repo_root / ".codex" / "config.toml"
 
     mcp_json = render_mcp_json(CONNECTORS)
-    codex_toml = render_codex_toml(CONNECTORS, repo_root=repo_root)
+    codex_toml = render_codex_toml(CONNECTORS)
 
     if args.check:
         stale = []

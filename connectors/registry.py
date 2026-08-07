@@ -19,10 +19,18 @@ Codex ждёт их в `[mcp_servers.<id>]` внутри `.codex/config.toml` �
   ProjectScript — путь к локальному скрипту коннектора относительно корня
       репозитория (например "connectors/trino_proxy.py"). В .mcp.json это
       разворачивается макросом `${CLAUDE_PROJECT_DIR:-.}/<path>` — подстановку
-      делает сам Claude Code. У Codex такого макроса нет, а `${VAR}` в
-      config.toml не подставляется вообще (проверено запуском, см.
-      docs/codex-facts.md, раздел 4) — там путь обязан быть абсолютным,
-      посчитанным во время генерации, а не строкой-плейсхолдером.
+      делает сам Claude Code. У Codex такого макроса нет, но это и не нужно:
+      относительный путь в `args` разрешается относительно рабочего каталога,
+      из которого запущен сам `codex` (проверено живым MCP-рукопожатием при
+      ревью задачи Codex-3 — `uv run connectors/trino_proxy.py` в config.toml
+      с относительным путём вернул реальный список инструментов trino, когда
+      `codex exec` запущен из корня репозитория; предыдущая версия этого
+      модуля ошибочно считала, что раз ${VAR}-подстановка в config.toml не
+      работает (это факт про переменные окружения — docs/codex-facts.md,
+      раздел 4), то и путь в args обязан быть абсолютным — это была
+      непроверенная догадка по аналогии, а не факт, и она оказалась неверной).
+      Поэтому `render_codex_toml` тоже пишет путь как есть, относительным —
+      как и .mcp.json.
 
   StaticEnv — литеральная константа окружения: нет источника в .env, значение
       одинаковое всегда и везде (например MCP_TRANSPORT=stdio). Не секрет —
@@ -48,27 +56,41 @@ Codex ждёт их в `[mcp_servers.<id>]` внутри `.codex/config.toml` �
       даже если формально это всё ещё подстановка переменной (тот же класс
       регрессии, что ловит tests/test_mcp_config.py для .mcp.json).
 
-ВАЖНАЯ НЕДОКОНЦА (см. отчёт задачи Codex-3, раздел "находки"): у Codex нет
-способа переслать переменную окружения ребёнку под ДРУГИМ именем — механизм
-`env_vars` (проверено живым запуском, docs/codex-facts.md, раздел 4, плюс
-собственная проверка: `env_vars` в config.toml — только плоский список имён,
-TOML-таблица/маппинг для него не парсится, схема требует "sequence") умеет
-только "переменная X из окружения, что запустило codex, попадёт в дочерний
-процесс под тем же именем X". Это значит: там, где `target != source`
-(ClickHouse, Jira/Confluence, Grafana, OpenMetadata, GrowthBook, Sheets),
-`render_codex_toml` показывает `env_vars` по имени `target` (это то имя,
-которое реально нужно дочернему процессу) — но чтобы это заработало, ту же
-переменную нужно ЭКСПОРТИРОВАТЬ под именем `target` в окружение, из которого
-запускается `codex` (это забота мастера установки, не этого модуля). Для двух
-кластеров ClickHouse (`clickhouse-wms`, `clickhouse-dwh`) это в принципе не
-решается экспортом: обоим нужен один и тот же `target`-имя `CLICKHOUSE_HOST`
-(и т.д.) одновременно с разными значениями, а `codex` — один процесс с одним
-общим окружением на оба дочерних MCP-сервера. Без обёртки-скрипта (по образцу
-уже существующих connectors/trino_proxy.py, superset_mcp.py, sheets_mcp.py),
-которая переименовывает переменные перед запуском настоящего пакета,
-одновременная работа обоих кластеров ClickHouse под Codex не сходится. Это
-архитектурный дефект, найденный при переносе, а не что-то, что этот модуль
-предполагается чинить сам по себе.
+РЕШЁННАЯ НАХОДКА — два кластера ClickHouse под Codex (см. отчёт задачи
+Codex-3, раздел "находки"). У Codex нет способа переслать переменную
+окружения ребёнку под ДРУГИМ именем — механизм `env_vars` (проверено живым
+запуском, docs/codex-facts.md, раздел 4, плюс собственная проверка:
+`env_vars` в config.toml — только плоский список имён, TOML-таблица/маппинг
+для него не парсится, схема требует "sequence") умеет только "переменная X
+из окружения, что запустило codex, попадёт в дочерний процесс под тем же
+именем X". Пакет mcp-clickhouse при этом ждёт фиксированные имена
+(CLICKHOUSE_HOST и т.д.) — одинаковые что для WMS, что для DWH. Если оба
+коннектора попросят переслать одну и ту же CLICKHOUSE_HOST, оба получат одно
+и то же значение из общего окружения codex — второй кластер станет
+недоступен молча (132 витрины из реестра, которые живут только на DWH).
+
+Решение — поле `codex` у `Connector`: отдельный сценарий запуска
+специально для Codex, только у `clickhouse-wms`/`clickhouse-dwh` (у
+остальных семи `codex=None`, рендерятся из общего command/args/env, как и
+раньше). Вместо прямого `uvx --with pyarrow mcp-clickhouse` Codex запускает
+`connectors/clickhouse_proxy.py <wms|dwh>` — обёртку (тот же приём, что уже
+применяют trino_proxy.py/superset_mcp.py/sheets_mcp.py), которая читает
+CH_WMS_*/CH_DWH_* (эти имена уже не пересекаются — коллизии в `env_vars`
+нет) и раскладывает их в CLICKHOUSE_* ВНУТРИ своего процесса, до запуска
+настоящего пакета (os.execvpe) — то есть переименование происходит не в
+config.toml (где было бы негде, см. выше), а в отдельном процессе на
+каждый кластер.
+
+Claude Code эту обёртку не использует — его `codex=None` тут неприменим
+(поле относится только к Codex-ветке), а сам по себе Claude Code развязки
+не требует: .mcp.json подставляет ${CH_WMS_HOST} в значение ключа
+CLICKHOUSE_HOST ВНУТРИ env-словаря ОДНОГО процесса — clickhouse-wms и
+clickhouse-dwh это два независимых процесса с двумя независимыми
+env-словарями, делить им нечего, коллизии никогда не было. Решение
+осознанное, не молчаливая асимметрия: единообразие "оба движка всегда через
+обёртку" стоило бы лишнего процесса там, где Claude Code и так работает
+корректно (см. отчёт задачи, раздел про выбор между "обёртка для обоих" и
+"обёртка только для Codex").
 """
 from __future__ import annotations
 
@@ -110,12 +132,25 @@ ArgItem = Union[str, ProjectScript]
 
 
 @dataclass(frozen=True)
+class CodexLaunch:
+    """Альтернативный сценарий запуска — только для Codex, только когда
+    общий (Claude Code) сценарий не подходит из-за плоского `env_vars` (см.
+    докстринг модуля, раздел "РЕШЁННАЯ НАХОДКА"). У большинства коннекторов
+    этого поля нет вообще — `Connector.codex is None` значит "рендерить
+    Codex из тех же command/args/env, что и Claude Code"."""
+    command: str
+    args: Tuple[ArgItem, ...]
+    env: Tuple[EnvItem, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True)
 class Connector:
     """Одно описание MCP-коннектора — источник для обоих форматов."""
     id: str
     command: str
     args: Tuple[ArgItem, ...]
     env: Tuple[EnvItem, ...] = field(default_factory=tuple)
+    codex: "CodexLaunch" = None
 
     def env_vars(self) -> Tuple[EnvVar, ...]:
         return tuple(item for item in self.env if isinstance(item, EnvVar))
@@ -156,6 +191,21 @@ CONNECTORS: Tuple[Connector, ...] = (
             StaticEnv("CLICKHOUSE_VERIFY", "false"),
             StaticEnv("CHDB_ENABLED", "false"),
         ),
+        # Codex: через обёртку — см. докстринг модуля, "РЕШЁННАЯ НАХОДКА".
+        # target == source везде: обёртка сама переименовывает в CLICKHOUSE_*
+        # уже внутри своего процесса, Codex-у достаточно переслать CH_WMS_*
+        # как есть (тут коллизии с DWH нет — имена разные).
+        codex=CodexLaunch(
+            command="uv",
+            args=("run", ProjectScript("connectors/clickhouse_proxy.py"), "wms"),
+            env=(
+                EnvVar(target="CH_WMS_HOST", source="CH_WMS_HOST", secret=False),
+                EnvVar(target="CH_WMS_PORT", source="CH_WMS_PORT", secret=False, default="8123"),
+                EnvVar(target="CH_WMS_USER", source="CH_WMS_USER", secret=True),
+                EnvVar(target="CH_WMS_PASSWORD", source="CH_WMS_PASSWORD", secret=True),
+                EnvVar(target="CH_WMS_SECURE", source="CH_WMS_SECURE", secret=False, default="false"),
+            ),
+        ),
     ),
     Connector(
         id="clickhouse-dwh",
@@ -170,6 +220,17 @@ CONNECTORS: Tuple[Connector, ...] = (
             EnvVar(target="CLICKHOUSE_SECURE", source="CH_DWH_SECURE", secret=False, default="false"),
             StaticEnv("CLICKHOUSE_VERIFY", "false"),
             StaticEnv("CHDB_ENABLED", "false"),
+        ),
+        codex=CodexLaunch(
+            command="uv",
+            args=("run", ProjectScript("connectors/clickhouse_proxy.py"), "dwh"),
+            env=(
+                EnvVar(target="CH_DWH_HOST", source="CH_DWH_HOST", secret=False),
+                EnvVar(target="CH_DWH_PORT", source="CH_DWH_PORT", secret=False, default="8123"),
+                EnvVar(target="CH_DWH_USER", source="CH_DWH_USER", secret=True),
+                EnvVar(target="CH_DWH_PASSWORD", source="CH_DWH_PASSWORD", secret=True),
+                EnvVar(target="CH_DWH_SECURE", source="CH_DWH_SECURE", secret=False, default="false"),
+            ),
         ),
     ),
     Connector(

@@ -1,0 +1,44 @@
+[mcp_servers.atlassian]
+command = "uvx"
+args = ["mcp-atlassian"]
+env_vars = ["JIRA_URL", "JIRA_PERSONAL_TOKEN", "CONFLUENCE_URL", "CONFLUENCE_PERSONAL_TOKEN"]
+
+[mcp_servers.clickhouse-wms]
+command = "uv"
+args = ["run", "connectors/clickhouse_proxy.py", "wms"]
+env_vars = ["CH_WMS_HOST", "CH_WMS_PORT", "CH_WMS_USER", "CH_WMS_PASSWORD", "CH_WMS_SECURE"]
+
+[mcp_servers.clickhouse-dwh]
+command = "uv"
+args = ["run", "connectors/clickhouse_proxy.py", "dwh"]
+env_vars = ["CH_DWH_HOST", "CH_DWH_PORT", "CH_DWH_USER", "CH_DWH_PASSWORD", "CH_DWH_SECURE"]
+
+[mcp_servers.trino]
+command = "uv"
+args = ["run", "connectors/trino_proxy.py"]
+env_vars = ["TRINO_HOST", "TRINO_CATALOG"]
+
+[mcp_servers.superset]
+command = "uv"
+args = ["run", "connectors/superset_mcp.py"]
+env_vars = ["SUPERSET_URL"]
+
+[mcp_servers.grafana]
+command = "uvx"
+args = ["mcp-grafana"]
+env_vars = ["GRAFANA_URL", "GRAFANA_SERVICE_ACCOUNT_TOKEN"]
+
+[mcp_servers.openmetadata]
+command = "uvx"
+args = ["--with", "fastmcp<2.4", "--with", "pydantic<2.9", "--from", "mcp-openmetadata", "python", "-m", "mcp_openmetadata.server"]
+env_vars = ["OPENMETADATA_URI", "OPENMETADATA_JWT_TOKEN"]
+
+[mcp_servers.growthbook]
+command = "npx"
+args = ["-y", "@growthbook/mcp"]
+env_vars = ["GB_API_KEY"]
+
+[mcp_servers.sheets]
+command = "uv"
+args = ["run", "connectors/sheets_mcp.py"]
+env_vars = ["GOOGLE_SERVICE_ACCOUNT_FILE", "GOOGLE_SHEETS_FOLDER_ID"]
