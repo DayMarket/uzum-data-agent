@@ -309,6 +309,11 @@ def test_deploy_codex_profile_backs_up_foreign_file_with_the_same_profile_name(t
 # так и оказалось на машине автора задачи (сторонний notify-хук). Слепая
 # перезапись стёрла бы чужие хуки.
 
+def _codex_hook_commands(defs):
+    return [hook["command"] for groups in defs.values()
+            for group in groups for hook in group["hooks"]]
+
+
 def test_codex_hook_definitions_cover_the_engine_portable_events():
     """SessionStart/SessionEnd/UserPromptSubmit/PostToolUse — те же
     события, что уже пишет Claude Code, и НЕТ PostToolUseFailure: у Codex
@@ -316,10 +321,36 @@ def test_codex_hook_definitions_cover_the_engine_portable_events():
     PostToolUse там срабатывает и на успехе, и на сбое."""
     defs = setup_helpers.codex_hook_definitions()
     assert set(defs) == {"SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse"}
-    for group in defs.values():
-        command = group["hooks"][0]["command"]
-        assert command.startswith("python3 .claude/hooks/")
-        assert not command.startswith("python3 /")  # путь относительный, не абсолютный
+    for command in _codex_hook_commands(defs):
+        # Путь до скрипта относительный, не абсолютный: hooks.json общий на
+        # весь $CODEX_HOME, и в чужих проектах наш хук просто не найдётся.
+        assert ".claude/hooks/" in command
+        assert " /" not in command
+
+
+def test_codex_session_start_updates_the_repository_too_not_only_telemetry():
+    """Находка ревью (Important): раньше сессия Codex не делала `git pull`
+    вообще — on_session_start.sh регистрировался только для Claude Code, а
+    замены не было. Аналитик в Codex работал бы на скиллах из дня
+    установки и никак бы об этом не узнал. Проверяем возможность, а не имя
+    файла: среди команд SessionStart должна быть та, что запускает
+    обновление репозитория, и именно в режиме обычного текста (--plain) —
+    Claude-формат hookSpecificOutput для Codex не проверен."""
+    groups = setup_helpers.codex_hook_definitions()["SessionStart"]
+    commands = [hook["command"] for group in groups for hook in group["hooks"]]
+    updater = [c for c in commands if "on_session_start.sh" in c]
+    assert updater, commands
+    assert all("--plain" in c for c in updater), updater
+
+
+def test_codex_hook_definitions_keep_one_script_per_entry():
+    """Идемпотентность merge_codex_hooks держится на сравнении записей по
+    значению. Если сложить два скрипта в одну запись, то добавление третьего
+    в будущем изменит значение целиком — старая запись перестанет совпадать
+    и телеметрия начнёт писаться дважды из одной сессии."""
+    for groups in setup_helpers.codex_hook_definitions().values():
+        for group in groups:
+            assert len(group["hooks"]) == 1, group
 
 
 def test_merge_codex_hooks_preserves_foreign_hooks_untouched():
@@ -344,11 +375,22 @@ def test_merge_codex_hooks_preserves_foreign_hooks_untouched():
 
 
 def test_merge_codex_hooks_is_idempotent_no_duplicate_entries():
-    once = setup_helpers.merge_codex_hooks({}, setup_helpers.codex_hook_definitions())
-    twice = setup_helpers.merge_codex_hooks(once, setup_helpers.codex_hook_definitions())
+    defs = setup_helpers.codex_hook_definitions()
+    once = setup_helpers.merge_codex_hooks({}, defs)
+    twice = setup_helpers.merge_codex_hooks(once, defs)
     assert twice == once
-    for event_hooks in twice["hooks"].values():
-        assert len(event_hooks) == 1
+    for event, event_hooks in twice["hooks"].items():
+        assert len(event_hooks) == len(defs[event]), event
+
+
+def test_merge_codex_hooks_adds_only_the_new_entry_to_an_older_installation():
+    """Повторный ./setup.sh на машине, где hooks.json остался от прошлой
+    версии (без хука обновления репозитория), обязан ДОБАВИТЬ недостающую
+    запись, а не удвоить уже лежащую там телеметрию."""
+    defs = setup_helpers.codex_hook_definitions()
+    older = {"hooks": {"SessionStart": [defs["SessionStart"][0]]}}
+    merged = setup_helpers.merge_codex_hooks(older, defs)
+    assert merged["hooks"]["SessionStart"] == defs["SessionStart"]
 
 
 def test_deploy_codex_hooks_merges_with_file_already_on_disk(tmp_path):

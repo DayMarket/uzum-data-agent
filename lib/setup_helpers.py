@@ -322,10 +322,24 @@ def codex_hook_definitions():
     пишет Claude Code (.claude/hooks/log_event.py, .claude/hooks/
     log_session.py): lib/hook_payload.py и lib/transcript_codex.py уже
     умеют оба движка (задача Codex-4), отдельного кода для Codex не нужно.
-    on_session_start.sh сюда сознательно не включён — он возвращает
-    Claude-Code-специфичный формат (`hookSpecificOutput.additionalContext`),
-    совместимость которого с Codex не проверена запуском; тянуть
-    непроверенное в основной, всегда исполняемый путь не стоит.
+
+    on_session_start.sh (обновление репозитория на старте сессии) раньше сюда
+    не включался: он возвращал Claude-специфичный `hookSpecificOutput`, а его
+    совместимость с Codex никто не проверял запуском. Из-за этого сессия
+    Codex не делала `git pull` вообще — аналитик месяцами работал бы на
+    скиллах из дня установки и не узнал бы об этом. Проверено живым запуском
+    (docs/codex-facts.md, раздел 9): у Codex есть событие `SessionStart`, наш
+    хук на нём реально выполняется, `git pull --ff-only` реально
+    подтягивает коммит, а обычный текст из stdout хука долетает до модели
+    дословно. Поэтому скрипт зарегистрирован и здесь — с флагом `--plain`,
+    который переключает вывод с Claude-формата на обычный текст.
+
+    Значение на событие — СПИСОК записей, а не одна: у SessionStart их две
+    (телеметрия и обновление репозитория), и по одному скрипту на запись, а
+    не обе команды внутри одной. Так merge_codex_hooks остаётся
+    идемпотентным при добавлении нового скрипта в будущем: сравнение идёт по
+    значению записи, и уже лежащие на диске записи продолжают совпадать
+    вместо того, чтобы удвоиться.
 
     Команда — ОТНОСИТЕЛЬНЫЙ путь, не абсолютный, и это осознанный выбор, не
     недосмотр: hooks.json у Codex — файл на весь $CODEX_HOME, общий для
@@ -342,29 +356,37 @@ def codex_hook_definitions():
     ДРУГИХ проектах файла по этому относительному пути просто не будет —
     хук тихо не сработает, и это и есть желаемое поведение (не наша
     сессия, не наша телеметрия)."""
-    def entry(script):
-        return {"hooks": [{"type": "command", "command": "python3 .claude/hooks/%s" % script}]}
+    def entry(command):
+        return {"hooks": [{"type": "command", "command": command}]}
+
+    def telemetry(script):
+        return entry("python3 .claude/hooks/%s" % script)
 
     return {
-        "SessionStart": entry("log_session.py"),
-        "SessionEnd": entry("log_session.py"),
-        "UserPromptSubmit": entry("log_event.py"),
-        "PostToolUse": entry("log_event.py"),
+        "SessionStart": [
+            telemetry("log_session.py"),
+            entry("bash .claude/hooks/on_session_start.sh --plain"),
+        ],
+        "SessionEnd": [telemetry("log_session.py")],
+        "UserPromptSubmit": [telemetry("log_event.py")],
+        "PostToolUse": [telemetry("log_event.py")],
     }
 
 
 def merge_codex_hooks(existing, new_entries):
     """Слить наши записи в уже существующую структуру hooks.json, не теряя
     чужие. `existing` — распарсенный JSON (dict) текущего hooks.json, или
-    {}/None, если файла ещё не было. Идемпотентно: повторный вызов с той
-    же записью не создаёт дубликат (сравнение по значению), поэтому
+    {}/None, если файла ещё не было. `new_entries` — событие → список наших
+    записей (см. codex_hook_definitions). Идемпотентно: повторный вызов с
+    той же записью не создаёт дубликат (сравнение по значению), поэтому
     повторный ./setup.sh не плодит копии хука при каждом перезапуске."""
     merged = dict(existing) if existing else {}
     hooks = dict(merged.get("hooks") or {})
-    for event, group in new_entries.items():
+    for event, groups in new_entries.items():
         existing_groups = list(hooks.get(event) or [])
-        if group not in existing_groups:
-            existing_groups.append(group)
+        for group in groups:
+            if group not in existing_groups:
+                existing_groups.append(group)
         hooks[event] = existing_groups
     merged["hooks"] = hooks
     return merged

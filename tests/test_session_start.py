@@ -6,9 +6,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOK = REPO_ROOT / ".claude" / "hooks" / "on_session_start.sh"
 
 
-def _run(cwd):
+def _run(cwd, *args):
     return subprocess.run(
-        ["bash", str(HOOK)],
+        ["bash", str(HOOK), *args],
         input='{"hook_event_name":"SessionStart","session_id":"s"}',
         capture_output=True, text=True, cwd=str(cwd), timeout=30,
     )
@@ -34,6 +34,45 @@ def test_outputs_valid_json_with_additional_context(tmp_path):
     payload = json.loads(result.stdout)
     assert "hookSpecificOutput" in payload
     assert payload["hookSpecificOutput"]["hookEventName"] == "SessionStart"
+
+
+def test_plain_mode_prints_text_not_claude_json(tmp_path):
+    """Режим для Codex: тот же скрипт, тот же git pull, но вывод — обычный
+    текст. hookSpecificOutput у Codex не описан и живым запуском не
+    подтверждён; обычный текст — подтверждён (docs/codex-facts.md, раздел 9:
+    Codex отдал его модели дословно)."""
+    result = _run(tmp_path, "--plain")
+    assert result.returncode == 0
+    assert result.stdout.strip()
+    assert "hookSpecificOutput" not in result.stdout
+    assert not result.stdout.lstrip().startswith("{")
+
+
+def test_plain_mode_pulls_the_repository_the_same_way(tmp_path):
+    """Главное, ради чего хук вообще нужен: обновление не должно зависеть от
+    формата вывода. Клон отстаёт от апстрима на один коммит — после хука
+    должен догнать."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    git = ["git", "-c", "user.email=t@t", "-c", "user.name=t"]
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=upstream, check=True)
+    (upstream / "f.txt").write_text("one")
+    subprocess.run([*git, "add", "."], cwd=upstream, check=True)
+    subprocess.run([*git, "commit", "-qm", "one"], cwd=upstream, check=True)
+
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", str(upstream), str(clone)], check=True)
+    before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=clone,
+                            capture_output=True, text=True).stdout.strip()
+
+    (upstream / "f.txt").write_text("two")
+    subprocess.run([*git, "commit", "-qam", "two"], cwd=upstream, check=True)
+
+    assert _run(clone, "--plain").returncode == 0
+    after = subprocess.run(["git", "rev-parse", "HEAD"], cwd=clone,
+                           capture_output=True, text=True).stdout.strip()
+    assert after != before, "хук не подтянул коммит из апстрима"
+    assert (clone / "f.txt").read_text() == "two"
 
 
 def test_settings_registers_all_hooks():
