@@ -1,9 +1,11 @@
 """Заполнение доступов файлом `.env` вместо ответов на вопросы мастера.
 
 Разбор файла — тот же envfile.py, что и для secrets.env (см. test_envfile.py):
-второго парсера здесь нет, `read_dotenv` только проверяет права и зовёт
-`envfile.read`. Эти тесты — про то, что специфично для .env-файла: права 600
-на входе и приоритет "значение из файла важнее вопроса".
+второго парсера здесь нет, `read_dotenv` только проверяет права, зовёт
+`envfile.parse` и попутно `envfile.lint` по тому же тексту. Эти тесты — про
+то, что специфично для .env-файла: права 600 на входе, приоритет "значение
+из файла важнее вопроса" и предупреждение о непарной кавычке/апострофе
+(отдельные, более подробные случаи lint — в test_envfile.py).
 """
 import os
 import stat
@@ -40,9 +42,10 @@ def test_reads_plain_dotenv_values(tmp_path):
     path = tmp_path / ".env"
     path.write_text("CH_USER=denis-platon\nCH_PASSWORD=p@ss w0rd\n", encoding="utf-8")
     os.chmod(path, 0o600)
-    values, tightened = setup_helpers.read_dotenv(str(path))
+    values, tightened, warnings = setup_helpers.read_dotenv(str(path))
     assert values == {"CH_USER": "denis-platon", "CH_PASSWORD": "p@ss w0rd"}
     assert tightened is False
+    assert warnings == []
 
 
 def test_nasty_values_survive_the_round_trip(tmp_path):
@@ -51,15 +54,16 @@ def test_nasty_values_survive_the_round_trip(tmp_path):
     path = tmp_path / ".env"
     path.write_text("".join(NASTY_LINES[k] for k in NASTY), encoding="utf-8")
     os.chmod(path, 0o600)
-    values, _ = setup_helpers.read_dotenv(str(path))
+    values, _, warnings = setup_helpers.read_dotenv(str(path))
     assert values == NASTY
+    assert warnings == []
 
 
 def test_blank_and_missing_values_are_not_returned_as_present(tmp_path):
     path = tmp_path / ".env"
     path.write_text("CH_USER=denis\nCH_PASSWORD=\n", encoding="utf-8")
     os.chmod(path, 0o600)
-    values, _ = setup_helpers.read_dotenv(str(path))
+    values, _, _ = setup_helpers.read_dotenv(str(path))
     # Пустое значение по разбору присутствует, но для приоритета это
     # "не заполнено" — эту границу проверяет missing_keys ниже.
     assert values.get("CH_USER") == "denis"
@@ -67,16 +71,17 @@ def test_blank_and_missing_values_are_not_returned_as_present(tmp_path):
 
 
 def test_missing_file_returns_empty_without_error(tmp_path):
-    values, tightened = setup_helpers.read_dotenv(str(tmp_path / "nope.env"))
+    values, tightened, warnings = setup_helpers.read_dotenv(str(tmp_path / "nope.env"))
     assert values == {}
     assert tightened is False
+    assert warnings == []
 
 
 def test_loose_permissions_are_tightened_to_600(tmp_path):
     path = tmp_path / ".env"
     path.write_text("CH_USER=denis\n", encoding="utf-8")
     os.chmod(path, 0o644)
-    values, tightened = setup_helpers.read_dotenv(str(path))
+    values, tightened, _ = setup_helpers.read_dotenv(str(path))
     assert values == {"CH_USER": "denis"}
     assert tightened is True
     assert oct(path.stat().st_mode)[-3:] == "600"
@@ -86,7 +91,7 @@ def test_permissions_already_600_are_left_alone_and_not_reported(tmp_path):
     path = tmp_path / ".env"
     path.write_text("CH_USER=denis\n", encoding="utf-8")
     os.chmod(path, 0o600)
-    _, tightened = setup_helpers.read_dotenv(str(path))
+    _, tightened, _ = setup_helpers.read_dotenv(str(path))
     assert tightened is False
 
 
@@ -96,9 +101,35 @@ def test_group_readable_file_is_also_tightened(tmp_path):
     path = tmp_path / ".env"
     path.write_text("CH_USER=denis\n", encoding="utf-8")
     os.chmod(path, 0o640)
-    _, tightened = setup_helpers.read_dotenv(str(path))
+    _, tightened, _ = setup_helpers.read_dotenv(str(path))
     assert tightened is True
     assert oct(path.stat().st_mode)[-3:] == "600"
+
+
+# ── непарная кавычка/апостроф: read_dotenv отдаёт предупреждения lint,
+# но значение не подменяет (решать человеку) ────────────────────────────
+
+
+def test_unpaired_apostrophe_is_reported_but_value_is_not_discarded(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text("JIRA_TOKEN=it's-my-token\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    values, _, warnings = setup_helpers.read_dotenv(str(path))
+    assert warnings == [(1, "JIRA_TOKEN")]
+    # read_dotenv ничего не подменяет и не отбрасывает — отдаёт то, что
+    # реально разобралось. А разобралось не то, что человек имел в виду:
+    # апостроф открыл кавычку и съел сам себя — ровно та подмена, которую
+    # ловит предупреждение выше, а не "невидимая, но безобидная деталь".
+    assert values.get("JIRA_TOKEN") == "its-my-token\n"
+
+
+def test_properly_quoted_apostrophe_gives_no_warning(tmp_path):
+    path = tmp_path / ".env"
+    path.write_text("JIRA_TOKEN=\"it's-my-token\"\n", encoding="utf-8")
+    os.chmod(path, 0o600)
+    values, _, warnings = setup_helpers.read_dotenv(str(path))
+    assert warnings == []
+    assert values.get("JIRA_TOKEN") == "it's-my-token"
 
 
 # ── приоритет: значение из файла важнее вопроса ─────────────────────────

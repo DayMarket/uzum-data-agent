@@ -115,3 +115,50 @@ def test_rewrite_upgrades_old_file_to_quoted_format(tmp_path):
 
 def test_missing_file_is_not_an_error():
     assert envfile.read("/nope/secrets.env") == {}
+
+
+# ── lint: непарная кавычка/апостроф вне кавычек (задача 14, ревью) ──────
+#
+# Файл, который пишет код (write_env → quote()), так не ломается — открытая
+# кавычка там всегда закрыта. Файл, который правит человек (.env), ломается
+# этим регулярно: апостроф в пароле/токене без кавычек вокруг открывает
+# режим одинарной кавычки и не закрывается сам на переводе строки —
+# значение вбирает в себя всё дальше. lint() не меняет разбор, только
+# предупреждает — с номером строки и именем ключа.
+
+
+def test_lint_flags_unclosed_apostrophe_at_end_of_file():
+    assert envfile.lint("JIRA_TOKEN=it's\n") == [(1, "JIRA_TOKEN")]
+
+
+def test_lint_flags_unclosed_apostrophe_that_swallows_the_next_key():
+    text = "A=it's\nB=2\n"
+    assert envfile.lint(text) == [(1, "A")]
+    # То, что она реально проглотила — не наша забота здесь, но подтверждает
+    # диагноз: B как отдельный ключ не появляется вовсе.
+    assert envfile.parse(text) == {"A": "its\nB=2\n"}
+
+
+def test_lint_does_not_flag_a_quote_that_closes_on_the_same_line():
+    assert envfile.lint("TOKEN=\"it's fine\"\n") == []
+
+
+def test_lint_does_not_flag_plain_values_without_quotes():
+    assert envfile.lint("CH_USER=denis-platon\nCH_PASSWORD=p@ss w0rd\n") == []
+
+
+def test_lint_ignores_comments_and_blank_lines():
+    assert envfile.lint("# it's a comment\n\nCH_USER=denis\n") == []
+
+
+def test_lint_reports_correct_line_number_for_the_second_key():
+    text = "CH_USER=denis\nJIRA_TOKEN=it's\n"
+    assert envfile.lint(text) == [(2, "JIRA_TOKEN")]
+
+
+def test_lint_finds_multiple_unpaired_values():
+    # У B тоже есть апостроф — он закрывает открытую A кавычку (и потому не
+    # получает собственного предупреждения, B целиком вобрался в значение
+    # A), а C — уже независимый, последний в файле, ничем не закрытый.
+    text = "A=it's\nB=ok'\nC=don't\n"
+    assert envfile.lint(text) == [(1, "A"), (3, "C")]

@@ -160,15 +160,21 @@ find_env_file() {
 # угодно, включая бэктики — их нельзя отдавать шеллу на интерпретацию,
 # значение должно остаться литеральным текстом.
 load_env_file() {
-  local path="$1" tightened_marker
+  local path="$1" tightened_marker warnings_marker line key
   tightened_marker="$(mk_tmp)"
-  UZUM_DOTENV_PATH="$path" UZUM_TIGHTENED_MARKER="$tightened_marker" python3 -c "
+  warnings_marker="$(mk_tmp)"
+  UZUM_DOTENV_PATH="$path" UZUM_TIGHTENED_MARKER="$tightened_marker" \
+  UZUM_WARNINGS_MARKER="$warnings_marker" python3 -c "
 import os, sys
 sys.path.insert(0, '$REPO_DIR/lib')
 import envfile, setup_helpers
-values, tightened = setup_helpers.read_dotenv(os.environ['UZUM_DOTENV_PATH'])
+values, tightened, warnings = setup_helpers.read_dotenv(os.environ['UZUM_DOTENV_PATH'])
 if tightened:
     open(os.environ['UZUM_TIGHTENED_MARKER'], 'w').write('1')
+if warnings:
+    with open(os.environ['UZUM_WARNINGS_MARKER'], 'w', encoding='utf-8') as wf:
+        for line_no, key in warnings:
+            wf.write('%d\t%s\n' % (line_no, key))
 for k, v in values.items():
     sys.stdout.write(envfile.format_line(k, v))
 "
@@ -178,6 +184,16 @@ for k, v in values.items():
   # not found" при source).
   if [ -s "$tightened_marker" ]; then
     fail "права на $path были шире 600 — исправил" >&2
+  fi
+  # Непарный апостроф/кавычка вне кавычек (envfile.lint, вызывается внутри
+  # read_dotenv): значение не подменяем, только предупреждаем — иначе
+  # человек увидит совсем не связанную с опечаткой ошибку вида "✗ токен не
+  # принят (код: 401)" на шаге живой проверки и пойдёт перевыпускать токен,
+  # хотя дело в .env.
+  if [ -s "$warnings_marker" ]; then
+    while IFS="$(printf '\t')" read -r line key; do
+      [ -n "$key" ] && fail "$path:$line: в значении $key не закрыт апостроф/кавычка — дальше по файлу могло съесть не то. Оберни всё значение в двойные кавычки." >&2
+    done <"$warnings_marker"
   fi
 }
 
@@ -518,6 +534,12 @@ setup_grafana() {
   say "── Grafana ── сервисный токен у платформы (URL приходит вместе с ним)"
   ask GRAFANA_URL "  URL Grafana (Enter — пропустить): "
   if [ -z "$GRAFANA_URL" ]; then
+    # GRAFANA_TOKEN мог прийти из .env сам по себе — без URL он бесполезен,
+    # и молчание тут выглядело бы как "мастер его не заметил", хотя на
+    # самом деле он просто не может включить коннектор без адреса.
+    if [ -n "${GRAFANA_TOKEN:-}" ]; then
+      fail "GRAFANA_TOKEN в .env есть, а GRAFANA_URL нет — токен не использован"
+    fi
     fail "пропущено — подключить позже: ./setup.sh --add grafana"
     return
   fi
@@ -544,6 +566,9 @@ setup_openmetadata() {
   say "── OpenMetadata ── Профиль → Access Token (URL — спроси в платформе, если нет под рукой)"
   ask OMD_URL "  URL OpenMetadata (Enter — пропустить): "
   if [ -z "$OMD_URL" ]; then
+    if [ -n "${OMD_TOKEN:-}" ]; then
+      fail "OMD_TOKEN в .env есть, а OMD_URL нет — токен не использован"
+    fi
     fail "пропущено — подключить позже: ./setup.sh --add openmetadata"
     return
   fi
@@ -589,6 +614,9 @@ setup_sheets() {
   say "── Google Sheets ── файл сервисного аккаунта — у Насти"
   ask GOOGLE_SA_FILE "  Путь к файлу (Enter — пропустить): "
   if [ -z "$GOOGLE_SA_FILE" ]; then
+    if [ -n "${GOOGLE_SHEETS_FOLDER_ID:-}" ]; then
+      fail "GOOGLE_SHEETS_FOLDER_ID в .env есть, а GOOGLE_SA_FILE нет — не использован"
+    fi
     fail "пропущено — подключить позже: ./setup.sh --add sheets"
     return
   fi

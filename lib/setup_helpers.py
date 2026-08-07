@@ -40,7 +40,7 @@ def write_env(path, values):
 def read_dotenv(path):
     """Прочитать файл доступов `.env`, заполненный человеком вручную.
 
-    Тот же разборщик, что и для secrets.env (envfile.read) — второго парсера
+    Тот же разборщик, что и для secrets.env (envfile.parse) — второго парсера
     нарочно нет, чтобы значение с пробелом/`$`/бэктиком/кавычкой не сломалось
     здесь так же, как это уже однажды случилось с secrets.env (см.
     tests/test_envfile.py). `.env` лежит внутри рабочей папки, а не в
@@ -48,18 +48,25 @@ def read_dotenv(path):
     права проверяются и ужимаются до 600 точно так же, как каталог секретов
     ужимается до 700 в write_env.
 
-    Возвращает (значения, было_ли_право_сужено). Отсутствие файла — не
-    ошибка, как и для envfile.read.
+    Кроме разбора — envfile.lint по тому же тексту: непарный апостроф/кавычка
+    в значении, вписанном руками без кавычек вокруг, молча "проглатывает"
+    остаток строки (см. envfile.lint). Значение при этом не подменяется —
+    только предупреждение с номером строки и именем ключа, решать человеку.
+
+    Возвращает (значения, было_ли_право_сужено, предупреждения_lint).
+    Отсутствие файла — не ошибка, как и для envfile.read.
     """
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
     except OSError:
-        return {}, False
+        return {}, False, []
     tightened = False
     if mode & (stat.S_IRWXG | stat.S_IRWXO):
         os.chmod(path, 0o600)
         tightened = True
-    return envfile.read(path), tightened
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+    return envfile.parse(text), tightened, envfile.lint(text)
 
 
 def missing_keys(values, required):
