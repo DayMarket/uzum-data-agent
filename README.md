@@ -10,9 +10,14 @@
 (`brew install node`, нужен только GrowthBook). Мастер проверит и скажет,
 чего не хватает.
 
+Репозиторий приватный. Клонируем по HTTPS: у большинства ключи SSH на GitHub
+не настроены, и `git@github.com:` упадёт с «make sure you have the correct
+access rights» ещё до установки. Если GitHub попросит логин — заведи
+Personal Access Token или поставь `gh` (`brew install gh`, затем `gh auth login`).
+
 ### Быстрый путь — заполнить файл
 
-    git clone git@github.com:DayMarket/uzum-data-agent.git
+    git clone https://github.com/DayMarket/uzum-data-agent.git
     cd uzum-data-agent
     cp .env.example .env
     # впиши значения в .env, сверяясь с подсказками внутри файла
@@ -38,7 +43,7 @@
 
 ### Обычный путь — ответить на вопросы
 
-    git clone git@github.com:DayMarket/uzum-data-agent.git
+    git clone https://github.com/DayMarket/uzum-data-agent.git
     cd uzum-data-agent
     ./setup.sh
 
