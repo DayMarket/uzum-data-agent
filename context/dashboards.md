@@ -62,4 +62,4 @@
 | [Market Нарушения сотрудников - невыходы](https://bi.uzum.uz/superset/dashboard/2138/) | 2026-06-04 | Rosina Karimova, Damir Mukhamedzhanov, Anton Bykov + ещё 1 |  |  |
 | [Market Новички Буст в топ](https://bi.uzum.uz/superset/dashboard/1384/) | 2025-11-13 | Rida Zabirova, Fazil Novanov |  |  |
 | [Market Расстояние до ПВЗ](https://bi.uzum.uz/superset/dashboard/2516/) | 2026-07-07 | Aleksandra Petrukhina, Ivan Ilichev, Ilya Kadochnikov + ещё 1 |  |  |
-| [Market Эффективность [ОКЗ & ОТД \| OPH] [новая огрструктура]](https://bi.uzum.uz/superset/dashboard/1727/) | 2026-07-16 | 12 |  |  |
+| [Market Эффективность [ОКЗ & ОТД \| OPH] [новая огрструктура]](https://bi.uzum.uz/superset/dashboard/1727/) | 2026-07-16 | Pavel Sokal, Ilia Uchitel, Anastasia Bir |  |  |

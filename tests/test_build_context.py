@@ -153,3 +153,16 @@ def test_registry_headers_do_not_promise_a_weekly_rebuild():
     for name in ("marts.md", "dashboards.md", "metrics.md"):
         text = (CONTEXT / name).read_text(encoding="utf-8")
         assert "раз в неделю" not in text, name
+def test_no_owner_column_is_a_bare_number():
+    """Находка 2 финального ревью: у дашборда 1727 в колонку owners затянуло
+    число из промежуточного счётчика выгрузки (`12`) вместо имён. Ловим
+    класс ошибки целиком — owners не бывает голым числом ни у одной строки."""
+    import re
+    for name in ("marts.md", "dashboards.md"):
+        for row in _data_rows(CONTEXT / name):
+            if len(row) < 3:
+                continue
+            owners = row[2].strip()
+            assert not re.fullmatch(r"\d+", owners), (name, row[0], owners)
+
+
