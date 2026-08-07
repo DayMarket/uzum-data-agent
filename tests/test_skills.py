@@ -72,6 +72,47 @@ def test_no_skill_exists_in_two_copies_on_disk():
             path.name, "SKILL.md существует в двух экземплярах на диске")
 
 
+def test_claude_and_agents_skill_names_match_exactly():
+    """Предыдущие проверки идут в одну сторону: от .claude/skills к
+    .agents/skills (симлинк — не копия, ведёт куда надо). Они не ловят
+    обратный дрейф — скилл добавлен прямо в .agents/skills (например, кто-то
+    работал только в Codex) и для него забыли завести симлинк в
+    .claude/skills. Codex такой скилл видит сразу, Claude Code не увидит
+    никогда, и ни один прежний тест на это не отреагирует: проверка
+    обязательных имён смотрит на подмножество, а обходы всех остальных
+    тестов стартуют от .claude/skills, где нового элемента попросту нет.
+
+    Поэтому здесь — не подмножество и не наличие обязательных, а равенство
+    множеств имён по обе стороны. Падает как при забытом симлинке (имя есть
+    только в .agents/skills), так и при осиротевшем симлинке без цели (имя
+    есть только в .claude/skills)."""
+    agents_names = {p.name for p in SKILLS_DIR.iterdir() if p.is_dir()}
+    claude_names = {p.name for p in CLAUDE_SKILLS_DIR.iterdir()
+                    if not p.name.startswith(".")}
+
+    only_in_agents = agents_names - claude_names
+    only_in_claude = claude_names - agents_names
+
+    assert not only_in_agents, (
+        "скилл есть в .agents/skills, но нет симлинка в .claude/skills — "
+        f"Codex видит, Claude Code не увидит: {only_in_agents}")
+    assert not only_in_claude, (
+        "в .claude/skills есть запись без каталога-цели в .agents/skills — "
+        f"осиротевший симлинк или чужой файл: {only_in_claude}")
+
+
+def test_every_skill_directory_in_agents_has_a_skill_md():
+    """test_every_skill_has_name_and_description_frontmatter обходит только
+    *.agents/skills/*/SKILL.md* — каталог без SKILL.md вообще ему не виден
+    и молча проходит мимо. Здесь то же равенство множеств, что и выше:
+    каталоги .agents/skills обязаны совпадать с каталогами, где реально
+    лежит SKILL.md."""
+    all_dirs = {p.name for p in SKILLS_DIR.iterdir() if p.is_dir()}
+    dirs_with_skill_md = {p.parent.name for p in SKILLS_DIR.glob("*/SKILL.md")}
+    assert all_dirs == dirs_with_skill_md, (
+        "каталог в .agents/skills без SKILL.md: ", all_dirs - dirs_with_skill_md)
+
+
 def test_job_skills_require_data_sanity():
     for name in ("adhoc-export", "data-check", "dashboard-fix"):
         text = (SKILLS_DIR / name / "SKILL.md").read_text(encoding="utf-8")
