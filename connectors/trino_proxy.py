@@ -33,6 +33,17 @@ OAuth2Authentication (пакет trino сам открывает браузер 
   TRINO_SCHEMA   схема (по умолчанию default)
   TRINO_USER     твой корп. email; если не задан в окружении — берём из
                  ~/.config/uzum-ai/secrets.env (ключ TRINO_USER)
+
+Задача Codex-5 (разрешения): у list_catalogs/list_schemas/list_tables/
+describe_table объявлен `annotations=types.ToolAnnotations(readOnlyHint=True)`.
+Это не декоративная пометка — проверено живым запуском изолированного
+`codex exec`, что именно это поле (и только оно) решает, пропустит ли Codex
+вызов инструмента без подтверждения человека: без него любой MCP-вызов,
+включая обычное перечисление, требует подтверждения и в headless-режиме
+автоматически отменяется. У execute_query аннотации нет и не должно быть —
+это прямое условие правила 1 (см. CLAUDE.md/context/rules.md): подтверждение
+на любой SQL остаётся всегда, коннектор не пытается отличить читающий запрос
+от пишущего. См. tests/test_codex_permissions.py и отчёт задачи Codex-5.
 """
 from __future__ import annotations
 
@@ -216,6 +227,7 @@ async def handle_list_tools() -> list[types.Tool]:
             name="list_catalogs",
             description="List all available Trino catalogs",
             inputSchema={"type": "object", "properties": {}},
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="list_schemas",
@@ -230,6 +242,7 @@ async def handle_list_tools() -> list[types.Tool]:
                     }
                 },
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="list_tables",
@@ -242,6 +255,7 @@ async def handle_list_tools() -> list[types.Tool]:
                 },
                 "required": ["catalog", "schema"],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
         types.Tool(
             name="describe_table",
@@ -255,6 +269,7 @@ async def handle_list_tools() -> list[types.Tool]:
                 },
                 "required": ["catalog", "schema", "table"],
             },
+            annotations=types.ToolAnnotations(readOnlyHint=True),
         ),
     ]
 

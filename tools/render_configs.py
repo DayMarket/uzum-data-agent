@@ -142,9 +142,56 @@ def _codex_spec(connector: Connector):
     return connector.command, connector.args, connector.env
 
 
+# ── Codex: базовые настройки профиля (задача Codex-5, "разрешения") ────────
+#
+# У Codex нет allow/deny-списка инструментов, как у Claude Code
+# (.claude/settings.json) — только три рычага, и все три проверены живым
+# запуском (`codex exec` с изолированным CODEX_HOME, отчёт задачи Codex-5):
+#
+# 1. Решение "спрашивать ли подтверждение на вызов конкретного
+#    MCP-инструмента" Codex принимает ИСКЛЮЧИТЕЛЬНО по полю
+#    `annotations.readOnlyHint`, которое отдаёт сам MCP-сервер в ответе на
+#    `tools/list` — ни sandbox_mode, ни approval_policy тут не участвуют
+#    (проверено во всех девяти комбинациях режим×политика, плюс отдельно
+#    доверие проекту). Поэтому это НЕ настраивается здесь — эти два поля
+#    прописаны непосредственно в connectors/trino_proxy.py и
+#    connectors/superset_mcp.py, у тех инструментов, что уже одобрены для
+#    Claude Code как read-only в .claude/settings.json. См.
+#    tests/test_codex_permissions.py.
+#
+# 2. `sandbox_mode`/`approval_policy` ниже управляют ДРУГИМ: shell-командами,
+#    которые Codex выполняет сам (не через MCP) — обычный exec-инструмент
+#    агента. Здесь выставлен наименее опасный из документированных вариантов
+#    (workspace-write вместо danger-full-access, on-request вместо never),
+#    но это НЕ решает правила 2 (запрет чтения секретов/.env) и 3 (запись
+#    только в work/) — оба проверены живым запуском и НЕ выполняются: чтение
+#    файла любой shell-командой (cat/sed/...) не ограничено ни в одном
+#    режиме sandbox_mode ("read-only" означает "без права записи", не
+#    "чтение под контролем"), а approval_policy=untrusted по официальному
+#    описанию флага сама держит cat/sed/ls в списке команд, не требующих
+#    подтверждения, независимо от того, какой путь им передан. Подробности,
+#    что проверялось и что не удалось выразить — в отчёте задачи Codex-5.
+#
+# 3. `--dangerously-bypass-approvals-and-sandbox` (обход подтверждений в
+#    headless-режиме, `codex exec`) — это флаг ЗАПУСКА для автоматизации без
+#    терминала, а не часть профиля; в config.toml он не прописывается
+#    никогда — иначе профиль тихо восстановил бы дыру, которую чинит правило
+#    1. Не путать с `--dangerously-bypass-hook-trust` (это отдельный флаг про
+#    доверие хукам, см. docs/codex-facts.md, раздел 7).
+CODEX_BASE_SETTINGS = {
+    "sandbox_mode": "workspace-write",
+    "approval_policy": "on-request",
+}
+
+
+def _render_codex_base_settings() -> str:
+    lines = ["%s = %s" % (key, _toml_string(value)) for key, value in CODEX_BASE_SETTINGS.items()]
+    return "\n".join(lines)
+
+
 def render_codex_toml(connectors: Iterable[Connector]) -> str:
     """Собрать .codex/config.toml (формат Codex) из реестра коннекторов."""
-    blocks = []
+    blocks = [_render_codex_base_settings()]
     for connector in connectors:
         command, raw_args, env_items = _codex_spec(connector)
         args = [_codex_arg(a) for a in raw_args]

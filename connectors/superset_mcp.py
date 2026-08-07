@@ -17,6 +17,22 @@ SUPERSET_USERNAME/SUPERSET_PASSWORD), как и остальные секрет�
 persistent cookie jar с follow_redirects, которого нет в stdlib). Claude Code
 запускает файл через `uv run` (см. PEP 723 заголовок выше) — uv разворачивает
 изолированное окружение под httpx сам, без ручного pip install.
+
+Задача Codex-5 (разрешения): у 13 читающих инструментов (тот же набор, что
+уже одобрен для Claude Code в .claude/settings.json — refresh_token,
+list_dashboards, get_dashboard, list_charts, list_dashboard_charts,
+get_chart_params_summary, get_chart_data, get_dashboard_layout_summary,
+get_dataset, get_dataset_summary, list_datasets, get_chart_screenshot,
+get_dashboard_screenshot) в get_tools() добавлен ключ
+`"annotations": {"readOnlyHint": True}`. Это единственное, что Codex смотрит
+при решении — спрашивать ли подтверждение на вызов MCP-инструмента
+(проверено живым запуском, см. tests/test_codex_permissions.py и отчёт
+задачи Codex-5): без этого поля любой вызов, включая безобидное
+перечисление, требует подтверждения. У sql_query и у всех пишущих
+инструментов (create_*/update_*/delete/patch_dashboard_position/
+normalize_dashboard_metrics) этого поля нет и не должно быть — правило 1
+(любой SQL и любое изменение требует подтверждения человека) держится
+именно на его отсутствии.
 """
 from __future__ import annotations
 
@@ -1411,6 +1427,7 @@ class SupersetMCPServer:
                     "properties": {},
                     "required": [],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "list_dashboards",
@@ -1423,6 +1440,7 @@ class SupersetMCPServer:
                     },
                     "required": [],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "get_dashboard",
@@ -1434,6 +1452,7 @@ class SupersetMCPServer:
                     },
                     "required": ["id_or_slug"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "list_charts",
@@ -1447,6 +1466,7 @@ class SupersetMCPServer:
                     },
                     "required": [],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "list_dashboard_charts",
@@ -1458,6 +1478,7 @@ class SupersetMCPServer:
                     },
                     "required": ["dashboard_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "get_chart_params_summary",
@@ -1469,6 +1490,7 @@ class SupersetMCPServer:
                     },
                     "required": ["chart_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "get_chart_data",
@@ -1480,6 +1502,7 @@ class SupersetMCPServer:
                     },
                     "required": ["chart_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "get_dashboard_layout_summary",
@@ -1493,6 +1516,7 @@ class SupersetMCPServer:
                     },
                     "required": ["dashboard_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "patch_dashboard_position",
@@ -1608,6 +1632,7 @@ class SupersetMCPServer:
                     },
                     "required": ["dataset_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "get_dataset_summary",
@@ -1623,6 +1648,7 @@ class SupersetMCPServer:
                     },
                     "required": ["dataset_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "create_dataset",
@@ -1667,6 +1693,7 @@ class SupersetMCPServer:
                     },
                     "required": [],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "create_dashboard",
@@ -1703,6 +1730,7 @@ class SupersetMCPServer:
                     },
                     "required": ["chart_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
             {
                 "name": "get_dashboard_screenshot",
@@ -1714,6 +1742,7 @@ class SupersetMCPServer:
                     },
                     "required": ["dashboard_id"],
                 },
+                "annotations": {"readOnlyHint": True},
             },
         ]
 

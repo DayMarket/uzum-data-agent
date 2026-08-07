@@ -1,3 +1,6 @@
+sandbox_mode = "workspace-write"
+approval_policy = "on-request"
+
 [mcp_servers.atlassian]
 command = "uvx"
 args = ["mcp-atlassian"]
