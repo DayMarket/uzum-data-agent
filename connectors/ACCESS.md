@@ -52,9 +52,7 @@ CH_HOST=wms-clickhouse.prod.um.internal
 CH_PORT=8123
 CH_USER=имя-фамилия
 CH_PASSWORD=<пароль из той же заявки JSM>
-JIRA_URL=https://jira.uzum.com
 JIRA_TOKEN=<Personal Access Token из профиля Jira>
-CONFLUENCE_URL=https://confluence.uzum.com
 SUPERSET_URL=https://bi.uzum.uz
 TRINO_USER=твой.email@uzum.com
 GRAFANA_URL=<URL из ответа платформы вместе с токеном>
@@ -68,6 +66,12 @@ GOOGLE_SHEETS_FOLDER_ID=<ID папки из её URL: drive.google.com/drive/fol
 
 Значения в `<угловых скобках>` — не значения для копирования, а подсказка, где
 их взять; остальные строки — рабочие значения, их можно использовать как есть.
+
+`JIRA_URL` и `CONFLUENCE_URL` тут нарочно не перечислены и мастер их не
+спрашивает: `.mcp.json` подставляет им дефолт (`https://jira.uzum.com` и
+`https://confluence.uzum.com` — они у всех одинаковые), задавать эти
+переменные вручную незачем. Прописывай их в `secrets.env` только если реально
+работаешь с другим инстансом Jira/Confluence, не с корпоративным.
 
 `setup.sh` (задача 9) подставляет эти значения в окружение перед запуском Claude
 Code — `.mcp.json` ссылается на них через `${VAR}` и никогда не хранит значения
