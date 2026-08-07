@@ -4,32 +4,37 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 CONFIG = json.loads((REPO_ROOT / ".mcp.json").read_text(encoding="utf-8"))
-EXPECTED = {"atlassian", "clickhouse", "trino", "superset", "grafana",
-            "openmetadata", "growthbook", "sheets"}
+EXPECTED = {"atlassian", "clickhouse-wms", "clickhouse-dwh", "trino", "superset",
+            "grafana", "openmetadata", "growthbook", "sheets"}
 
 # Структурные значения — адреса/пути. Не секрет, поэтому дефолт через
 # ${VAR:-значение} допустим: .mcp.json тогда работает "из коробки" без
 # лишних warning в `claude mcp list`, пока человек ещё не заполнил secrets.env.
 #
-# CH_SECURE — тоже структурное значение (схема http/https для рабочего
-# коннектора clickhouse), а не секрет. Раньше CLICKHOUSE_SECURE был
+# CH_WMS_SECURE/CH_DWH_SECURE — тоже структурные значения (схема http/https
+# для каждого из двух коннекторов ClickHouse — складского и общего DWH), а не
+# секрет. Раньше (один коннектор, один CH_SECURE) CLICKHOUSE_SECURE был
 # захардкожен литералом "true", хотя реальный эндпоинт отвечает по http на
 # 8123 (тот же дефект чинили в lib/telemetry.py) — коннектор "успешно
 # устанавливался", но не подключался в первой же сессии. Дефолт "false"
-# отражает рабочую схему; setup.sh пишет в CH_SECURE результат своего же
-# смоук-теста (какая схема реально ответила), а не гадает заранее.
-STRUCTURAL_VARS = ("CH_HOST", "CH_SECURE", "JIRA_URL", "CONFLUENCE_URL")
+# отражает рабочую схему; setup.sh пишет в CH_WMS_SECURE/CH_DWH_SECURE
+# результат своего же смоук-теста (какая схема реально ответила), а не гадает
+# заранее.
+STRUCTURAL_VARS = ("CH_WMS_HOST", "CH_WMS_SECURE", "CH_DWH_HOST", "CH_DWH_SECURE",
+                    "JIRA_URL", "CONFLUENCE_URL")
 
 # Настоящие секреты — пароли и токены. Дефолт здесь значит зашитый в git секрет
-# (пример регрессии: "${CH_PASSWORD:-hardcoded-secret}" всё ещё подстановка
+# (пример регрессии: "${CH_WMS_PASSWORD:-hardcoded-secret}" всё ещё подстановка
 # переменной по форме, но с утекшим паролем внутри), поэтому подстановка
 # обязана быть голой: ${VAR} без ":-значение". Новый коннектор — новый
-# секретный env var — дописывай сюда, а не в STRUCTURAL_VARS.
-SECRET_VARS = ("CH_USER", "CH_PASSWORD", "JIRA_TOKEN", "GRAFANA_TOKEN",
-               "OMD_TOKEN", "GROWTHBOOK_TOKEN")
+# секретный env var — дописывай сюда, а не в STRUCTURAL_VARS. WMS и DWH —
+# разные учётки на разных кластерах, поэтому у каждого свои CH_*_USER/
+# CH_*_PASSWORD, а не общая пара на двоих.
+SECRET_VARS = ("CH_WMS_USER", "CH_WMS_PASSWORD", "CH_DWH_USER", "CH_DWH_PASSWORD",
+               "JIRA_TOKEN", "GRAFANA_TOKEN", "OMD_TOKEN", "GROWTHBOOK_TOKEN")
 
 
-def test_all_eight_servers_present():
+def test_all_nine_servers_present():
     assert set(CONFIG["mcpServers"]) == EXPECTED
 
 
@@ -42,7 +47,8 @@ def test_no_literal_secrets_in_config():
 
 
 def test_structural_values_allow_default():
-    """CH_HOST/JIRA_URL/CONFLUENCE_URL — адреса, дефолт через :- разрешён."""
+    """CH_WMS_HOST/CH_DWH_HOST/JIRA_URL/CONFLUENCE_URL — адреса, дефолт через
+    :- разрешён."""
     raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
     for var in STRUCTURAL_VARS:
         assert re.search(r"\$\{%s(:-[^}]*)?\}" % re.escape(var), raw), var
@@ -54,7 +60,7 @@ def test_secrets_forbid_default():
     Дефолт у секрета — это буквально зашитый в git пароль/токен, даже если он
     формально всё ещё "подстановка переменной". Ловим регрессию отдельно от
     test_structural_values_allow_default, чтобы будущий копипаст дефолта с
-    JIRA_URL на, скажем, CH_PASSWORD, ронял тест, а не проходил его.
+    JIRA_URL на, скажем, CH_WMS_PASSWORD, ронял тест, а не проходил его.
     """
     raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
     for var in SECRET_VARS:
@@ -117,25 +123,29 @@ def test_clickhouse_keeps_the_battle_tested_parameter_set():
     `uvx --with pyarrow mcp-clickhouse` и передаёт MCP_TRANSPORT, порт,
     CLICKHOUSE_VERIFY и CHDB_ENABLED. Порт особенно важен: без него
     коннектор идёт на дефолтный 8443, хотя мастер спрашивает порт и
-    проверяет им доступ.
+    проверяет им доступ. Оба коннектора (WMS и DWH) — тот же набор
+    параметров, каждый со своим префиксом переменных.
     """
-    ch = CONFIG["mcpServers"]["clickhouse"]
-    assert ch["args"] == ["--with", "pyarrow", "mcp-clickhouse"]
-    env = ch["env"]
-    assert env["MCP_TRANSPORT"] == "stdio"
-    assert env["CLICKHOUSE_PORT"] == "${CH_PORT:-8123}"
-    assert env["CLICKHOUSE_VERIFY"] == "false"
-    assert env["CHDB_ENABLED"] == "false"
+    for name, prefix in (("clickhouse-wms", "CH_WMS"), ("clickhouse-dwh", "CH_DWH")):
+        ch = CONFIG["mcpServers"][name]
+        assert ch["args"] == ["--with", "pyarrow", "mcp-clickhouse"]
+        env = ch["env"]
+        assert env["MCP_TRANSPORT"] == "stdio"
+        assert env["CLICKHOUSE_PORT"] == "${%s_PORT:-8123}" % prefix
+        assert env["CLICKHOUSE_VERIFY"] == "false"
+        assert env["CHDB_ENABLED"] == "false"
 
 
 def test_clickhouse_secure_is_not_a_hardcoded_literal():
     """Регрессия на находку ревью задачи 9: CLICKHOUSE_SECURE был захардкожен
     `"true"`, хотя реальный ClickHouse-эндпоинт отвечает по http на 8123, а не
     по https — коннектор считался бы настроенным и не подключался в первой же
-    сессии. Схема должна приходить из CH_SECURE (результат смоук-теста
-    setup.sh), а не быть вкопанной в файл строкой.
+    сессии. Схема должна приходить из CH_WMS_SECURE/CH_DWH_SECURE (результат
+    смоук-теста setup.sh для каждого кластера отдельно), а не быть вкопанной
+    в файл строкой.
     """
     raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
     assert '"CLICKHOUSE_SECURE": "true"' not in raw
     assert '"CLICKHOUSE_SECURE": "false"' not in raw
-    assert re.search(r'"CLICKHOUSE_SECURE":\s*"\$\{CH_SECURE(:-[^}]*)?\}"', raw)
+    matches = re.findall(r'"CLICKHOUSE_SECURE":\s*"\$\{(CH_\w+_SECURE)(?::-[^}]*)?\}"', raw)
+    assert set(matches) == {"CH_WMS_SECURE", "CH_DWH_SECURE"}

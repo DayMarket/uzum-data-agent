@@ -15,6 +15,10 @@ superset_mcp.py) не ограничивают запрос до чтения, I
 нет» не пытаемся. Заодно: `~/.config/uzum-ai/secrets.env` и `.env` в корне —
 единственное место, где лежат пароли и токены в открытом виде (см.
 connectors/ACCESS.md, README.md), поэтому Read их не видит.
+
+ClickHouse разведён на два коннектора (`clickhouse-wms`, `clickhouse-dwh` —
+складской и общий DWH, разные учётки). Политика та же для обоих: read-only
+инструменты (`list_databases`/`list_tables`) в allow, `run_query` — нет.
 """
 import re
 from pathlib import Path
@@ -52,7 +56,8 @@ def test_reading_and_working_in_work_are_preapproved():
 
 
 def test_read_only_connector_tools_are_preapproved():
-    for tool in ("mcp__clickhouse__list_tables",
+    for tool in ("mcp__clickhouse-wms__list_tables",
+                 "mcp__clickhouse-dwh__list_tables",
                  "mcp__trino__describe_table",
                  "mcp__superset__get_dashboard",
                  "mcp__atlassian__jira_get_issue",
@@ -103,19 +108,23 @@ def test_arbitrary_sql_tools_are_not_preapproved():
     for name in superset_sql_tools:
         assert f"mcp__superset__{name}" not in ALLOW, name
 
-    # clickhouse — сторонний пакет mcp-clickhouse (не наш исходник в этом
-    # репо), детектором по тексту не достать. Инструмент run_query
-    # подтверждён живым запуском (`uvx --with pyarrow --from mcp-clickhouse
-    # python -c "import mcp_clickhouse; ..."`): выполняет произвольный SQL,
-    # write-защита включается отдельной переменной окружения
-    # CLICKHOUSE_ALLOW_WRITE_ACCESS, а не самой MCP-схемой инструмента — то
-    # есть полагаться на "он и так read-only" нельзя, политика для всех трёх
-    # инструментов одна: подтверждение человека на каждый вызов.
-    assert "mcp__clickhouse__run_query" not in ALLOW
+    # clickhouse-wms/clickhouse-dwh — сторонний пакет mcp-clickhouse (не наш
+    # исходник в этом репо), детектором по тексту не достать, для обоих
+    # коннекторов один и тот же пакет под разными переменными окружения.
+    # Инструмент run_query подтверждён живым запуском (`uvx --with pyarrow
+    # --from mcp-clickhouse python -c "import mcp_clickhouse; ..."`):
+    # выполняет произвольный SQL, write-защита включается отдельной
+    # переменной окружения CLICKHOUSE_ALLOW_WRITE_ACCESS, а не самой
+    # MCP-схемой инструмента — то есть полагаться на "он и так read-only"
+    # нельзя, политика для всех четырёх инструментов (два коннектора x
+    # run_query) одна: подтверждение человека на каждый вызов.
+    assert "mcp__clickhouse-wms__run_query" not in ALLOW
+    assert "mcp__clickhouse-dwh__run_query" not in ALLOW
 
-    # Бэкстоп: даже если детектор выше сломают, эти три конкретных имени не
+    # Бэкстоп: даже если детектор выше сломают, эти конкретные имена не
     # должны вернуться в allow.
     for tool in ("mcp__trino__execute_query", "mcp__superset__sql_query",
+                 "mcp__clickhouse-wms__run_query", "mcp__clickhouse-dwh__run_query",
                  "mcp__clickhouse__run_query"):
         assert tool not in ALLOW, tool
 

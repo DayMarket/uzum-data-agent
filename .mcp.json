@@ -10,16 +10,30 @@
         "CONFLUENCE_PERSONAL_TOKEN": "${JIRA_TOKEN}"
       }
     },
-    "clickhouse": {
+    "clickhouse-wms": {
       "command": "uvx",
       "args": ["--with", "pyarrow", "mcp-clickhouse"],
       "env": {
         "MCP_TRANSPORT": "stdio",
-        "CLICKHOUSE_HOST": "${CH_HOST}",
-        "CLICKHOUSE_PORT": "${CH_PORT:-8123}",
-        "CLICKHOUSE_USER": "${CH_USER}",
-        "CLICKHOUSE_PASSWORD": "${CH_PASSWORD}",
-        "CLICKHOUSE_SECURE": "${CH_SECURE:-false}",
+        "CLICKHOUSE_HOST": "${CH_WMS_HOST}",
+        "CLICKHOUSE_PORT": "${CH_WMS_PORT:-8123}",
+        "CLICKHOUSE_USER": "${CH_WMS_USER}",
+        "CLICKHOUSE_PASSWORD": "${CH_WMS_PASSWORD}",
+        "CLICKHOUSE_SECURE": "${CH_WMS_SECURE:-false}",
+        "CLICKHOUSE_VERIFY": "false",
+        "CHDB_ENABLED": "false"
+      }
+    },
+    "clickhouse-dwh": {
+      "command": "uvx",
+      "args": ["--with", "pyarrow", "mcp-clickhouse"],
+      "env": {
+        "MCP_TRANSPORT": "stdio",
+        "CLICKHOUSE_HOST": "${CH_DWH_HOST}",
+        "CLICKHOUSE_PORT": "${CH_DWH_PORT:-8123}",
+        "CLICKHOUSE_USER": "${CH_DWH_USER}",
+        "CLICKHOUSE_PASSWORD": "${CH_DWH_PASSWORD}",
+        "CLICKHOUSE_SECURE": "${CH_DWH_SECURE:-false}",
         "CLICKHOUSE_VERIFY": "false",
         "CHDB_ENABLED": "false"
       }

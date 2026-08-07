@@ -4,10 +4,10 @@
 # Запуск:
 #   ./setup.sh              — полный мастер, все коннекторы за один заход
 #   ./setup.sh --add NAME   — настроить/переподключить один коннектор,
-#                             не трогая остальные (clickhouse, atlassian,
-#                             superset, trino, grafana, openmetadata,
-#                             growthbook, sheets), либо телеметрию:
-#                             ./setup.sh --add telemetry
+#                             не трогая остальные (clickhouse-wms,
+#                             clickhouse-dwh, atlassian, superset, trino,
+#                             grafana, openmetadata, growthbook, sheets),
+#                             либо телеметрию: ./setup.sh --add telemetry
 #   ./setup.sh --non-interactive
 #                           — без единого вопроса: значения только из .env,
 #                             по недостающим — список и выход с кодом 1
@@ -24,7 +24,7 @@ set -uo pipefail
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SECRETS="$HOME/.config/uzum-ai/secrets.env"
 SETTINGS_LOCAL="$REPO_DIR/.claude/settings.local.json"
-SERVERS_LIST="clickhouse atlassian superset trino grafana openmetadata growthbook sheets"
+SERVERS_LIST="clickhouse-wms clickhouse-dwh atlassian superset trino grafana openmetadata growthbook sheets"
 
 # Заполнено из .env одним из ask_*-хелперов ниже, но не введено человеком и
 # отсутствует в файле — только при --non-interactive (иначе просто спросили
@@ -43,10 +43,12 @@ ENABLED=()
 # enabledMcpjsonServers: телеметрия — это хуки, а не коннектор.
 EXTRAS_LIST="telemetry"
 
-# Смоук-тест рабочего ClickHouse прошёл в этом запуске (setup_clickhouse).
-# Нужен setup_telemetry: переиспользовать логин/пароль можно только если они
-# на этом хосте реально сработали, а не просто были введены.
-CH_OK=0
+# Смоук-тест складского ClickHouse (WMS) прошёл в этом запуске
+# (setup_clickhouse_wms). Нужен setup_telemetry: переиспользовать логин/пароль
+# можно только если они на этом хосте реально сработали, а не просто были
+# введены. Общий DWH (setup_clickhouse_dwh) сюда не годится — таблиц
+# sandbox.ai_usage_* там нет, см. комментарий в setup_telemetry.
+CH_WMS_OK=0
 
 say()  { printf "\n%s\n" "$1"; }
 ok()   { printf "  \xe2\x9c\x93 %s\n" "$1"; }
@@ -201,18 +203,20 @@ for k, v in values.items():
 # ask_secret VAR "приглашение" [обязателен: метка для --non-interactive]
 #
 # shellcheck (если запущен на этом файле) пометит `read -r "$__var"` как
-# SC2229 и использование $CH_USER/$CH_PASSWORD дальше по файлу как SC2153 —
+# SC2229 и использование $CH_WMS_USER/$CH_WMS_PASSWORD дальше по файлу как
+# SC2153 —
 # оба ложные срабатывания: shellcheck не умеет проследить чтение в
 # переменную по имени, переданному строкой. Это стандартный приём для
 # bash 3.2 (дефолтный на macOS, где нет `local -n`/namerefs) — `read` внутри
 # вложенной функции пишет в переменную вызывающей функции благодаря
 # динамической области видимости bash, без eval. Проверено вручную:
-# ask вызывается из setup_clickhouse (CH_HOST и т.д. — глобальные) и из
-# setup_telemetry (T_HOST и т.д. — local), в обоих случаях значение
-# долетает до вызывающей функции.
+# ask вызывается из setup_clickhouse_wms/setup_clickhouse_dwh (CH_WMS_HOST,
+# CH_DWH_HOST и т.д. — глобальные) и из setup_telemetry (T_HOST и т.д. —
+# local), в обоих случаях значение долетает до вызывающей функции.
 #
 # Значение уже есть (из .env, или переиграно из другого коннектора, как
-# TELEMETRY_* от рабочего ClickHouse) — не спрашиваем, используем как есть;
+# TELEMETRY_* от складского ClickHouse, CH_WMS_*) — не спрашиваем, используем
+# как есть;
 # живая проверка ниже по коду всё равно выполнится по-настоящему. Значения
 # нет и вопросов не задаём (--non-interactive) — просто оставляем пустым:
 # позвать ask_required/ask_required_secret с меткой, если пустое значение
@@ -328,26 +332,31 @@ check_environment() {
 }
 
 # ── ClickHouse ───────────────────────────────────────────────────────────
+# Два независимых коннектора, два независимых кластера — разные учётки,
+# разный смоук-тест, разный отказ не трогает второй. WMS (склад, основной для
+# операционной аналитики) и DWH (продажи/финансы/маркетинг) исторически были
+# одним коннектором с одним вопросом про хост — человек мог настроить только
+# один кластер за раз, второй оставался недоступен вовсе.
+#
 # Реальный HTTP-интерфейс ClickHouse — http, порт 8123 (не https из брифа:
 # тот же дефект уже находили в lib/telemetry.py, из-за него не доходило ни
 # одной строки телеметрии). Порт спрашиваем, а не хардкодим, и подбираем
 # схему по факту ответа, а не гадаем — https пробуем вторым номером.
 #
-# CH_SECURE пишется в secrets.env наравне с TELEMETRY_CH_SECURE: .mcp.json
-# подставляет её в CLICKHOUSE_SECURE (см. CH_SECURE в этом же файле) —
-# раньше там был захардкожен литерал "true", из-за чего рабочий коннектор
-# clickhouse считался бы настроенным и не подключался в первой сессии, хотя
-# смоук-тест здесь честно нашёл рабочую схему.
-setup_clickhouse() {
-  say "── ClickHouse ── логин это корп-почта через дефис, пароль выдаётся заявкой в JSM"
-  printf "  Складской кластер (WMS) — основной для операционной аналитики: wms-clickhouse.prod.um.internal\n"
-  printf "  Общий DWH (продажи, финансы, маркетинг):                       dwh-clickhouse.prod.um.internal\n"
-  ask CH_HOST "  Хост [wms-clickhouse.prod.um.internal]: "
-  CH_HOST=${CH_HOST:-wms-clickhouse.prod.um.internal}
-  ask CH_PORT "  Порт [8123]: "
-  CH_PORT=${CH_PORT:-8123}
-  ask_required CH_USER "  Логин: " "CH_USER (логин ClickHouse)"
-  ask_required_secret CH_PASSWORD "  Пароль: " "CH_PASSWORD (пароль ClickHouse)"
+# CH_WMS_SECURE/CH_DWH_SECURE пишутся в secrets.env наравне с
+# TELEMETRY_CH_SECURE: .mcp.json подставляет их в CLICKHOUSE_SECURE каждого
+# коннектора — раньше (один коннектор, один CH_SECURE) там был захардкожен
+# литерал "true", из-за чего коннектор считался бы настроенным и не
+# подключался в первой сессии, хотя смоук-тест здесь честно нашёл рабочую
+# схему.
+setup_clickhouse_wms() {
+  say "── ClickHouse: складской кластер (WMS) ── основной для операционной аналитики; логин это корп-почта через дефис, пароль выдаётся заявкой в JSM"
+  ask CH_WMS_HOST "  Хост [wms-clickhouse.prod.um.internal]: "
+  CH_WMS_HOST=${CH_WMS_HOST:-wms-clickhouse.prod.um.internal}
+  ask CH_WMS_PORT "  Порт [8123]: "
+  CH_WMS_PORT=${CH_WMS_PORT:-8123}
+  ask_required CH_WMS_USER "  Логин: " "CH_WMS_USER (логин ClickHouse WMS)"
+  ask_required_secret CH_WMS_PASSWORD "  Пароль: " "CH_WMS_PASSWORD (пароль ClickHouse WMS)"
 
   # Пробуем каждую схему в свой файл — иначе при обрыве соединения на втором
   # запросе (например https, если сервер вообще не говорит по TLS) curl не
@@ -356,39 +365,39 @@ setup_clickhouse() {
   local http_out https_out http_code https_code
   http_out="$(mk_tmp)"
   http_code=$(curl_check "$http_out" 8 \
-    "http://$CH_HOST:$CH_PORT/?query=SELECT+count()+FROM+system.databases" \
-    "X-ClickHouse-User: $CH_USER" "X-ClickHouse-Key: $CH_PASSWORD")
+    "http://$CH_WMS_HOST:$CH_WMS_PORT/?query=SELECT+count()+FROM+system.databases" \
+    "X-ClickHouse-User: $CH_WMS_USER" "X-ClickHouse-Key: $CH_WMS_PASSWORD")
 
   if [ "$http_code" = "200" ]; then
-    ok "вижу $(cat "$http_out" 2>/dev/null) баз (по http, порт $CH_PORT)"
-    put_env CH_HOST "$CH_HOST"
-    put_env CH_PORT "$CH_PORT"
-    put_env CH_USER "$CH_USER"
-    put_env CH_PASSWORD "$CH_PASSWORD"
-    put_env CH_SECURE "false"
-    CH_OK=1
-    ENABLED+=("clickhouse")
+    ok "вижу $(cat "$http_out" 2>/dev/null) баз (по http, порт $CH_WMS_PORT)"
+    put_env CH_WMS_HOST "$CH_WMS_HOST"
+    put_env CH_WMS_PORT "$CH_WMS_PORT"
+    put_env CH_WMS_USER "$CH_WMS_USER"
+    put_env CH_WMS_PASSWORD "$CH_WMS_PASSWORD"
+    put_env CH_WMS_SECURE "false"
+    CH_WMS_OK=1
+    ENABLED+=("clickhouse-wms")
     return
   fi
 
   https_out="$(mk_tmp)"
   https_code=$(curl_check "$https_out" 8 \
-    "https://$CH_HOST:$CH_PORT/?query=SELECT+count()+FROM+system.databases" \
-    "X-ClickHouse-User: $CH_USER" "X-ClickHouse-Key: $CH_PASSWORD")
+    "https://$CH_WMS_HOST:$CH_WMS_PORT/?query=SELECT+count()+FROM+system.databases" \
+    "X-ClickHouse-User: $CH_WMS_USER" "X-ClickHouse-Key: $CH_WMS_PASSWORD")
 
   if [ "$https_code" = "200" ]; then
-    ok "вижу $(cat "$https_out" 2>/dev/null) баз (по https, порт $CH_PORT)"
-    put_env CH_HOST "$CH_HOST"
-    put_env CH_PORT "$CH_PORT"
-    put_env CH_USER "$CH_USER"
-    put_env CH_PASSWORD "$CH_PASSWORD"
-    put_env CH_SECURE "true"
-    CH_OK=1
-    ENABLED+=("clickhouse")
+    ok "вижу $(cat "$https_out" 2>/dev/null) баз (по https, порт $CH_WMS_PORT)"
+    put_env CH_WMS_HOST "$CH_WMS_HOST"
+    put_env CH_WMS_PORT "$CH_WMS_PORT"
+    put_env CH_WMS_USER "$CH_WMS_USER"
+    put_env CH_WMS_PASSWORD "$CH_WMS_PASSWORD"
+    put_env CH_WMS_SECURE "true"
+    CH_WMS_OK=1
+    ENABLED+=("clickhouse-wms")
     return
   fi
 
-  fail "не подключился ни по http (код: $http_code), ни по https (код: $https_code) на $CH_HOST:$CH_PORT"
+  fail "не подключился ни по http (код: $http_code), ни по https (код: $https_code) на $CH_WMS_HOST:$CH_WMS_PORT"
   # Показываем текст той попытки, которая реально дошла до сервера (код не
   # 000) — там настоящая причина отказа, а не обрыв TCP/TLS соединения.
   if [ "$http_code" != "000" ]; then
@@ -396,13 +405,64 @@ setup_clickhouse() {
   elif [ "$https_code" != "000" ]; then
     fail "$(head -c 300 "$https_out" 2>/dev/null)"
   fi
-  fail "пропущено — подключить позже: ./setup.sh --add clickhouse"
+  fail "пропущено — подключить позже: ./setup.sh --add clickhouse-wms"
+}
+
+setup_clickhouse_dwh() {
+  say "── ClickHouse: общий кластер (DWH) ── продажи, финансы, маркетинг; учётка отдельная от складского кластера — независимый доступ, заявка в JSM подаётся отдельно"
+  ask CH_DWH_HOST "  Хост [dwh-clickhouse.prod.um.internal]: "
+  CH_DWH_HOST=${CH_DWH_HOST:-dwh-clickhouse.prod.um.internal}
+  ask CH_DWH_PORT "  Порт [8123]: "
+  CH_DWH_PORT=${CH_DWH_PORT:-8123}
+  ask_required CH_DWH_USER "  Логин: " "CH_DWH_USER (логин ClickHouse DWH)"
+  ask_required_secret CH_DWH_PASSWORD "  Пароль: " "CH_DWH_PASSWORD (пароль ClickHouse DWH)"
+
+  local http_out https_out http_code https_code
+  http_out="$(mk_tmp)"
+  http_code=$(curl_check "$http_out" 8 \
+    "http://$CH_DWH_HOST:$CH_DWH_PORT/?query=SELECT+count()+FROM+system.databases" \
+    "X-ClickHouse-User: $CH_DWH_USER" "X-ClickHouse-Key: $CH_DWH_PASSWORD")
+
+  if [ "$http_code" = "200" ]; then
+    ok "вижу $(cat "$http_out" 2>/dev/null) баз (по http, порт $CH_DWH_PORT)"
+    put_env CH_DWH_HOST "$CH_DWH_HOST"
+    put_env CH_DWH_PORT "$CH_DWH_PORT"
+    put_env CH_DWH_USER "$CH_DWH_USER"
+    put_env CH_DWH_PASSWORD "$CH_DWH_PASSWORD"
+    put_env CH_DWH_SECURE "false"
+    ENABLED+=("clickhouse-dwh")
+    return
+  fi
+
+  https_out="$(mk_tmp)"
+  https_code=$(curl_check "$https_out" 8 \
+    "https://$CH_DWH_HOST:$CH_DWH_PORT/?query=SELECT+count()+FROM+system.databases" \
+    "X-ClickHouse-User: $CH_DWH_USER" "X-ClickHouse-Key: $CH_DWH_PASSWORD")
+
+  if [ "$https_code" = "200" ]; then
+    ok "вижу $(cat "$https_out" 2>/dev/null) баз (по https, порт $CH_DWH_PORT)"
+    put_env CH_DWH_HOST "$CH_DWH_HOST"
+    put_env CH_DWH_PORT "$CH_DWH_PORT"
+    put_env CH_DWH_USER "$CH_DWH_USER"
+    put_env CH_DWH_PASSWORD "$CH_DWH_PASSWORD"
+    put_env CH_DWH_SECURE "true"
+    ENABLED+=("clickhouse-dwh")
+    return
+  fi
+
+  fail "не подключился ни по http (код: $http_code), ни по https (код: $https_code) на $CH_DWH_HOST:$CH_DWH_PORT"
+  if [ "$http_code" != "000" ]; then
+    fail "$(head -c 300 "$http_out" 2>/dev/null)"
+  elif [ "$https_code" != "000" ]; then
+    fail "$(head -c 300 "$https_out" 2>/dev/null)"
+  fi
+  fail "пропущено — подключить позже: ./setup.sh --add clickhouse-dwh"
 }
 
 # ── Телеметрия ───────────────────────────────────────────────────────────
-# Отдельный вопрос, а не «тот же хост, что и рабочий ClickHouse»: таблицы
+# Отдельный вопрос, а не «тот же хост, что и складской ClickHouse»: таблицы
 # sandbox.ai_usage_{sessions,events,verdicts} созданы ТОЛЬКО на складском
-# кластере (wms-clickhouse). Аналитик, который выбрал рабочим хостом
+# кластере (wms-clickhouse). Аналитик, который вместо него указал бы здесь
 # dwh-clickhouse, раньше получал TELEMETRY_CH_HOST=dwh-... — каждый INSERT
 # падал бы с «unknown table», а telemetry.write() по контракту не бросает
 # исключений и молча складывал бы строку в локальную очередь навсегда: ноль
@@ -414,7 +474,7 @@ setup_clickhouse() {
 # хуки: тот кластер, та база, та таблица, те права.
 setup_telemetry() {
   say "── Телеметрия ── куда хуки пишут статистику работы (sandbox.ai_usage_*)"
-  printf "  Таблицы живут на складском кластере — обычно это дефолт ниже.\n"
+  printf "  Таблицы живут на складском кластере (WMS) — обычно это дефолт ниже.\n"
   # Seed из .env (TELEMETRY_CH_* — так значения названы в secrets.env, а не
   # T_HOST/T_PORT — те локальные для этой функции, см. put_env ниже).
   T_HOST="${TELEMETRY_CH_HOST:-}"
@@ -425,10 +485,10 @@ setup_telemetry() {
   T_PORT=${T_PORT:-8123}
 
   local T_USER T_PASSWORD
-  if [ "$CH_OK" = "1" ] && [ "$T_HOST" = "${CH_HOST:-}" ] && [ "$T_PORT" = "${CH_PORT:-}" ]; then
-    T_USER="$CH_USER"
-    T_PASSWORD="$CH_PASSWORD"
-    ok "тот же хост, что и рабочий ClickHouse — беру уже проверенный логин $T_USER"
+  if [ "$CH_WMS_OK" = "1" ] && [ "$T_HOST" = "${CH_WMS_HOST:-}" ] && [ "$T_PORT" = "${CH_WMS_PORT:-}" ]; then
+    T_USER="$CH_WMS_USER"
+    T_PASSWORD="$CH_WMS_PASSWORD"
+    ok "тот же хост, что и складской ClickHouse (clickhouse-wms) — беру уже проверенный логин $T_USER"
   else
     T_USER="${TELEMETRY_CH_USER:-}"
     ask T_USER "  Логин: "
@@ -648,7 +708,8 @@ except Exception as e:
 
 run_server() {
   case "$1" in
-    clickhouse)   setup_clickhouse ;;
+    clickhouse-wms) setup_clickhouse_wms ;;
+    clickhouse-dwh) setup_clickhouse_dwh ;;
     atlassian)    setup_jira ;;
     superset)     setup_superset ;;
     trino)        setup_trino ;;
@@ -722,7 +783,8 @@ fi
 if [ "$MODE" = "add" ]; then
   run_server "$ADD_SERVER"
 else
-  setup_clickhouse
+  setup_clickhouse_wms
+  setup_clickhouse_dwh
   setup_telemetry
   setup_jira
   setup_superset
