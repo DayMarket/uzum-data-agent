@@ -8,6 +8,7 @@
 (docs/codex-facts.md, раздел 11).
 """
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -207,10 +208,30 @@ def _run_from_a_vanished_directory(command, tmp_path, payload):
     doomed = tmp_path / "work" / "OE-1234"
     doomed.mkdir(parents=True)
     script = " ".join(['rm -rf "$1";', 'shift;', 'exec "$@"'])
+    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "lib"))
     return subprocess.run(
         ["bash", "-c", script, "_", str(doomed), *command],
-        cwd=str(doomed), input=payload, capture_output=True, text=True,
-        timeout=60)
+        cwd=str(doomed), input=payload, env=env, capture_output=True,
+        text=True, timeout=60)
+
+
+def test_session_is_ours_answers_instead_of_raising_when_the_directory_is_gone(tmp_path):
+    """Защита заявлена с ДВУХ сторон, значит и проверять надо обе.
+
+    Три теста ниже держатся на `try/except` вокруг вызова и остаются зелёными,
+    даже если сама функция снова начнёт бросать исключение (проверено
+    мутацией). Здесь проверяется вторая сторона отдельно: функция, вызванная
+    БЕЗ аргументов — то есть так, как её зовут хуки, — обязана вернуть False,
+    а не уронить процесс. Ни моков, ни monkeypatch: настоящий процесс с
+    настоящим исчезнувшим рабочим каталогом."""
+    result = _run_from_a_vanished_directory(
+        [sys.executable, "-c",
+         "import hook_scope; print(repr(hook_scope.session_is_ours()))"],
+        tmp_path, "")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "False", result.stdout + result.stderr
+    assert result.stderr == ""
 
 
 def test_log_event_survives_a_vanished_working_directory(tmp_path):

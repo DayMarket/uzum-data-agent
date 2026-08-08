@@ -4,6 +4,8 @@ import shlex
 import subprocess
 from pathlib import Path
 
+import pytest
+
 import setup_helpers
 
 
@@ -454,13 +456,124 @@ def test_codex_session_start_updates_the_repository_too_not_only_telemetry():
 
 
 def test_codex_hook_definitions_keep_one_script_per_entry():
-    """Идемпотентность merge_codex_hooks держится на сравнении записей по
-    значению. Если сложить два скрипта в одну запись, то добавление третьего
-    в будущем изменит значение целиком — старая запись перестанет совпадать
-    и телеметрия начнёт писаться дважды из одной сессии."""
+    """По одному скрипту на запись: так каждая видна и в hooks.json, и в
+    диалоге доверия по отдельности, а не слипается в одну строку."""
     for groups in setup_helpers.codex_hook_definitions().values():
         for group in groups:
             assert len(group["hooks"]) == 1, group
+
+
+# ── Апгрейд уже установленной машины: старая форма записи вытесняется ─────
+#
+# Самая дорогая находка третьего круга ревью. merge_codex_hooks только
+# ДОБАВЛЯЛ записи, сравнивая их по значению целиком, — а значение меняется
+# вместе с текстом команды. У аналитика, поставившего инструмент раньше,
+# после ./setup.sh в hooks.json оставались обе записи разом, и живой Codex
+# в постороннем каталоге давал:
+#
+#     hook: UserPromptSubmit
+#     hook: UserPromptSubmit
+#     hook: UserPromptSubmit Blocked
+#     hook: UserPromptSubmit Completed
+#
+# То есть починка не доезжала ровно до тех, ради кого дефект и заводили, а в
+# нашем собственном репозитории каждое событие обрабатывалось дважды.
+#
+# Все прежние проверки идемпотентности сливали codex_hook_definitions() сам с
+# собой — то есть проверяли случай, в котором дефекта быть не может. Ниже
+# проверяется именно апгрейд: СТАРАЯ форма записи против новой.
+
+# Дословно то, что писали прошлые версии codex_hook_definitions().
+LEGACY_RELATIVE = "python3 .claude/hooks/log_event.py"
+LEGACY_ABSOLUTE = "python3 '/Users/analyst/uzum-data-agent/.claude/hooks/log_event.py'"
+
+
+def _commands(merged, event):
+    return [hook["command"] for group in merged["hooks"][event]
+            for hook in group["hooks"]]
+
+
+@pytest.mark.parametrize("legacy", [LEGACY_RELATIVE, LEGACY_ABSOLUTE])
+def test_merge_evicts_our_own_entry_of_an_older_form(legacy):
+    installed = {"hooks": {"UserPromptSubmit": [
+        {"hooks": [{"type": "command", "command": legacy}]}]}}
+
+    merged = setup_helpers.merge_codex_hooks(
+        installed, setup_helpers.codex_hook_definitions("/opt/uzum-data-agent"))
+
+    commands = _commands(merged, "UserPromptSubmit")
+    assert legacy not in commands, commands
+    assert len(commands) == 1, commands
+
+
+@pytest.mark.parametrize("legacy", [LEGACY_RELATIVE, LEGACY_ABSOLUTE])
+def test_merge_evicts_ours_but_keeps_the_foreign_entry_next_to_it(legacy):
+    """Вытеснение обязано быть прицельным: чужой хук на том же событии —
+    не наш и остаётся нетронутым."""
+    foreign = {"type": "command", "command": "some-other-tool-notify.sh"}
+    installed = {"hooks": {"UserPromptSubmit": [
+        {"hooks": [foreign]},
+        {"hooks": [{"type": "command", "command": legacy}]},
+    ]}}
+
+    merged = setup_helpers.merge_codex_hooks(
+        installed, setup_helpers.codex_hook_definitions("/opt/uzum-data-agent"))
+
+    commands = _commands(merged, "UserPromptSubmit")
+    assert commands[0] == "some-other-tool-notify.sh", commands
+    assert legacy not in commands, commands
+    assert len(commands) == 2, commands
+
+
+def test_merge_is_idempotent_across_a_change_of_the_command():
+    """Повторный ./setup.sh после смены формы команды не должен ни удваивать
+    записи, ни менять файл во второй раз."""
+    old = setup_helpers.merge_codex_hooks(
+        {}, setup_helpers.codex_hook_definitions("/старый путь/uzum-data-agent"))
+    new_defs = setup_helpers.codex_hook_definitions("/новый путь/uzum-data-agent")
+
+    once = setup_helpers.merge_codex_hooks(old, new_defs)
+    twice = setup_helpers.merge_codex_hooks(once, new_defs)
+
+    assert once == twice
+    assert once["hooks"] == {event: list(groups)
+                             for event, groups in new_defs.items()}
+
+
+def test_merge_drops_an_event_we_no_longer_register():
+    """Если мы перестанем регистрировать событие, наша запись о нём должна
+    уйти из файла, а не остаться висеть навсегда."""
+    installed = {"hooks": {"Stop": [
+        {"hooks": [{"type": "command",
+                    "command": "python3 /x/.claude/hooks/log_event.py"}]}]}}
+
+    merged = setup_helpers.merge_codex_hooks(
+        installed, setup_helpers.codex_hook_definitions("/opt/uzum-data-agent"))
+
+    assert "Stop" not in merged["hooks"], merged["hooks"]
+
+
+def test_deploy_codex_hooks_upgrades_an_older_installation_on_disk(tmp_path):
+    """То же самое, но через настоящий deploy_codex_hooks и файл на диске —
+    путь, которым это и происходит у аналитика при ./setup.sh."""
+    codex_home = tmp_path / "codex_home"
+    codex_home.mkdir()
+    hooks_path = codex_home / "hooks.json"
+    hooks_path.write_text(json.dumps({"hooks": {
+        "UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "чужой-notify.sh"}]},
+            {"hooks": [{"type": "command", "command": LEGACY_RELATIVE}]},
+        ],
+    }}), encoding="utf-8")
+
+    assert setup_helpers.deploy_codex_hooks(str(codex_home), str(tmp_path / "clone")) is True
+
+    data = json.loads(hooks_path.read_text(encoding="utf-8"))
+    commands = [hook["command"] for group in data["hooks"]["UserPromptSubmit"]
+                for hook in group["hooks"]]
+    assert LEGACY_RELATIVE not in commands, commands
+    assert "чужой-notify.sh" in commands, commands
+    assert len([c for c in commands if "log_event.py" in c]) == 1, commands
 
 
 def test_merge_codex_hooks_preserves_foreign_hooks_untouched():

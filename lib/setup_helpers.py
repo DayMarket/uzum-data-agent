@@ -414,10 +414,10 @@ def codex_hook_definitions(repo_root=None):
 
     Значение на событие — СПИСОК записей, а не одна: у SessionStart их две
     (телеметрия и обновление репозитория), и по одному скрипту на запись, а
-    не обе команды внутри одной. Так merge_codex_hooks остаётся
-    идемпотентным при добавлении нового скрипта в будущем: сравнение идёт по
-    значению записи, и уже лежащие на диске записи продолжают совпадать
-    вместо того, чтобы удвоиться.
+    не обе команды внутри одной — так каждую запись видно и в hooks.json, и в
+    диалоге доверия по отдельности. Прежние наши записи merge_codex_hooks
+    вытесняет (см. OUR_HOOK_SCRIPTS), поэтому смена команды здесь не плодит
+    дубликаты на уже установленных машинах.
 
     Смена команды меняет `trusted_hash` (docs/codex-facts.md, раздел 7):
     у того, у кого Codex уже настроен, диалог «Hooks need review» появится
@@ -448,22 +448,78 @@ def codex_hook_definitions(repo_root=None):
     }
 
 
+# Имена скриптов, которые ставим мы. По ним запись в чужом hooks.json
+# опознаётся как НАША — не по точному тексту команды.
+#
+# Почему не по тексту: текст команды уже менялся дважды (относительный путь →
+# абсолютный → абсолютный в обёртке `test -f`) и будет меняться дальше. Пока
+# опознания не было вовсе, merge_codex_hooks только ДОБАВЛЯЛ: у аналитика,
+# поставившего инструмент раньше, после `./setup.sh` в hooks.json оставались
+# обе записи разом — старая и новая. Живой Codex на этом давал
+#
+#     hook: UserPromptSubmit
+#     hook: UserPromptSubmit
+#     hook: UserPromptSubmit Blocked
+#     hook: UserPromptSubmit Completed
+#
+# то есть починка не доезжала ровно до тех, ради кого дефект и заводили (вся
+# уже установленная база), а в нашем собственном репозитории каждое событие
+# обрабатывалось дважды и телеметрия удваивалась.
+#
+# Опознание по имени скрипта переживает любую смену формы команды —
+# интерпретатора, обёртки, флагов, вида пути — и заодно распознаёт все
+# исторические формы, что и нужно для апгрейда уже установленных машин.
+# Дополнительное условие ".claude/hooks/" — чтобы случайное совпадение имени
+# в чужой команде не выдало её за нашу.
+OUR_HOOK_SCRIPTS = ("log_session.py", "log_event.py", "on_session_start.sh")
+
+
+def is_our_codex_hook(group):
+    """Наша ли это запись hooks.json (в любой из исторических форм)."""
+    if not isinstance(group, dict):
+        return False
+    for hook in group.get("hooks") or []:
+        command = isinstance(hook, dict) and hook.get("command") or ""
+        if ".claude/hooks/" in command and any(
+                script in command for script in OUR_HOOK_SCRIPTS):
+            return True
+    return False
+
+
 def merge_codex_hooks(existing, new_entries):
     """Слить наши записи в уже существующую структуру hooks.json, не теряя
     чужие. `existing` — распарсенный JSON (dict) текущего hooks.json, или
     {}/None, если файла ещё не было. `new_entries` — событие → список наших
-    записей (см. codex_hook_definitions). Идемпотентно: повторный вызов с
-    той же записью не создаёт дубликат (сравнение по значению), поэтому
-    повторный ./setup.sh не плодит копии хука при каждом перезапуске."""
+    записей (см. codex_hook_definitions).
+
+    Наши прежние записи ВЫТЕСНЯЮТСЯ, а не дополняются (см. OUR_HOOK_SCRIPTS
+    выше — там же про то, чем это кончалось). Порядок: сначала чужие записи в
+    том порядке, в каком они лежали, следом наши. Отсюда идемпотентность —
+    уже не «повторная запись случайно совпала по значению», а свойство самого
+    построения: сколько раз ни вызови, наших записей ровно столько, сколько
+    их в new_entries.
+
+    Событие, где после вытеснения не осталось ничего, из файла убирается: так
+    исчезнет и запись о событии, которое мы перестали регистрировать."""
     merged = dict(existing) if existing else {}
     hooks = dict(merged.get("hooks") or {})
-    for event, groups in new_entries.items():
-        existing_groups = list(hooks.get(event) or [])
-        for group in groups:
-            if group not in existing_groups:
-                existing_groups.append(group)
-        hooks[event] = existing_groups
-    merged["hooks"] = hooks
+
+    # Порядок событий фиксирован (сначала уже лежащие в файле, потом наши
+    # новые) — иначе ключи JSON прыгали бы между запусками, файл переписывался
+    # бы без причины, а вместе с ним менялся бы trusted_hash и Codex каждый
+    # раз переспрашивал бы «Hooks need review».
+    events = list(hooks)
+    events.extend(event for event in new_entries if event not in hooks)
+
+    result = {}
+    for event in events:
+        groups = [group for group in (hooks.get(event) or [])
+                  if not is_our_codex_hook(group)]
+        groups.extend(new_entries.get(event, []))
+        if groups:
+            result[event] = groups
+
+    merged["hooks"] = result
     return merged
 
 
