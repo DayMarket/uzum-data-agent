@@ -483,9 +483,38 @@ def test_codex_hook_definitions_keep_one_script_per_entry():
 # собой — то есть проверяли случай, в котором дефекта быть не может. Ниже
 # проверяется именно апгрейд: СТАРАЯ форма записи против новой.
 
-# Дословно то, что писали прошлые версии codex_hook_definitions().
+# Корень клона, который «ставится» в тестах ниже, и дословно те команды,
+# которые писали прошлые версии codex_hook_definitions() для этого корня.
+#
+# Все три формы видны в `git log` по codex_hook_definitions: относительный
+# путь (4b81b8c … 6764f04 — это форма установленной базы), абсолютный путь
+# (f2761fc), абсолютный путь в обёртке `test -f` (7a59c6f, 90c2905).
+#
+# Строки выписаны здесь руками, а НЕ взяты из setup_helpers.
+# legacy_hook_commands(): иначе тест сверял бы перечень сам с собой и молчал
+# бы о любой ошибке в нём. Что это ровно тот текст, который печатал код тех
+# коммитов, проверено отдельно (git archive каждого коммита + печать команд;
+# дословный вывод — в отчёте по задаче).
+LEGACY_ROOT = "/opt/uzum-data-agent"
 LEGACY_RELATIVE = "python3 .claude/hooks/log_event.py"
-LEGACY_ABSOLUTE = "python3 '/Users/analyst/uzum-data-agent/.claude/hooks/log_event.py'"
+LEGACY_ABSOLUTE = "python3 /opt/uzum-data-agent/.claude/hooks/log_event.py"
+LEGACY_COMMANDS = (
+    # 4b81b8c … 6764f04
+    "python3 .claude/hooks/log_event.py",
+    "python3 .claude/hooks/log_session.py",
+    "bash .claude/hooks/on_session_start.sh --plain",
+    # f2761fc
+    "python3 /opt/uzum-data-agent/.claude/hooks/log_event.py",
+    "python3 /opt/uzum-data-agent/.claude/hooks/log_session.py",
+    "bash /opt/uzum-data-agent/.claude/hooks/on_session_start.sh --plain",
+    # 7a59c6f, 90c2905
+    "test -f /opt/uzum-data-agent/.claude/hooks/log_event.py && exec python3"
+    " /opt/uzum-data-agent/.claude/hooks/log_event.py || exit 0",
+    "test -f /opt/uzum-data-agent/.claude/hooks/log_session.py && exec python3"
+    " /opt/uzum-data-agent/.claude/hooks/log_session.py || exit 0",
+    "test -f /opt/uzum-data-agent/.claude/hooks/on_session_start.sh && exec bash"
+    " /opt/uzum-data-agent/.claude/hooks/on_session_start.sh --plain || exit 0",
+)
 
 
 def _commands(merged, event):
@@ -493,13 +522,18 @@ def _commands(merged, event):
             for hook in group["hooks"]]
 
 
-@pytest.mark.parametrize("legacy", [LEGACY_RELATIVE, LEGACY_ABSOLUTE])
+def _merge_installing(installed, root=LEGACY_ROOT):
+    """Слияние ровно так, как его делает deploy_codex_hooks при ./setup.sh."""
+    return setup_helpers.merge_codex_hooks(
+        installed, setup_helpers.codex_hook_definitions(root), root)
+
+
+@pytest.mark.parametrize("legacy", LEGACY_COMMANDS)
 def test_merge_evicts_our_own_entry_of_an_older_form(legacy):
     installed = {"hooks": {"UserPromptSubmit": [
         {"hooks": [{"type": "command", "command": legacy}]}]}}
 
-    merged = setup_helpers.merge_codex_hooks(
-        installed, setup_helpers.codex_hook_definitions("/opt/uzum-data-agent"))
+    merged = _merge_installing(installed)
 
     commands = _commands(merged, "UserPromptSubmit")
     assert legacy not in commands, commands
@@ -516,13 +550,143 @@ def test_merge_evicts_ours_but_keeps_the_foreign_entry_next_to_it(legacy):
         {"hooks": [{"type": "command", "command": legacy}]},
     ]}}
 
-    merged = setup_helpers.merge_codex_hooks(
-        installed, setup_helpers.codex_hook_definitions("/opt/uzum-data-agent"))
+    merged = _merge_installing(installed)
 
     commands = _commands(merged, "UserPromptSubmit")
     assert commands[0] == "some-other-tool-notify.sh", commands
     assert legacy not in commands, commands
     assert len(commands) == 2, commands
+
+
+# ── Находка: предикат съедал чужой инструмент, и это не проверялось ────────
+#
+# Опознание шло по имени скрипта плюс подстроке ".claude/hooks/" в команде.
+# Оба признака родовые: `.claude/hooks/` — штатный каталог Claude Code, а
+# `log_event.py` — предельно общее имя, мы сами его и выбрали. Чужой
+# инструмент, следующий той же конвенции, молча удалялся из общего
+# hooks.json. Мутация «убрать условие .claude/hooks/» не роняла ни одного
+# теста из 68: на вход никогда не подавали чужую запись с именем нашего
+# скрипта. Теперь подают.
+
+FOREIGN_LOOKALIKES = (
+    # Ровно тот случай, который вскрыл ревьюер: чужой инструмент в своём
+    # клоне, та же конвенция каталога, то же родовое имя скрипта.
+    "python3 /Users/analyst/other-tool/.claude/hooks/log_event.py",
+    "test -f ~/other-tool/.claude/hooks/log_session.py && exec python3"
+    " ~/other-tool/.claude/hooks/log_session.py || exit 0",
+    "bash /Users/analyst/other-tool/.claude/hooks/on_session_start.sh --plain",
+    # Соседний инструмент с этой машины — он тоже помечает свои записи.
+    'SUPERSET_AGENT_ID=codex "/Users/analyst/.superset/hooks/notify.sh"',
+    "python3 /home/a/mytool/hooks/log_event.py",
+    "grep -r log_event.py ~/notes",
+    # Прежняя наша форма ЦЕЛИКОМ лежит внутри чужой команды — но команда
+    # всё равно чужая: совпадать обязана вся строка, а не её кусок.
+    "sh -c 'cd ~/other-tool && python3 .claude/hooks/log_event.py'",
+)
+
+
+@pytest.mark.parametrize("foreign", FOREIGN_LOOKALIKES)
+def test_merge_keeps_a_foreign_hook_that_only_looks_like_ours(foreign):
+    """Чужая команда с именем нашего скрипта и штатным каталогом Claude Code
+    — всё ещё чужая. Из общего файла её удалять нельзя."""
+    installed = {"hooks": {"UserPromptSubmit": [
+        {"hooks": [{"type": "command", "command": foreign}]}]}}
+
+    merged = _merge_installing(installed)
+
+    commands = _commands(merged, "UserPromptSubmit")
+    assert commands[0] == foreign, commands
+    assert len(commands) == 2, commands  # чужая на месте, наша добавлена рядом
+
+
+# ── Находка: совпадение искалось в хуке, а удалялась запись целиком ────────
+#
+# is_our_codex_hook отвечал True, если совпал ЛЮБОЙ хук внутри записи, а
+# фильтр выбрасывал запись целиком — вместе с чужими командами, лежащими в
+# ней рядом. Записей больше чем с одним хуком в тестах не было вообще.
+
+def test_merge_takes_out_our_hook_and_leaves_the_foreign_one_in_the_same_entry():
+    foreign_first = {"type": "command", "command": "чужой-инструмент-notify.sh"}
+    foreign_last = {"type": "command", "command": "чужой-инструмент-audit.sh"}
+    installed = {"hooks": {"UserPromptSubmit": [{
+        "matcher": "*",  # чужие поля записи тоже не наши, чтобы их терять
+        "hooks": [foreign_first,
+                  {"type": "command", "command": LEGACY_RELATIVE},
+                  foreign_last],
+    }]}}
+
+    merged = _merge_installing(installed)
+
+    groups = merged["hooks"]["UserPromptSubmit"]
+    # Чужая запись цела: оба чужих хука, в прежнем порядке, с прежними полями.
+    assert groups[0]["hooks"] == [foreign_first, foreign_last], groups[0]
+    assert groups[0]["matcher"] == "*", groups[0]
+    # Наш прежний хук ушёл, новый добавлен ОТДЕЛЬНОЙ записью.
+    commands = _commands(merged, "UserPromptSubmit")
+    assert LEGACY_RELATIVE not in commands, commands
+    assert len([c for c in commands if "log_event.py" in c]) == 1, commands
+
+
+def test_merge_drops_an_entry_that_had_nothing_but_our_hook_in_it():
+    """Обратная сторона: запись, где кроме нашего хука ничего не было, должна
+    исчезнуть целиком, а не остаться пустой оболочкой."""
+    installed = {"hooks": {"UserPromptSubmit": [
+        {"hooks": [{"type": "command", "command": LEGACY_RELATIVE}]},
+        {"hooks": [{"type": "command", "command": "чужой-инструмент-notify.sh"}]},
+    ]}}
+
+    merged = _merge_installing(installed)
+
+    groups = merged["hooks"]["UserPromptSubmit"]
+    assert all(group["hooks"] for group in groups), groups
+    assert len(groups) == 2, groups  # чужая + наша новая
+
+
+def test_merge_keeps_an_entry_whose_shape_we_do_not_understand():
+    """hooks.json — общий файл, и его формат не наш: чужой инструмент (или
+    будущая версия Codex) может положить туда запись, которую мы не умеем
+    разбирать. Не опознали как своё — не трогаем. Иначе «не разобрали»
+    означало бы «удалили»."""
+    odd = [
+        {"hooks": "чужой-инструмент-notify.sh"},        # не список
+        {"matcher": "Bash"},                             # хуков нет вовсе
+        "чужой-инструмент-notify.sh",                    # вообще не запись
+        {"hooks": ["чужой-инструмент-notify.sh", 42]},   # хуки не словари
+    ]
+    installed = {"hooks": {"UserPromptSubmit": list(odd)}}
+
+    merged = _merge_installing(installed)
+
+    assert merged["hooks"]["UserPromptSubmit"][:len(odd)] == odd, merged["hooks"]
+
+
+def test_every_command_we_write_carries_our_marker():
+    """Метка — единственное, по чему наши будущие записи опознаются в общем
+    файле. Потерять её при следующей смене команды нельзя: без неё вытеснение
+    снова начнёт угадывать по родовым признакам."""
+    for command in _codex_hook_commands(
+            setup_helpers.codex_hook_definitions(LEGACY_ROOT)):
+        assert setup_helpers.OUR_HOOK_MARKER in command, command
+    for foreign in FOREIGN_LOOKALIKES:
+        assert setup_helpers.OUR_HOOK_MARKER not in foreign, foreign
+
+
+def test_marker_identifies_our_entry_whatever_the_rest_of_the_command_is():
+    """Метка не зависит ни от пути, ни от формы команды: запись, оставшуюся от
+    клона по ДРУГОМУ пути (аналитик перенёс папку и переставил инструмент),
+    вытесняем по одной метке — перечень прежних форм тут уже не помогает."""
+    moved = ("test -f '/старый путь/uzum-data-agent/.claude/hooks/log_event.py'"
+             " && exec env %s=1 python3"
+             " '/старый путь/uzum-data-agent/.claude/hooks/log_event.py'"
+             " || exit 0" % setup_helpers.OUR_HOOK_MARKER)
+    installed = {"hooks": {"UserPromptSubmit": [
+        {"hooks": [{"type": "command", "command": moved}]}]}}
+
+    merged = _merge_installing(installed)
+
+    commands = _commands(merged, "UserPromptSubmit")
+    assert moved not in commands, commands
+    assert len(commands) == 1, commands
 
 
 def test_merge_is_idempotent_across_a_change_of_the_command():
@@ -542,13 +706,12 @@ def test_merge_is_idempotent_across_a_change_of_the_command():
 
 def test_merge_drops_an_event_we_no_longer_register():
     """Если мы перестанем регистрировать событие, наша запись о нём должна
-    уйти из файла, а не остаться висеть навсегда."""
-    installed = {"hooks": {"Stop": [
-        {"hooks": [{"type": "command",
-                    "command": "python3 /x/.claude/hooks/log_event.py"}]}]}}
+    уйти из файла, а не остаться висеть навсегда. `Stop` мы не регистрируем —
+    значит запись на нём, помеченная как наша, лишняя."""
+    ours = setup_helpers.codex_hook_definitions(LEGACY_ROOT)["PostToolUse"][0]
+    installed = {"hooks": {"Stop": [ours]}}
 
-    merged = setup_helpers.merge_codex_hooks(
-        installed, setup_helpers.codex_hook_definitions("/opt/uzum-data-agent"))
+    merged = _merge_installing(installed)
 
     assert "Stop" not in merged["hooks"], merged["hooks"]
 

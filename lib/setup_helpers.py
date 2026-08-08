@@ -347,6 +347,31 @@ def deploy_codex_profile(generated_config_toml_path, codex_home_dir,
     return True, backed_up_to
 
 
+# Метка, по которой наши записи опознаются в общем $CODEX_HOME/hooks.json.
+#
+# hooks.json — файл на все проекты и все инструменты аналитика: рядом с нашими
+# записями там живут чужие (на машине автора задачи —
+# `SUPERSET_AGENT_ID=codex ".../.superset/hooks/notify.sh"`). Предикат,
+# решающий «эта запись наша», управляет УДАЛЕНИЕМ из этого файла, поэтому он
+# обязан быть однозначным: ошибётся в одну сторону — не дотянемся до уже
+# установленных машин, ошибётся в другую — молча снесём чужой инструмент.
+#
+# Предыдущая версия опознавала запись по имени скрипта (log_event.py) плюс
+# подстроке ".claude/hooks/" в команде. Оба признака родовые: `.claude/hooks/`
+# — штатный каталог Claude Code, а `log_event.py` — предельно общее имя.
+# Команда чужого инструмента, следующего той же конвенции (а конвенция ровно
+# одна, и мы сами ей следуем), опознавалась как наша:
+#
+#     python3 ~/other-tool/.claude/hooks/log_event.py    -> съедалась
+#
+# Поэтому опознание больше не угадывает. Свои записи мы ПОМЕЧАЕМ: команда
+# запускает скрипт через `env UZUM_DATA_AGENT_HOOK=1`. Метка называет
+# инструмент по имени, случайно её не напишет никто, и она переживает любую
+# будущую смену интерпретатора, обёртки, флагов и пути. Заодно её видно в
+# диалоге доверия Codex — аналитику ясно, чей это хук.
+OUR_HOOK_MARKER = "UZUM_DATA_AGENT_HOOK"
+
+
 def codex_hook_definitions(repo_root=None):
     """Наши записи для $CODEX_HOME/hooks.json — те же скрипты, что уже
     пишет Claude Code (.claude/hooks/log_event.py, .claude/hooks/
@@ -416,8 +441,14 @@ def codex_hook_definitions(repo_root=None):
     (телеметрия и обновление репозитория), и по одному скрипту на запись, а
     не обе команды внутри одной — так каждую запись видно и в hooks.json, и в
     диалоге доверия по отдельности. Прежние наши записи merge_codex_hooks
-    вытесняет (см. OUR_HOOK_SCRIPTS), поэтому смена команды здесь не плодит
-    дубликаты на уже установленных машинах.
+    вытесняет (см. OUR_HOOK_MARKER и LEGACY_HOOK_FORMS), поэтому смена команды
+    здесь не плодит дубликаты на уже установленных машинах.
+
+    `env UZUM_DATA_AGENT_HOOK=1` — метка, по которой запись опознаётся как
+    наша (см. OUR_HOOK_MARKER). Она не влияет на работу скрипта: переменная
+    просто есть в его окружении. Меняя команду здесь, метку не теряй — на ней
+    держится вытеснение прежних записей (tests/test_setup_helpers.py::
+    test_every_command_we_write_carries_our_marker).
 
     Смена команды меняет `trusted_hash` (docs/codex-facts.md, раздел 7):
     у того, у кого Codex уже настроен, диалог «Hooks need review» появится
@@ -430,8 +461,8 @@ def codex_hook_definitions(repo_root=None):
 
     def entry(runner, script, args=""):
         path = shlex.quote(os.path.join(root, ".claude", "hooks", script))
-        command = "test -f %s && exec %s %s%s || exit 0" % (
-            path, runner, path, args)
+        command = "test -f %s && exec env %s=1 %s %s%s || exit 0" % (
+            path, OUR_HOOK_MARKER, runner, path, args)
         return {"hooks": [{"type": "command", "command": command}]}
 
     def telemetry(script):
@@ -448,56 +479,129 @@ def codex_hook_definitions(repo_root=None):
     }
 
 
-# Имена скриптов, которые ставим мы. По ним запись в чужом hooks.json
-# опознаётся как НАША — не по точному тексту команды.
+# Все формы команды, которыми мы писали хуки ДО появления метки. Перечень
+# исторический и закрытый: он описывает прошлое, а не настоящее. Новые скрипты
+# и новые формы сюда НЕ добавляются — их опознаёт метка (OUR_HOOK_MARKER).
 #
-# Почему не по тексту: текст команды уже менялся дважды (относительный путь →
-# абсолютный → абсолютный в обёртке `test -f`) и будет меняться дальше. Пока
-# опознания не было вовсе, merge_codex_hooks только ДОБАВЛЯЛ: у аналитика,
-# поставившего инструмент раньше, после `./setup.sh` в hooks.json оставались
-# обе записи разом — старая и новая. Живой Codex на этом давал
+# Зачем перечень вообще: на уже установленных машинах метки нет — там лежит
+# ровно то, что писали прежние версии codex_hook_definitions(). Пока
+# merge_codex_hooks только ДОБАВЛЯЛ записи, после `./setup.sh` в hooks.json
+# оставались обе разом — старая и новая, и живой Codex давал
 #
 #     hook: UserPromptSubmit
 #     hook: UserPromptSubmit
 #     hook: UserPromptSubmit Blocked
 #     hook: UserPromptSubmit Completed
 #
-# то есть починка не доезжала ровно до тех, ради кого дефект и заводили (вся
-# уже установленная база), а в нашем собственном репозитории каждое событие
-# обрабатывалось дважды и телеметрия удваивалась.
+# то есть починка не доезжала ровно до тех, ради кого дефект и заводили, а в
+# нашем репозитории каждое событие обрабатывалось дважды.
 #
-# Опознание по имени скрипта переживает любую смену формы команды —
-# интерпретатора, обёртки, флагов, вида пути — и заодно распознаёт все
-# исторические формы, что и нужно для апгрейда уже установленных машин.
-# Дополнительное условие ".claude/hooks/" — чтобы случайное совпадение имени
-# в чужой команде не выдало её за нашу.
-OUR_HOOK_SCRIPTS = ("log_session.py", "log_event.py", "on_session_start.sh")
+# (скрипт, интерпретатор, аргументы) — то, что перечислено ниже, менялось
+# вместе с формой команды; формы собирает legacy_hook_commands().
+LEGACY_HOOK_FORMS = (
+    ("log_session.py", "python3", ""),
+    ("log_event.py", "python3", ""),
+    ("on_session_start.sh", "bash", " --plain"),
+)
 
 
-def is_our_codex_hook(group):
-    """Наша ли это запись hooks.json (в любой из исторических форм)."""
-    if not isinstance(group, dict):
+def legacy_hook_commands(repo_root=None):
+    """Дословный перечень команд, которые писали прежние версии
+    codex_hook_definitions() для клона `repo_root`. Совпадение с записью в
+    hooks.json проверяется по ВСЕЙ строке, а не по подстроке.
+
+    Три формы, все три видны в `git log` по codex_hook_definitions:
+
+    1. относительный путь (4b81b8c … 6764f04) — `python3
+       .claude/hooks/log_event.py`. Это та форма, что стоит у всей
+       установленной базы;
+    2. абсолютный путь (f2761fc) — `python3 <корень>/.claude/hooks/log_event.py`;
+    3. абсолютный путь в обёртке (7a59c6f, 90c2905) — `test -f … && exec … ||
+       exit 0`.
+
+    Формы 2 и 3 опознаются только для того клона, который сейчас ставится:
+    `python3 <любой корень>/.claude/hooks/log_event.py` — команда, которую с
+    тем же успехом мог написать чужой инструмент (`.claude/hooks/` — штатный
+    каталог Claude Code, `log_event.py` — родовое имя), и отличить её от нашей
+    по тексту нельзя. Своё узнаём по корню, чужое не трогаем. Практическая
+    цена: если аналитик поставил инструмент из ОДНОГО клона, а `./setup.sh`
+    запустил из ДРУГОГО (переименовал или перенёс папку), запись прежней формы
+    останется висеть. Форму 3 это не ломает (`test -f` не находит файл, шелл
+    выходит нулём), формы 1 и 2 до внешних машин не доехали — они появились
+    уже после того, как установленная база была собрана. Дальше этой проблемы
+    нет вовсе: метка от пути не зависит.
+
+    Путь проходит через тот же shlex.quote, что и в codex_hook_definitions —
+    иначе у аналитика с пробелом в пути перечень не совпал бы с файлом.
+    realpath — потому что в hooks.json мог попасть путь через симлинк
+    (на macOS /tmp против /private/tmp), а setup.sh запускается по
+    разрешённому; сравниваем и так, и так."""
+    roots = [repo_root or hook_scope.repo_root()]
+    resolved = os.path.realpath(roots[0])
+    if resolved != roots[0]:
+        roots.append(resolved)
+
+    commands = []
+    for script, runner, args in LEGACY_HOOK_FORMS:
+        commands.append("%s .claude/hooks/%s%s" % (runner, script, args))
+        for root in roots:
+            path = shlex.quote(os.path.join(root, ".claude", "hooks", script))
+            commands.append("%s %s%s" % (runner, path, args))
+            commands.append("test -f %s && exec %s %s%s || exit 0" % (
+                path, runner, path, args))
+    return tuple(commands)
+
+
+def is_our_codex_hook(hook, repo_root=None):
+    """Наш ли это ХУК (не запись целиком) из hooks.json: наш, если несёт метку
+    или дословно совпадает с одной из прежних наших команд.
+
+    Проверка идёт на уровне хука, потому что на этом же уровне идёт и
+    удаление: в одной записи hooks.json может лежать несколько команд, и
+    чужая, оказавшаяся в одной записи с нашей, не должна исчезнуть вместе с
+    ней."""
+    if not isinstance(hook, dict):
         return False
-    for hook in group.get("hooks") or []:
-        command = isinstance(hook, dict) and hook.get("command") or ""
-        if ".claude/hooks/" in command and any(
-                script in command for script in OUR_HOOK_SCRIPTS):
-            return True
-    return False
+    command = hook.get("command")
+    if not isinstance(command, str):
+        return False
+    if OUR_HOOK_MARKER in command:
+        return True
+    return command in legacy_hook_commands(repo_root)
 
 
-def merge_codex_hooks(existing, new_entries):
+def _without_our_hooks(group, repo_root):
+    """Запись hooks.json без наших хуков. None — если после этого в ней не
+    осталось ни одного хука (такую запись держать в файле незачем).
+    Всё чужое — команды, их порядок и остальные поля записи — как было."""
+    if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
+        return group  # не наш формат — не наша забота, не трогаем
+    kept = [hook for hook in group["hooks"]
+            if not is_our_codex_hook(hook, repo_root)]
+    if len(kept) == len(group["hooks"]):
+        return group
+    if not kept:
+        return None
+    pruned = dict(group)
+    pruned["hooks"] = kept
+    return pruned
+
+
+def merge_codex_hooks(existing, new_entries, repo_root=None):
     """Слить наши записи в уже существующую структуру hooks.json, не теряя
     чужие. `existing` — распарсенный JSON (dict) текущего hooks.json, или
     {}/None, если файла ещё не было. `new_entries` — событие → список наших
-    записей (см. codex_hook_definitions).
+    записей (см. codex_hook_definitions). `repo_root` — корень клона, который
+    ставится; тот же, с которым построены new_entries (см.
+    legacy_hook_commands про то, зачем он нужен здесь).
 
-    Наши прежние записи ВЫТЕСНЯЮТСЯ, а не дополняются (см. OUR_HOOK_SCRIPTS
-    выше — там же про то, чем это кончалось). Порядок: сначала чужие записи в
-    том порядке, в каком они лежали, следом наши. Отсюда идемпотентность —
-    уже не «повторная запись случайно совпала по значению», а свойство самого
-    построения: сколько раз ни вызови, наших записей ровно столько, сколько
-    их в new_entries.
+    Наши прежние хуки ВЫТЕСНЯЮТСЯ, а не дополняются (см. OUR_HOOK_MARKER и
+    LEGACY_HOOK_FORMS — там же про то, чем это кончалось). Убирается ровно наш
+    хук; запись выбрасывается, только если после этого в ней ничего не
+    осталось. Порядок: сначала чужие записи в том порядке, в каком они лежали,
+    следом наши. Отсюда идемпотентность — уже не «повторная запись случайно
+    совпала по значению», а свойство самого построения: сколько раз ни вызови,
+    наших записей ровно столько, сколько их в new_entries.
 
     Событие, где после вытеснения не осталось ничего, из файла убирается: так
     исчезнет и запись о событии, которое мы перестали регистрировать."""
@@ -513,8 +617,11 @@ def merge_codex_hooks(existing, new_entries):
 
     result = {}
     for event in events:
-        groups = [group for group in (hooks.get(event) or [])
-                  if not is_our_codex_hook(group)]
+        groups = []
+        for group in (hooks.get(event) or []):
+            kept = _without_our_hooks(group, repo_root)
+            if kept is not None:
+                groups.append(kept)
         groups.extend(new_entries.get(event, []))
         if groups:
             result[event] = groups
@@ -543,7 +650,8 @@ def deploy_codex_hooks(codex_home_dir, repo_root=None):
             existing = json.loads(current_text)
         except ValueError:
             existing = {}
-    merged = merge_codex_hooks(existing, codex_hook_definitions(repo_root))
+    merged = merge_codex_hooks(existing, codex_hook_definitions(repo_root),
+                               repo_root)
     new_text = json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
     if current_text == new_text:
         return False
