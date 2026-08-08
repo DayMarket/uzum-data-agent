@@ -66,6 +66,9 @@ CH_WMS_OK=0
 say()  { printf "\n%s\n" "$1"; }
 ok()   { printf "  \xe2\x9c\x93 %s\n" "$1"; }
 fail() { printf "  \xe2\x9c\x97 %s\n" "$1"; }
+# Просто факт, не «хорошо» и не «плохо»: например, что второй движок на
+# машине не стоит — это штатная ситуация, а не ошибка (✗ читается как ошибка).
+note() { printf "  \xc2\xb7 %s\n" "$1"; }
 
 # Временные файлы смоук-проверок: непредсказуемые имена (mktemp, не
 # фиксированные /tmp/uzum_*) и гарантированная уборка при выходе — даже при
@@ -303,17 +306,24 @@ check_environment() {
   # остальных проверок окружения — команды установки понятнее печатать
   # рядом, а не раньше python3/curl/uv, без которых мастер всё равно
   # бесполезен).
-  if command -v claude >/dev/null 2>&1; then
+  #
+  # Отсутствие ОДНОГО из двух движков — не ошибка, а штатная ситуация:
+  # аналитик мог осознанно поставить только Codex или только Claude Code.
+  # Раньше это печаталось красным ✗ и в первый час читалось как «что-то не
+  # так» — теперь строкой-заметкой, а ✗ остаётся там, где он и правда
+  # означает ошибку: когда нет ни одного движка.
+  command -v claude >/dev/null 2>&1 && ENGINE_CLAUDE_FOUND=1
+  command -v codex  >/dev/null 2>&1 && ENGINE_CODEX_FOUND=1
+
+  if [ "$ENGINE_CLAUDE_FOUND" = "1" ]; then
     ok "claude найден"
-    ENGINE_CLAUDE_FOUND=1
-  else
-    fail "Claude Code не найден в PATH"
+  elif [ "$ENGINE_CODEX_FOUND" = "1" ]; then
+    note "Claude Code в PATH нет — настраиваю только Codex"
   fi
-  if command -v codex >/dev/null 2>&1; then
+  if [ "$ENGINE_CODEX_FOUND" = "1" ]; then
     ok "codex найден"
-    ENGINE_CODEX_FOUND=1
-  else
-    fail "Codex не найден в PATH"
+  elif [ "$ENGINE_CLAUDE_FOUND" = "1" ]; then
+    note "Codex в PATH нет — настраиваю только Claude Code"
   fi
   if [ "$ENGINE_CLAUDE_FOUND" = "0" ] && [ "$ENGINE_CODEX_FOUND" = "0" ]; then
     fail "не найден ни один движок — нужен хотя бы один"
@@ -1040,11 +1050,32 @@ if [ "$ENGINE_CODEX_FOUND" = "1" ]; then
 EOF
 fi
 
-cat <<EOF
+# Синтаксис вызова скилла у движков разный: слэш у Claude Code, доллар у
+# Codex. Блок был безусловным и всегда показывал слэш — аналитик, поставивший
+# только Codex, набирал /task и не получал ничего. В первый час человек
+# читает вывод мастера, а не README, поэтому развилка тут обязательна.
+# Одинарные кавычки в heredoc — иначе $task/$fix-access развернутся в пустоту.
+say "Запускай: uzum"
 
-Запускай:       uzum
+if [ "$ENGINE_CLAUDE_FOUND" = "1" ] && [ "$ENGINE_CODEX_FOUND" = "1" ]; then
+  cat <<'EOF'
+Синтаксис вызова скилла зависит от движка:
+  Claude Code:  /task <ключ задачи из Jira>    починка: /fix-access
+  Codex:        $task <ключ задачи из Jira>    починка: $fix-access
+EOF
+elif [ "$ENGINE_CODEX_FOUND" = "1" ]; then
+  cat <<'EOF'
+Первая задача:  $task <ключ задачи из Jira>
+Если сломалось: $fix-access прямо в сессии
+EOF
+else
+  cat <<'EOF'
 Первая задача:  /task <ключ задачи из Jira>
 Если сломалось: /fix-access прямо в сессии
+EOF
+fi
+
+cat <<'EOF'
 Добавить доступ позже: ./setup.sh --add <коннектор>
 EOF
 
