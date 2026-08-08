@@ -3,8 +3,11 @@
 Транскрипт — настоящий, живым запуском (изолированный CODEX_HOME, `codex
 exec` + `codex exec resume --last`, 07.08.2026, снят при подготовке этой
 задачи): одна сессия, два хода — успешный `echo hello-fixture-success` и
-падающий `exit 9`. Файл: tests/fixtures/codex/transcript.jsonl, hook-события
-той же сессии — tests/fixtures/codex/hook_events.jsonl (turn_id совпадает
+падающий `exit 9`. Файл:
+tests/fixtures/codex/rollout-2026-08-07T20-49-54-019fdd21-9868-7633-a9ca-63122c263433.jsonl
+— имя сохранено ровно таким, каким его написал сам Codex (см. комментарий у
+TRANSCRIPT ниже); hook-события той же сессии —
+tests/fixtures/codex/hook_events.jsonl (turn_id совпадает
 дословно между ними — см. докстринг lib/transcript_codex.py про то, почему
 это единственный надёжный ключ сверки, а не tool_use_id).
 """
