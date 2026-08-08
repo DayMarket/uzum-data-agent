@@ -68,8 +68,9 @@ Jira с Confluence одним коннектором, Grafana, OpenMetadata, Gro
 Без него профиль просто не участвует — ни один из двух запретов не
 действует, а сессия выглядит обычной рабочей сессией, без единого
 предупреждения об этом. Проверено тестом:
-`tests/test_codex_permissions.py::test_live_undeployed_config_gives_no_technical_protection`
-— живой `cat .env` без нашего профиля отдаёт секрет в вывод дословно.
+`tests/test_codex_permissions.py::test_live_deployed_profile_not_selected_by_dash_p_gives_no_protection`
+— профиль развёрнут ровно так, как его кладёт `setup.sh`, запуск идёт без
+`-p`, и живой `cat .env` отдаёт секрет в вывод дословно.
 
 ## Что должно быть на машине, кроме `uv`
 

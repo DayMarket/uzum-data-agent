@@ -161,8 +161,9 @@ Personal Access Token или поставь `gh` (`brew install gh`, затем 
    профиля вообще — ни запрет на чтение `.env`/секретов, ни ограничение
    записи не действуют, а сессия при этом выглядит совершенно рабочей,
    никакого предупреждения не будет. Это подтверждено тестом
-   (`tests/test_codex_permissions.py::test_live_undeployed_config_gives_no_technical_protection`
-   — реальный `cat .env` без нашего профиля отдаёт секрет в вывод дословно).
+   (`tests/test_codex_permissions.py::test_live_deployed_profile_not_selected_by_dash_p_gives_no_protection`
+   — профиль лежит на месте, ровно как его положил `setup.sh`, запуск идёт
+   без `-p`, и реальный `cat .env` отдаёт секрет в вывод дословно).
    Для Claude Code голый `claude` работает сам по себе не так рискованно
    (разрешения лежат в `.claude/settings.json` и подхватываются им
    автоматически), но `uzum` в любом случае ещё и подгружает секреты в
