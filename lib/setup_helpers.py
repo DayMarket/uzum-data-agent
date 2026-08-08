@@ -7,10 +7,12 @@
 """
 import json
 import os
+import shlex
 import stat
 import time
 
 import envfile
+import hook_scope
 
 
 def write_env(path, values):
@@ -345,7 +347,7 @@ def deploy_codex_profile(generated_config_toml_path, codex_home_dir,
     return True, backed_up_to
 
 
-def codex_hook_definitions():
+def codex_hook_definitions(repo_root=None):
     """Наши записи для $CODEX_HOME/hooks.json — те же скрипты, что уже
     пишет Claude Code (.claude/hooks/log_event.py, .claude/hooks/
     log_session.py): lib/hook_payload.py и lib/transcript_codex.py уже
@@ -367,33 +369,67 @@ def codex_hook_definitions():
     не обе команды внутри одной. Так merge_codex_hooks остаётся
     идемпотентным при добавлении нового скрипта в будущем: сравнение идёт по
     значению записи, и уже лежащие на диске записи продолжают совпадать
+    Команда — АБСОЛЮТНЫЙ путь к скриптам того клона, который сейчас
+    ставится (`repo_root`, по умолчанию — корень клона, которому принадлежит
+    этот файл; setup.sh подключает lib именно из своего клона).
+
+    Раньше здесь стоял относительный путь (`python3 .claude/hooks/
+    log_event.py`) — и этот докстринг утверждал, что в чужом проекте файла по
+    такому пути не окажется, хук "тихо не сработает", и это и есть желаемое
+    поведение. Живой запуск это ОПРОВЕРГ (docs/codex-facts.md, раздел 11).
+    hooks.json у Codex — файл на весь $CODEX_HOME, общий для ВСЕХ проектов,
+    которые аналитик когда-либо откроет в Codex (в отличие от профиля
+    config.toml выше, который подключается явно флагом -p). В постороннем
+    каталоге, где `.claude/hooks/` нет, отсутствие файла даёт не тишину, а
+    `python3` с ненулевым кодом возврата, и Codex читает это как отказ хука:
+
+        hook: SessionStart Failed
+        hook: UserPromptSubmit Blocked
+
+    `Blocked` на UserPromptSubmit означает, что промпт не доходит до модели
+    вообще: аналитик ставит наш инструмент и получает нерабочий Codex во всех
+    остальных своих проектах.
+
+    Намерение осталось прежним — хуки работают в нашем репозитории и не
+    вмешиваются больше нигде, — но выражено оно теперь там, где может быть
+    выражено честно: абсолютный путь гарантирует, что файл на месте и
+    ненулевого кода не будет, а «не наша сессия» скрипты определяют сами и
+    выходят нулём мгновенно и молча (lib/hook_scope.py; тот же признак —
+    рабочий каталог — работает и для Claude Code, где он безвредный no-op).
+    Абсолютные пути в $CODEX_HOME/hooks.json — уже сложившаяся практика:
+    посторонний инструмент, прописавший туда себя, использует именно их.
+
+    shlex.quote — потому что команда исполняется шеллом, а путь к клону
+    аналитика может содержать пробел (`~/My Projects/uzum-data-agent`).
+    Машинно-зависимый путь остаётся только в $CODEX_HOME/hooks.json, которого
+    нет в git.
+
+    Значение на событие — СПИСОК записей, а не одна: у SessionStart их две
+    (телеметрия и обновление репозитория), и по одному скрипту на запись, а
+    не обе команды внутри одной. Так merge_codex_hooks остаётся
+    идемпотентным при добавлении нового скрипта в будущем: сравнение идёт по
+    значению записи, и уже лежащие на диске записи продолжают совпадать
     вместо того, чтобы удвоиться.
 
-    Команда — ОТНОСИТЕЛЬНЫЙ путь, не абсолютный, и это осознанный выбор, не
-    недосмотр: hooks.json у Codex — файл на весь $CODEX_HOME, общий для
-    ВСЕХ проектов, которые аналитик когда-либо откроет в Codex, а не
-    только для этого репозитория (в отличие от профиля config.toml выше,
-    который подключается явно флагом -p и поэтому безопасно "виден" только
-    тем, кто его явно запросил). Абсолютный путь заставил бы наш
-    hook-скрипт запускаться в КАЖДОЙ чужой сессии Codex на диске аналитика
-    и писать в нашу телеметрию чужую, не относящуюся к uzum-data-agent
-    работу. Относительный путь резолвится от рабочего каталога процесса
-    `codex` (docs/codex-facts.md, раздел 8) — bin/uzum всегда делает `cd` в
-    корень репозитория перед запуском движка, поэтому для сессий,
-    запущенных через `uzum`, путь резолвится верно; для сессий Codex в
-    ДРУГИХ проектах файла по этому относительному пути просто не будет —
-    хук тихо не сработает, и это и есть желаемое поведение (не наша
-    сессия, не наша телеметрия)."""
+    Смена команды меняет `trusted_hash` (docs/codex-facts.md, раздел 7):
+    у того, у кого Codex уже настроен, диалог «Hooks need review» появится
+    ещё раз. Это штатно — так же будет при любом переезде или переименовании
+    папки репозитория."""
+    root = repo_root or hook_scope.repo_root()
+
+    def hook_path(script):
+        return shlex.quote(os.path.join(root, ".claude", "hooks", script))
+
     def entry(command):
         return {"hooks": [{"type": "command", "command": command}]}
 
     def telemetry(script):
-        return entry("python3 .claude/hooks/%s" % script)
+        return entry("python3 %s" % hook_path(script))
 
     return {
         "SessionStart": [
             telemetry("log_session.py"),
-            entry("bash .claude/hooks/on_session_start.sh --plain"),
+            entry("bash %s --plain" % hook_path("on_session_start.sh")),
         ],
         "SessionEnd": [telemetry("log_session.py")],
         "UserPromptSubmit": [telemetry("log_event.py")],
@@ -420,12 +456,14 @@ def merge_codex_hooks(existing, new_entries):
     return merged
 
 
-def deploy_codex_hooks(codex_home_dir):
+def deploy_codex_hooks(codex_home_dir, repo_root=None):
     """Записать/дополнить $CODEX_HOME/hooks.json нашими хуками, не трогая
     чужие записи (см. докстринг раздела выше — на машине автора задачи там
     уже жил hooks.json стороннего инструмента). Битый существующий файл
     (не наш формат, не наша забота чинить) не роняет установку — честнее
     переписать его нашими хуками, чем упасть на разборе чужого JSON.
+    `repo_root` — корень клона, чьи скрипты прописываем (см.
+    codex_hook_definitions); по умолчанию наш собственный.
     Возвращает True, если файл реально изменился."""
     os.makedirs(codex_home_dir, exist_ok=True)
     path = os.path.join(codex_home_dir, "hooks.json")
@@ -438,7 +476,7 @@ def deploy_codex_hooks(codex_home_dir):
             existing = json.loads(current_text)
         except ValueError:
             existing = {}
-    merged = merge_codex_hooks(existing, codex_hook_definitions())
+    merged = merge_codex_hooks(existing, codex_hook_definitions(repo_root))
     new_text = json.dumps(merged, ensure_ascii=False, indent=2) + "\n"
     if current_text == new_text:
         return False

@@ -609,6 +609,103 @@ error: unexpected argument '-p' found
 
 ---
 
+## 11. Отсутствующий файл хука — не тишина, а `Blocked`; граница «наша сессия» — рабочий каталог
+
+> Дозапрошено по дефекту «хуки Codex ломают все остальные проекты аналитика». Проверено живым запуском 08.08.2026, codex-cli 0.147.0 и Claude Code 2.1.220, изолированный `CODEX_HOME` во временной папке (скопирован только `auth.json`), временные каталоги — рабочий `~/.codex` и рабочий репозиторий не участвовали.
+
+### Факт 1: относительный путь в `hooks.json` ломает чужие сессии Codex — опровергнутое предположение
+
+`lib/setup_helpers.py::codex_hook_definitions()` регистрировал хуки относительным путём (`python3 .claude/hooks/log_event.py`), и его докстринг утверждал: «для сессий Codex в других проектах файла по этому относительному пути просто не будет — хук тихо не сработает, и это и есть желаемое поведение». Это было предположение, не факт.
+
+`hooks.json` изолированного `CODEX_HOME` — ровно то, что генерировал код на коммите `168268c`; запуск в постороннем каталоге, где `.claude/hooks/` нет:
+
+```
+$ CODEX_HOME=<изолированный> codex exec --skip-git-repo-check --dangerously-bypass-hook-trust \
+    "Ответь ровно одним словом: ПРИВЕТ. Не запускай никаких команд." </dev/null
+...
+user
+Ответь ровно одним словом: ПРИВЕТ. Не запускай никаких команд.
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart Failed
+hook: SessionStart Failed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Blocked
+```
+
+Ответа нет вообще — сессия обрывается на `UserPromptSubmit Blocked`. Причина: `python3` не находит файл и завершается ненулевым кодом, а ненулевой код на `UserPromptSubmit` Codex трактует как блокировку промпта. `SessionStart Failed` сессию не рушит, но тоже шумит. Практический смысл: аналитик, поставивший наш инструмент, получал нерабочий Codex во **всех остальных** своих проектах — `hooks.json` один на весь `$CODEX_HOME`.
+
+### Факт 2: рабочий каталог процесса хука == `payload["cwd"]` == каталог сессии — у обоих движков
+
+Хук-зонд (абсолютный путь, дописывает в файл `payload`, `os.getcwd()` и окружение), все четыре события, которые мы регистрируем.
+
+**Codex 0.147.0**, запуск в постороннем каталоге `.../hookscope/foreign`:
+
+| Событие | `payload["cwd"]` | `os.getcwd()` хука |
+|---|---|---|
+| SessionStart | `.../hookscope/foreign` | `.../hookscope/foreign` |
+| UserPromptSubmit | `.../hookscope/foreign` | `.../hookscope/foreign` |
+| PostToolUse | `.../hookscope/foreign` | `.../hookscope/foreign` |
+| SessionEnd | `.../hookscope/foreign` | `.../hookscope/foreign` |
+
+То же значение стоит в баннере сессии (`workdir:`) и в переменной `PWD`. Уточнение к разделу 2: `cwd` приходит у Codex в **каждом** из четырёх событий, включая `SessionEnd` (там был приведён сокращённый JSON).
+
+**Claude Code 2.1.220**, те же четыре события во временном проекте: `payload["cwd"]` == `os.getcwd()` == `CLAUDE_PROJECT_DIR` == корень проекта. То есть для Claude Code проверка «рабочий каталог внутри нашего корня» — безвредный no-op: его хуки и так живут в `.claude/settings.json` своего проекта.
+
+Никакой переменной окружения вида `CODEX_PROJECT_DIR` у Codex в окружении хука нет — только `CODEX_HOME`. Опираться на окружение не на что, опора — рабочий каталог.
+
+### Факт 3: абсолютный путь + собственная проверка внутри скриптов — чужие сессии целы, своя работает
+
+`hooks.json` с абсолютными путями к скриптам клона, лежащего **не** по рабочему пути (`.../hookscope/clone`), скрипты — с проверкой из `lib/hook_scope.py`.
+
+Посторонний каталог (`.../hookscope/foreign`), тот же промпт, что и в факте 1:
+
+```
+hook: SessionStart
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+codex
+ПРИВЕТ
+```
+
+`Blocked` нет, `Failed` нет, промпт дошёл до модели, ответ получен. В очереди телеметрии (`UZUM_STATE_DIR`) — пусто: чужая сессия в наши данные не попала.
+
+Клон нашего репозитория по другому пути (`.../hookscope/clone`, не `~/Desktop/uzum-data-agent`), тот же изолированный `CODEX_HOME`, промпт с одной shell-командой:
+
+```
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart Completed
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+...
+hook: PostToolUse
+hook: PostToolUse Completed
+```
+
+В очереди телеметрии (ClickHouse намеренно недоступен, `127.0.0.1:1`) — три строки одной и той же сессии:
+
+```
+ai_usage_events   | event_type=UserPromptSubmit           engine=codex
+ai_usage_events   | event_type=PostToolUse tool_name=Bash engine=codex
+ai_usage_sessions | n_prompts=1 n_tools=1 duration_s=5    engine=codex
+```
+
+То есть путь «сессия наша» не пострадал: и пошаговые события, и итоговая строка сессии на месте.
+
+Тот же клон под Claude Code (`claude -p`, хуки из `.claude/settings.json`) — те же три строки, с `engine=claude`. Проверка ничего не сломала и на этой стороне.
+
+### Границы (не выдаю за большее, чем есть)
+
+- Оба движка проверялись в неинтерактивном режиме (`codex exec` с `--dangerously-bypass-hook-trust`, `claude -p`). Интерактивный TUI на этом дефекте отдельно не гонял: механизм доверия разобран в разделе 7 и от содержимого хука не зависит.
+- `cwd` снят для четырёх событий, которые мы регистрируем. Остальные события Codex (`PreToolUse`, `Stop`, `PreCompact`, …) на предмет наличия `cwd` не проверялись.
+- Поведение при `codex resume`/`fork` и в десктопном `codex app` не проверялось — как и в разделе 7.
+- Побочное наблюдение, не факт про Codex: `claude -p`, запущенный из подкаталога временного проекта, хуки из `.claude/settings.json` корня проекта не подхватил вовсе (ни одного события в зонде), даже когда корень был git-репозиторием; из самого корня — подхватил все четыре. Причину не выяснял, к этому дефекту отношения не имеет.
+
+---
+
 ## Что проверить не удалось (и почему)
 
 | Что | Почему не проверено |

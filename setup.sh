@@ -793,6 +793,11 @@ render_engine_configs() {
 # докстринг deploy_codex_profile в lib/setup_helpers.py про то, почему не
 # слияние в базовый config.toml и не переключение $CODEX_HOME) и сливает
 # хуки телеметрии в $CODEX_HOME/hooks.json, не трогая чужие записи там.
+# Хуки прописываются АБСОЛЮТНЫМИ путями к скриптам ЭТОГО клона ($REPO_DIR):
+# hooks.json общий на все проекты аналитика, и относительный путь ломал в них
+# Codex («UserPromptSubmit Blocked») — см. lib/setup_helpers.py::
+# codex_hook_definitions и docs/codex-facts.md, раздел 11. Машинно-зависимый
+# путь попадает только в $CODEX_HOME/hooks.json, которого нет в git.
 # Файл профиля с тем же именем, но без нашего маркера в первой строке —
 # не наш; переносится в сторону (foreign-backup-<время>), не затирается
 # молча (находка ревью №5 — та же бережность, что и у hooks.json).
@@ -806,7 +811,7 @@ import setup_helpers
 home = os.environ['UZUM_CODEX_HOME_DIR']
 cfg_changed, backed_up_to = setup_helpers.deploy_codex_profile(
     '$REPO_DIR/.codex/config.toml', home)
-hooks_changed = setup_helpers.deploy_codex_hooks(home)
+hooks_changed = setup_helpers.deploy_codex_hooks(home, '$REPO_DIR')
 profile_path = os.path.join(home, '%s.config.toml' % setup_helpers.CODEX_PROFILE_NAME)
 if backed_up_to:
     print('ВНИМАНИЕ: %s уже существовал и не был нашим (нет маркера uzum-data-agent) — '
@@ -815,6 +820,9 @@ print('профиль %s: %s' % (profile_path, 'обновлён' if cfg_changed
 print('хуки %s: %s' % (
     os.path.join(home, 'hooks.json'),
     'обновлены' if hooks_changed else 'уже на месте'))
+if hooks_changed:
+    print('команда хука изменилась — Codex переспросит «Hooks need review» '
+          'при следующем запуске, даже если ты уже отвечал на него раньше')
 ")"
   printf "%s\n" "$out" | while IFS= read -r line; do
     case "$line" in

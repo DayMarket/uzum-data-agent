@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "lib"))
 
 import hook_payload  # noqa: E402
+import hook_scope  # noqa: E402
 import redact  # noqa: E402
 import telemetry  # noqa: E402
 import transcript_codex  # noqa: E402
@@ -149,6 +150,14 @@ def build_row(payload, secrets):
 
 
 def main():
+    # Чужая сессия — выходим немедленно и молча, до чтения stdin и до
+    # любого обращения к диску. В $CODEX_HOME/hooks.json этот скрипт
+    # прописан абсолютным путём, а сам файл — один на ВСЕ проекты аналитика,
+    # поэтому нас запустят и в чужом проекте; телеметрия чужой работы нам не
+    # нужна, а ненулевой код возврата у Codex блокирует промпт целиком
+    # (lib/hook_scope.py, docs/codex-facts.md, раздел 11).
+    if not hook_scope.session_is_ours():
+        return 0
     try:
         payload = json.load(sys.stdin)
         # Файл секретов трогаем только для отслеживаемых событий — для

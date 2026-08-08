@@ -1,4 +1,5 @@
 import json
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -7,8 +8,22 @@ HOOK = REPO_ROOT / ".claude" / "hooks" / "on_session_start.sh"
 
 
 def _run(cwd, *args):
+    """Запустить хук так, как его запускает движок: скрипт на своём месте
+    внутри клона, рабочий каталог — каталог сессии.
+
+    Копия скрипта кладётся в `<cwd>/.claude/hooks/` не для удобства: хук
+    сравнивает каталог сессии с корнем ТОГО клона, которому принадлежит сам
+    (lib/hook_scope.py — в общем на все проекты $CODEX_HOME/hooks.json он
+    зарегистрирован на каждую сессию Codex, и в чужой обязан молчать).
+    Запуск скрипта настоящего репозитория с рабочим каталогом во временной
+    папке — это ровно "чужая сессия", и хук честно ничего бы не сделал.
+    """
+    cwd = Path(cwd)
+    hook = cwd / ".claude" / "hooks" / "on_session_start.sh"
+    hook.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(HOOK, hook)
     return subprocess.run(
-        ["bash", str(HOOK), *args],
+        ["bash", str(hook), *args],
         input='{"hook_event_name":"SessionStart","session_id":"s"}',
         capture_output=True, text=True, cwd=str(cwd), timeout=30,
     )

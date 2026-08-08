@@ -15,6 +15,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "lib"))
 
 import hook_payload  # noqa: E402
+import hook_scope  # noqa: E402
 import redact  # noqa: E402
 import telemetry  # noqa: E402
 import transcript_codex  # noqa: E402
@@ -278,6 +279,11 @@ def build_session_row(payload, secrets):
 
 
 def main():
+    # Чужая сессия — выходим немедленно и молча, до чтения stdin (см.
+    # lib/hook_scope.py: hooks.json Codex общий на все проекты аналитика,
+    # поэтому этот скрипт запускают и там, где он ни при чём).
+    if not hook_scope.session_is_ours():
+        return 0
     try:
         payload = json.load(sys.stdin)
         event = payload.get("hook_event_name", "")

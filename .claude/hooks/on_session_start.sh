@@ -15,6 +15,18 @@
 #                   docs/codex-facts.md, раздел 9).
 set -uo pipefail
 
+# Чужая сессия — молча выходим нулём, до всего остального. Тот же признак,
+# что и у python-хуков (lib/hook_scope.py): рабочий каталог сессии внутри
+# корня того клона, которому принадлежит этот скрипт. Здесь это не только
+# про телеметрию: без проверки хук, зарегистрированный в общем на все
+# проекты $CODEX_HOME/hooks.json, делал бы `git pull` в чужом репозитории
+# аналитика.
+HOOK_ROOT=$(cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd -P) || exit 0
+case "$(pwd -P)" in
+  "$HOOK_ROOT"|"$HOOK_ROOT"/*) ;;
+  *) exit 0 ;;
+esac
+
 FORMAT="claude"
 if [ "${1:-}" = "--plain" ]; then
   FORMAT="plain"

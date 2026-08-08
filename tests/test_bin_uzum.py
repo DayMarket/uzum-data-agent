@@ -39,8 +39,8 @@ def _stub_engine(path):
 
 def _make_repo(tmp_path, broken_helper=False):
     """Минимальная копия репозитория, достаточная для запуска bin/uzum:
-    сам bin/uzum и lib/setup_helpers.py (+ envfile.py, от которого
-    setup_helpers.py зависит на уровне импорта)."""
+    сам bin/uzum и lib/setup_helpers.py (+ envfile.py и hook_scope.py, от
+    которых setup_helpers.py зависит на уровне импорта)."""
     repo = tmp_path / "repo"
     (repo / "bin").mkdir(parents=True)
     (repo / "lib").mkdir(parents=True)
@@ -59,6 +59,7 @@ def _make_repo(tmp_path, broken_helper=False):
     else:
         shutil.copy(REPO_ROOT / "lib" / "setup_helpers.py", repo / "lib" / "setup_helpers.py")
         shutil.copy(REPO_ROOT / "lib" / "envfile.py", repo / "lib" / "envfile.py")
+        shutil.copy(REPO_ROOT / "lib" / "hook_scope.py", repo / "lib" / "hook_scope.py")
     return repo
 
 

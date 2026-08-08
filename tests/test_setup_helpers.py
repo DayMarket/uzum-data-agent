@@ -1,5 +1,7 @@
 import json
 import os
+import shlex
+from pathlib import Path
 
 import setup_helpers
 
@@ -350,10 +352,48 @@ def test_codex_hook_definitions_cover_the_engine_portable_events():
     defs = setup_helpers.codex_hook_definitions()
     assert set(defs) == {"SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse"}
     for command in _codex_hook_commands(defs):
-        # Путь до скрипта относительный, не абсолютный: hooks.json общий на
-        # весь $CODEX_HOME, и в чужих проектах наш хук просто не найдётся.
         assert ".claude/hooks/" in command
-        assert " /" not in command
+
+
+# ── Дефект: относительный путь в hooks.json ломал Codex в чужих проектах ──
+#
+# hooks.json — общий на весь $CODEX_HOME, то есть на ВСЕ проекты аналитика.
+# Пока путь в команде был относительным, в постороннем каталоге файла по
+# нему не оказывалось — и это не тишина, а ненулевой код возврата python3.
+# Живой запуск (docs/codex-facts.md, раздел 11):
+#     hook: SessionStart Failed
+#     hook: UserPromptSubmit Blocked
+# «Blocked» означает, что промпт не доходит до модели вообще: установка
+# нашего инструмента ломала аналитику Codex во всех остальных его проектах.
+# Файл теперь всегда на месте (абсолютный путь), а «не наша сессия»
+# решается внутри самих скриптов (lib/hook_scope.py, tests/test_hook_scope.py).
+
+def test_codex_hook_commands_point_at_this_clone_by_absolute_path(tmp_path):
+    root = str(tmp_path / "uzum-data-agent")
+    for command in _codex_hook_commands(setup_helpers.codex_hook_definitions(root)):
+        assert os.path.join(root, ".claude", "hooks") in command
+        # Относительного пути не осталось нигде: в чужом проекте команда
+        # обязана найти файл и завершиться нулём, а не упасть.
+        assert " .claude/hooks/" not in command
+
+
+def test_codex_hook_commands_quote_a_path_with_spaces(tmp_path):
+    """Путь к клону аналитика может содержать пробел (`~/My Projects/...`),
+    а команда хука исполняется шеллом — без кавычек она распалась бы на два
+    аргумента и хук падал бы уже у нас, в нашем же репозитории."""
+    root = str(tmp_path / "My Projects" / "uzum-data-agent")
+    for command in _codex_hook_commands(setup_helpers.codex_hook_definitions(root)):
+        script = [a for a in shlex.split(command) if a.endswith((".py", ".sh"))]
+        assert script == [
+            os.path.join(root, ".claude", "hooks", os.path.basename(script[0]))
+        ], command
+
+
+def test_codex_hook_definitions_default_to_our_own_clone():
+    """По умолчанию — корень того клона, откуда setup.sh подключил lib."""
+    expected = str(Path(setup_helpers.__file__).resolve().parent.parent)
+    for command in _codex_hook_commands(setup_helpers.codex_hook_definitions()):
+        assert expected in command
 
 
 def test_codex_session_start_updates_the_repository_too_not_only_telemetry():
@@ -397,7 +437,7 @@ def test_merge_codex_hooks_preserves_foreign_hooks_untouched():
     # Чужой SessionStart-хук на месте, наш добавлен рядом, не вместо.
     session_start_commands = [h["hooks"][0]["command"] for h in merged["hooks"]["SessionStart"]]
     assert "some-other-tool-notify.sh" in session_start_commands
-    assert any(c.startswith("python3 .claude/hooks/") for c in session_start_commands)
+    assert any("log_session.py" in c for c in session_start_commands)
     # Событие, которое мы вообще не трогаем (Stop), осталось как было.
     assert merged["hooks"]["Stop"] == foreign["hooks"]["Stop"]
 
