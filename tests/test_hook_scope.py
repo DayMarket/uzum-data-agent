@@ -7,9 +7,10 @@
 `UserPromptSubmit Blocked`, то есть промпт не доходит до модели вообще
 (docs/codex-facts.md, раздел 11).
 """
-import os
+import json
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import hook_scope
@@ -73,14 +74,18 @@ def _run_hook(command, cwd, payload):
 
 
 def _fake_clone(tmp_path):
-    """Клон-двойник: тот же скрипт хука на своём месте внутри временного
-    каталога. Проверять «внутри клона» на настоящем репозитории нельзя —
-    хук делает `git pull`, то есть тест лез бы в сеть и в рабочее дерево
-    разработчика."""
+    """Клон-двойник: те же скрипты хуков и та же lib на своих местах внутри
+    временного каталога. Проверять «внутри клона» на настоящем репозитории
+    нельзя — SessionStart-хук делает `git pull`, то есть тест лез бы в сеть и
+    в рабочее дерево разработчика."""
     root = tmp_path / "clone"
     (root / ".claude" / "hooks").mkdir(parents=True)
-    shutil.copy2(HOOKS_DIR / "on_session_start.sh",
-                 root / ".claude" / "hooks" / "on_session_start.sh")
+    (root / "lib").mkdir()
+    for script in HOOKS_DIR.glob("*"):
+        if script.is_file():
+            shutil.copy2(script, root / ".claude" / "hooks" / script.name)
+    for module in (REPO_ROOT / "lib").glob("*.py"):
+        shutil.copy2(module, root / "lib" / module.name)
     subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
     return root
 
@@ -108,12 +113,134 @@ def test_hooks_work_from_a_subdirectory_of_the_clone(tmp_path):
     assert result.stdout.strip() != ""
 
 
-def test_guard_is_a_noop_for_claude_code():
+# ── Положительная сторона у python-хуков: строка ДОЛЖНА записаться ────────
+#
+# Находка повторного ревью: у on_session_start.sh было и «молчит в чужом», и
+# «работает в своём», а у log_event.py/log_session.py — только первое. Мутант
+# «граница режет всё» ронял 4 теста из 294 и ни одного в test_log_event.py,
+# то есть телеметрию можно было выключить целиком, не уронив её тесты.
+# Проверяем сквозь весь скрипт, с настоящей записью в очередь.
+
+A_CLAUDE_TRANSCRIPT = "/Users/x/.claude/projects/slug/s.jsonl"
+A_CODEX_TRANSCRIPT = "/x/sessions/2026/08/08/rollout-2026-08-08T00-00-00-s.jsonl"
+
+
+def _payload(event, transcript, **extra):
+    data = {"hook_event_name": event, "session_id": "s",
+            "transcript_path": transcript}
+    data.update(extra)
+    return json.dumps(data)
+
+
+def _run_hook_in_clone(root, script, payload, telemetry_queue, cwd=None):
+    return subprocess.run(
+        [sys.executable, str(root / ".claude" / "hooks" / script)],
+        cwd=str(cwd or root), input=payload, env=telemetry_queue.env,
+        capture_output=True, text=True, timeout=60)
+
+
+def test_log_event_records_a_step_of_our_own_session(tmp_path, telemetry_queue):
+    root = _fake_clone(tmp_path)
+    result = _run_hook_in_clone(
+        root, "log_event.py",
+        _payload("PostToolUse", A_CODEX_TRANSCRIPT, tool_name="Bash"),
+        telemetry_queue)
+
+    assert result.returncode == 0, result.stderr
+    tables = [table for table, _ in telemetry_queue.rows()]
+    assert tables == ["ai_usage_events"], telemetry_queue.rows()
+    row = telemetry_queue.rows()[0][1]
+    assert row["tool_name"] == "Bash"
+    assert row["engine"] == "codex"
+
+
+def test_log_session_records_the_session_row_of_our_own_session(tmp_path, telemetry_queue):
+    root = _fake_clone(tmp_path)
+    transcript = tmp_path / "rollout-2026-08-08T00-00-00-s.jsonl"
+    transcript.write_text("", encoding="utf-8")
+    result = _run_hook_in_clone(
+        root, "log_session.py",
+        _payload("SessionEnd", str(transcript)), telemetry_queue)
+
+    assert result.returncode == 0, result.stderr
+    tables = [table for table, _ in telemetry_queue.rows()]
+    assert tables == ["ai_usage_sessions"], telemetry_queue.rows()
+
+
+def test_guard_lets_claude_code_through(tmp_path, telemetry_queue):
     """У Claude Code хуки регистрируются в .claude/settings.json своего
     проекта, поэтому рабочий каталог хука — всегда корень проекта (проверено
     живым запуском, docs/codex-facts.md, раздел 11: getcwd == payload["cwd"]
-    == CLAUDE_PROJECT_DIR). Проверка обязана быть для него безвредной.
+    == CLAUDE_PROJECT_DIR). Граница обязана быть для него безвредной — и это
+    проверяется сквозным прогоном с payload'ом Claude Code, а не сравнением
+    корня с самим собой."""
+    root = _fake_clone(tmp_path)
+    result = _run_hook_in_clone(
+        root, "log_event.py",
+        _payload("PostToolUse", A_CLAUDE_TRANSCRIPT, tool_name="Bash",
+                 duration_ms=51),
+        telemetry_queue, cwd=root / "lib")
+
+    assert result.returncode == 0, result.stderr
+    rows = telemetry_queue.rows()
+    assert [table for table, _ in rows] == ["ai_usage_events"], rows
+    assert rows[0][1]["engine"] == "claude"
+    assert rows[0][1]["duration_ms"] == 51
+
+
+# ── Находка повторного ревью: рабочего каталога может не быть на диске ────
+#
+# Аналитик сидит в work/OE-1234, каталог исчезает (переключение ветки,
+# `git clean`, `rm -rf` в соседнем окне). os.getcwd() кидает FileNotFoundError,
+# и до этой правки хук отвечал кодом 1 с трейсбеком — то есть тем же
+# `UserPromptSubmit Blocked`, ради которого всё и делалось, только с другого
+# входа. Обещание из заголовка обоих скриптов — «всегда завершается с кодом
+# 0» — обязано держаться и здесь.
+
+def _run_from_a_vanished_directory(command, tmp_path, payload):
+    """Запустить команду с рабочим каталогом, которого уже нет.
+
+    Каталог удаляется изнутри самого процесса, после того как он в нём
+    оказался: снаружи так не сделать — subprocess требует существующий cwd на
+    момент запуска.
     """
-    assert hook_scope.session_is_ours(str(REPO_ROOT), str(REPO_ROOT)) is True
-    assert hook_scope.session_is_ours(os.path.join(str(REPO_ROOT), "lib"),
-                                      str(REPO_ROOT)) is True
+    doomed = tmp_path / "work" / "OE-1234"
+    doomed.mkdir(parents=True)
+    script = " ".join(['rm -rf "$1";', 'shift;', 'exec "$@"'])
+    return subprocess.run(
+        ["bash", "-c", script, "_", str(doomed), *command],
+        cwd=str(doomed), input=payload, capture_output=True, text=True,
+        timeout=60)
+
+
+def test_log_event_survives_a_vanished_working_directory(tmp_path):
+    result = _run_from_a_vanished_directory(
+        [sys.executable, str(HOOKS_DIR / "log_event.py")], tmp_path,
+        _payload("UserPromptSubmit", A_CODEX_TRANSCRIPT))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+
+
+def test_log_session_survives_a_vanished_working_directory(tmp_path):
+    result = _run_from_a_vanished_directory(
+        [sys.executable, str(HOOKS_DIR / "log_session.py")], tmp_path,
+        _payload("SessionStart", A_CODEX_TRANSCRIPT))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stderr == ""
+
+
+def test_session_start_survives_a_vanished_working_directory(tmp_path):
+    """Bash-реализация той же границы обязана деградировать так же: код 0 и
+    ни своей строчки в выводе.
+
+    Единственное, что остаётся в stderr, — приветственное `shell-init: error
+    retrieving current directory` самого bash: оно печатается при старте
+    интерпретатора, до первой строки скрипта, и повлиять на него скрипт не
+    может. Проверяем то, что в нашей власти: ни `pwd:`, ни вывода git."""
+    result = _run_from_a_vanished_directory(
+        ["bash", str(HOOKS_DIR / "on_session_start.sh"), "--plain"], tmp_path,
+        _payload("SessionStart", A_CODEX_TRANSCRIPT))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert "pwd:" not in result.stderr, result.stderr
+    assert "git" not in result.stderr, result.stderr

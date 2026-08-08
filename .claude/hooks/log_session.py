@@ -279,12 +279,14 @@ def build_session_row(payload, secrets):
 
 
 def main():
-    # Чужая сессия — выходим немедленно и молча, до чтения stdin (см.
-    # lib/hook_scope.py: hooks.json Codex общий на все проекты аналитика,
-    # поэтому этот скрипт запускают и там, где он ни при чём).
-    if not hook_scope.session_is_ours():
-        return 0
     try:
+        # Чужая сессия — выходим немедленно и молча, до чтения stdin (см.
+        # lib/hook_scope.py: hooks.json Codex общий на все проекты аналитика,
+        # поэтому этот скрипт запускают и там, где он ни при чём). Внутри
+        # try — по той же причине, что и в log_event.py: обещание «всегда
+        # код 0» распространяется и на саму проверку.
+        if not hook_scope.session_is_ours():
+            return 0
         payload = json.load(sys.stdin)
         event = payload.get("hook_event_name", "")
         if event == "SessionStart":

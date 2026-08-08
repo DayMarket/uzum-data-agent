@@ -1,6 +1,7 @@
 import json
 import os
 import shlex
+import subprocess
 from pathlib import Path
 
 import setup_helpers
@@ -383,10 +384,13 @@ def test_codex_hook_commands_quote_a_path_with_spaces(tmp_path):
     аргумента и хук падал бы уже у нас, в нашем же репозитории."""
     root = str(tmp_path / "My Projects" / "uzum-data-agent")
     for command in _codex_hook_commands(setup_helpers.codex_hook_definitions(root)):
-        script = [a for a in shlex.split(command) if a.endswith((".py", ".sh"))]
-        assert script == [
-            os.path.join(root, ".claude", "hooks", os.path.basename(script[0]))
-        ], command
+        # shlex.split разбирает команду так же, как это сделает шелл: путь
+        # обязан остаться ОДНИМ аргументом, а не распасться на два.
+        script = {a for a in shlex.split(command) if a.endswith((".py", ".sh"))}
+        assert len(script) == 1, command
+        path = script.pop()
+        assert path == os.path.join(root, ".claude", "hooks",
+                                    os.path.basename(path)), command
 
 
 def test_codex_hook_definitions_default_to_our_own_clone():
@@ -394,6 +398,44 @@ def test_codex_hook_definitions_default_to_our_own_clone():
     expected = str(Path(setup_helpers.__file__).resolve().parent.parent)
     for command in _codex_hook_commands(setup_helpers.codex_hook_definitions()):
         assert expected in command
+
+
+# ── Находка повторного ревью: абсолютный путь на исчезнувший клон ─────────
+#
+# Абсолютный путь гарантирует, что файл будет найден, только пока папка
+# репозитория на месте. Аналитик её переносит, переименовывает или удаляет —
+# $CODEX_HOME/hooks.json не меняется (его пишет только setup.sh, bin/uzum
+# хуки не передеплоивает), и мы возвращаемся к тому же `UserPromptSubmit
+# Blocked`, только через другой вход и уже во ВСЕХ проектах разом, включая
+# сам переехавший репозиторий — то есть починить изнутри инструмента нельзя.
+# Поэтому команда обёрнута в `test -f … && exec … || exit 0`.
+
+def test_codex_hook_command_exits_zero_when_the_clone_is_gone(tmp_path):
+    """Запускаем команду ровно так, как её запускает Codex — через шелл."""
+    gone = str(tmp_path / "переехавший клон")
+    for command in _codex_hook_commands(setup_helpers.codex_hook_definitions(gone)):
+        result = subprocess.run(["sh", "-c", command], input="{}",
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, command
+        assert result.stdout == "", command
+        assert result.stderr == "", command
+
+
+def test_codex_hook_command_still_runs_the_script_that_is_in_place(tmp_path):
+    """Обратная сторона: пока файл на месте, обёртка обязана его запустить, а
+    не съесть. Скрипт-двойник печатает метку — её и ищем."""
+    root = tmp_path / "clone"
+    hooks = root / ".claude" / "hooks"
+    hooks.mkdir(parents=True)
+    for script in ("log_session.py", "log_event.py", "on_session_start.sh"):
+        (hooks / script).write_text("print('запущен')\n" if script.endswith(".py")
+                                    else "echo запущен\n", encoding="utf-8")
+
+    for command in _codex_hook_commands(setup_helpers.codex_hook_definitions(str(root))):
+        result = subprocess.run(["sh", "-c", command], input="{}",
+                                capture_output=True, text=True, timeout=30)
+        assert result.returncode == 0, command
+        assert result.stdout.strip() == "запущен", command
 
 
 def test_codex_session_start_updates_the_repository_too_not_only_telemetry():

@@ -34,60 +34,37 @@ A_CODEX_PAYLOAD = (
 )
 
 
-def _telemetry_env(state_dir):
-    """Окружение, в котором телеметрия ВКЛЮЧЕНА, но уходит не в сеть, а в
-    локальную очередь: 127.0.0.1:1 — гарантированный отказ соединения, после
-    которого lib/telemetry.write() кладёт строку файлом в очередь. Так
-    «хук ничего не записал» становится проверяемым фактом, а не догадкой по
-    пустому stdout: если бы граница не работала, в очереди лежала бы строка
-    чужой сессии."""
-    return {
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-        "HOME": str(state_dir),
-        "UZUM_STATE_DIR": str(state_dir),
-        "TELEMETRY_CH_HOST": "127.0.0.1",
-        "TELEMETRY_CH_PORT": "1",
-    }
-
-
-def _queued_rows(state_dir):
-    queue = Path(state_dir) / "queue"
-    if not queue.exists():
-        return []
-    return sorted(p.name for p in queue.iterdir())
-
-
-def _run_in_foreign_dir(tmp_path, command, payload):
+def _run_in_foreign_dir(tmp_path, command, payload, telemetry_queue):
+    """Телеметрия здесь не отключена, а направлена в локальную очередь
+    (фикстура telemetry_queue): «хук ничего не записал» — проверяемый факт,
+    а не догадка по пустому stdout."""
     foreign = tmp_path / "some-other-project"
     foreign.mkdir()
-    state = tmp_path / "state"
-    state.mkdir()
-    result = subprocess.run(command, cwd=str(foreign), input=payload,
-                            env=_telemetry_env(state), capture_output=True,
-                            text=True, timeout=60)
-    return result, state, foreign
+    return subprocess.run(command, cwd=str(foreign), input=payload,
+                          env=telemetry_queue.env, capture_output=True,
+                          text=True, timeout=60)
 
 
-def test_log_event_writes_nothing_in_a_foreign_project(tmp_path):
-    result, state, _ = _run_in_foreign_dir(
+def test_log_event_writes_nothing_in_a_foreign_project(tmp_path, telemetry_queue):
+    result = _run_in_foreign_dir(
         tmp_path, [sys.executable, str(HOOKS_DIR / "log_event.py")],
-        A_CODEX_PAYLOAD % "UserPromptSubmit")
+        A_CODEX_PAYLOAD % "UserPromptSubmit", telemetry_queue)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     assert result.stderr == ""
-    assert _queued_rows(state) == [], "чужая сессия попала в нашу телеметрию"
+    assert telemetry_queue.rows() == [], "чужая сессия попала в нашу телеметрию"
 
 
-def test_log_session_writes_nothing_in_a_foreign_project(tmp_path):
-    result, state, _ = _run_in_foreign_dir(
+def test_log_session_writes_nothing_in_a_foreign_project(tmp_path, telemetry_queue):
+    result = _run_in_foreign_dir(
         tmp_path, [sys.executable, str(HOOKS_DIR / "log_session.py")],
-        A_CODEX_PAYLOAD % "SessionEnd")
+        A_CODEX_PAYLOAD % "SessionEnd", telemetry_queue)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     assert result.stderr == ""
-    assert _queued_rows(state) == [], "чужая сессия попала в нашу телеметрию"
+    assert telemetry_queue.rows() == [], "чужая сессия попала в нашу телеметрию"
 
 
 def test_session_start_does_not_touch_a_foreign_repository(tmp_path):

@@ -364,11 +364,6 @@ def codex_hook_definitions(repo_root=None):
     дословно. Поэтому скрипт зарегистрирован и здесь — с флагом `--plain`,
     который переключает вывод с Claude-формата на обычный текст.
 
-    Значение на событие — СПИСОК записей, а не одна: у SessionStart их две
-    (телеметрия и обновление репозитория), и по одному скрипту на запись, а
-    не обе команды внутри одной. Так merge_codex_hooks остаётся
-    идемпотентным при добавлении нового скрипта в будущем: сравнение идёт по
-    значению записи, и уже лежащие на диске записи продолжают совпадать
     Команда — АБСОЛЮТНЫЙ путь к скриптам того клона, который сейчас
     ставится (`repo_root`, по умолчанию — корень клона, которому принадлежит
     этот файл; setup.sh подключает lib именно из своего клона).
@@ -404,6 +399,19 @@ def codex_hook_definitions(repo_root=None):
     Машинно-зависимый путь остаётся только в $CODEX_HOME/hooks.json, которого
     нет в git.
 
+    `test -f … && exec … || exit 0` — потому что абсолютный путь сам по себе
+    не гарантирует, что файл на месте (находка повторного ревью). Аналитик
+    может перенести, переименовать или удалить папку репозитория:
+    $CODEX_HOME/hooks.json при этом не меняется, `bin/uzum` его не
+    передеплоивает (это делает только setup.sh) — и мы возвращаемся ровно к
+    тому же `UserPromptSubmit Blocked`, только через другой вход, причём во
+    ВСЕХ проектах разом, включая сам переехавший репозиторий, то есть починить
+    изнутри инструмента уже нельзя. С этой обёрткой единственная точка отказа
+    исчезает: нет файла — шелл выходит нулём, ничего не напечатав. Проверено
+    живым запуском (docs/codex-facts.md, раздел 11): команда действительно
+    исполняется шеллом, `&&`/`||`/`exec` работают, `Blocked` не появляется.
+    `exec` — чтобы не плодить лишний процесс на каждое событие хука.
+
     Значение на событие — СПИСОК записей, а не одна: у SessionStart их две
     (телеметрия и обновление репозитория), и по одному скрипту на запись, а
     не обе команды внутри одной. Так merge_codex_hooks остаётся
@@ -413,23 +421,26 @@ def codex_hook_definitions(repo_root=None):
 
     Смена команды меняет `trusted_hash` (docs/codex-facts.md, раздел 7):
     у того, у кого Codex уже настроен, диалог «Hooks need review» появится
-    ещё раз. Это штатно — так же будет при любом переезде или переименовании
-    папки репозитория."""
+    ещё раз. Это штатно и происходит ровно тогда, когда команда реально
+    поменялась — то есть при обновлении этой функции и при `./setup.sh`,
+    запущенном из нового места. Сам по себе переезд папки hooks.json не
+    трогает: диалога не будет, хуки просто перестанут находить файл и
+    (благодаря `test -f`) молча выйдут нулём."""
     root = repo_root or hook_scope.repo_root()
 
-    def hook_path(script):
-        return shlex.quote(os.path.join(root, ".claude", "hooks", script))
-
-    def entry(command):
+    def entry(runner, script, args=""):
+        path = shlex.quote(os.path.join(root, ".claude", "hooks", script))
+        command = "test -f %s && exec %s %s%s || exit 0" % (
+            path, runner, path, args)
         return {"hooks": [{"type": "command", "command": command}]}
 
     def telemetry(script):
-        return entry("python3 %s" % hook_path(script))
+        return entry("python3", script)
 
     return {
         "SessionStart": [
             telemetry("log_session.py"),
-            entry("bash %s --plain" % hook_path("on_session_start.sh")),
+            entry("bash", "on_session_start.sh", " --plain"),
         ],
         "SessionEnd": [telemetry("log_session.py")],
         "UserPromptSubmit": [telemetry("log_event.py")],

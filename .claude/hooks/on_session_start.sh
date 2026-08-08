@@ -21,8 +21,16 @@ set -uo pipefail
 # про телеметрию: без проверки хук, зарегистрированный в общем на все
 # проекты $CODEX_HOME/hooks.json, делал бы `git pull` в чужом репозитории
 # аналитика.
-HOOK_ROOT=$(cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd -P) || exit 0
-case "$(pwd -P)" in
+#
+# 2>/dev/null у обоих `pwd -P` — не косметика: если рабочего каталога больше
+# нет на диске (аналитик сидел в work/<ключ>, каталог исчез при переключении
+# ветки или `git clean`), `pwd -P` пишет ошибку в stderr. Молча выйти нулём —
+# ровно то же поведение, что и у python-хуков в этом случае
+# (lib/hook_scope.py::session_is_ours), чтобы две реализации одной границы
+# не расходились.
+HOOK_ROOT=$(cd -- "$(dirname -- "$0")/../.." 2>/dev/null && pwd -P 2>/dev/null) || exit 0
+HOOK_CWD=$(pwd -P 2>/dev/null) || exit 0
+case "$HOOK_CWD" in
   "$HOOK_ROOT"|"$HOOK_ROOT"/*) ;;
   *) exit 0 ;;
 esac
