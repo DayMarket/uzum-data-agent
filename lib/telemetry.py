@@ -23,6 +23,8 @@ Asia/Tashkent) даст рассинхрон с тем, что реально п
 import datetime
 import json
 import os
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -65,20 +67,46 @@ class Config(object):
 
     @classmethod
     def from_env(cls):
-        host = os.environ.get("TELEMETRY_CH_HOST", "").strip()
+        """Куда и чем писать телеметрию.
+
+        По умолчанию — тот же складской ClickHouse (WMS), которым аналитик
+        уже пользуется: таблицы sandbox.ai_usage_* живут именно там, и
+        отдельного доступа для них не существует. Поэтому CH_WMS_* — не
+        «запасной вариант», а обычный путь, и мастер установки ничего про
+        телеметрию не спрашивает.
+
+        TELEMETRY_CH_* остаются как исключение и перебивают WMS
+        ПОКОЛОНОЧНО. Так задуман главный ожидаемый случай: у пилотной группы
+        прав INSERT в sandbox может не оказаться, и запись пойдёт отдельной
+        учёткой-писателем на том же хосте — тогда в secrets.env кладут
+        только TELEMETRY_CH_USER/TELEMETRY_CH_PASSWORD, а хост, порт и схему
+        соединения по-прежнему берут от WMS. Всё-или-ничего заставляло бы
+        переписывать все четыре значения ради двух и разъезжаться с WMS при
+        переезде кластера.
+        """
+        def value(name, fallback, default=""):
+            return (os.environ.get(name)
+                    or os.environ.get(fallback)
+                    or default).strip()
+
+        host = value("TELEMETRY_CH_HOST", "CH_WMS_HOST")
         state = os.environ.get(
             "UZUM_STATE_DIR",
             os.path.expanduser("~/.local/state/uzum-ai"),
         )
         return cls(
             host=host,
-            user=os.environ.get("TELEMETRY_CH_USER", ""),
-            password=os.environ.get("TELEMETRY_CH_PASSWORD", ""),
+            # Пароль не .strip(): в нём пробел по краям — законный символ,
+            # а не форматирование. Логин и хост чистим (их печатали руками
+            # в мастере), пароль берём как есть.
+            user=value("TELEMETRY_CH_USER", "CH_WMS_USER"),
+            password=(os.environ.get("TELEMETRY_CH_PASSWORD")
+                      or os.environ.get("CH_WMS_PASSWORD") or ""),
             database=os.environ.get("TELEMETRY_CH_DB", DEFAULT_DB),
             queue_dir=os.path.join(state, "queue"),
             enabled=bool(host) and os.environ.get("TELEMETRY_ENABLED", "1") != "0",
-            secure=os.environ.get("TELEMETRY_CH_SECURE", "").strip().lower() == "true",
-            port=os.environ.get("TELEMETRY_CH_PORT", DEFAULT_PORT).strip() or DEFAULT_PORT,
+            secure=value("TELEMETRY_CH_SECURE", "CH_WMS_SECURE").lower() == "true",
+            port=value("TELEMETRY_CH_PORT", "CH_WMS_PORT", DEFAULT_PORT) or DEFAULT_PORT,
         )
 
 
@@ -219,16 +247,125 @@ def _enqueue(cfg, table, row):
 
 
 def write(table, row):
-    """Записать строку. Никогда не бросает исключений."""
-    cfg = Config.from_env()
-    if not cfg.enabled:
-        return False
+    """Принять строку телеметрии. Только локально: файл в очереди, никакой
+    сети. Никогда не бросает исключений.
+
+    Раньше здесь стоял синхронный POST в ClickHouse, а очередь была
+    запасным путём на случай отказа. Хук `log_event.py` висит на
+    PostToolUse, то есть на КАЖДОМ вызове инструмента, — и этот POST
+    добавлял 283-423 мс к каждому шагу аналитика (замер с рабочей машины,
+    боевой кластер через Netbird), а при моргнувшей сети — ровно TIMEOUT_S,
+    4 секунды, тоже на каждом. Ход из десяти вызовов инструментов стоил
+    3-4,5 секунды ожидания, и это ощущалось как «инструмент тормозит».
+    Правило «телеметрия не имеет права мешать работе» выполнялось только в
+    части ошибок (наружу ничего не летит, код всегда 0), а про время не
+    выполнялось вовсе — для человека это одно и то же.
+
+    Теперь горячий путь — только запись файла рядом, это доли миллисекунды.
+    Отправку берёт на себя отдельный, отвязанный процесс
+    (flush_in_background) или следующий запуск сессии. Строка не теряется ни
+    в одном из случаев: она уже на диске до того, как кто-либо пробует
+    отправлять.
+
+    Возвращает True, если строка принята в очередь (а НЕ «доставлена в
+    ClickHouse» — доставку тут больше никто не ждёт).
+    """
     try:
-        if _post(cfg, table, [row]):
-            return True
+        cfg = Config.from_env()
+        if not cfg.enabled:
+            return False
+        _enqueue(cfg, table, row)
+        return True
     except Exception:
-        pass
-    _enqueue(cfg, table, row)
+        return False
+
+
+def flush_in_background():
+    """Запустить отправку очереди отдельным процессом и сразу вернуться.
+
+    Процесс отвязан от сессии полностью: свой сеанс (start_new_session) и
+    все три потока в /dev/null. Оба свойства обязательны, и второе — не
+    гигиена, а условие работоспособности: движок читает stdout процесса
+    хука, и потомок, унаследовавший эту трубу, держал бы её открытой после
+    завершения самого хука — движок ждал бы EOF ровно столько, сколько
+    живёт «фоновая» отправка, то есть фон перестал бы быть фоном (такой
+    сирота с унаследованной трубой у нас уже был найден в сторожевом
+    таймере setup.sh — второй заводить не будем).
+
+    Никогда не бросает исключений и ничего не ждёт. Если отправка уже идёт
+    (замок в очереди) — второй процесс не запускается: смысла нет, а
+    одновременные отправки одного и того же файла очереди — это ещё и
+    дубли строк в ClickHouse.
+    """
+    try:
+        cfg = Config.from_env()
+        if not cfg.enabled:
+            return False
+        if _flush_lock_held(cfg.queue_dir):
+            return False
+        subprocess.Popen(
+            [sys.executable, "-c", _FLUSH_SNIPPET, os.path.dirname(os.path.abspath(__file__))],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+# Тело фонового процесса. Отдельной строкой, а не файлом-скриптом: файл
+# пришлось бы держать в синхроне с расположением lib/ и правами на запуск, а
+# путь к самому lib/ и так передаётся аргументом.
+_FLUSH_SNIPPET = (
+    "import sys; sys.path.insert(0, sys.argv[1]); "
+    "import telemetry; telemetry.flush()"
+)
+
+
+# Замок «отправка уже идёт». Нужен не ради экономии процессов, а ради
+# корректности: два флашера, читающие один и тот же файл очереди, отправят
+# одни и те же строки дважды — в ClickHouse это дубли, которые потом никто
+# не отличит от настоящих повторов. Протухший замок (процесс убит, машина
+# уснула) забирается по возрасту: сама отправка ограничена
+# FLUSH_TIME_BUDGET_S ≈ 2 с, поэтому минута — заведомо больше любого
+# честного удержания.
+FLUSH_LOCK_STALE_S = 60
+
+
+def _flush_lock_path(queue_dir):
+    return os.path.join(queue_dir, ".flush.lock")
+
+
+def _flush_lock_held(queue_dir):
+    """Есть ли живой замок. Никогда не бросает исключений."""
+    try:
+        age = time.time() - os.stat(_flush_lock_path(queue_dir)).st_mtime
+    except OSError:
+        return False
+    return age <= FLUSH_LOCK_STALE_S
+
+
+def _acquire_flush_lock(queue_dir):
+    """Взять замок. True — взяли, False — отправка уже идёт."""
+    path = _flush_lock_path(queue_dir)
+    for attempt in (1, 2):
+        try:
+            os.makedirs(queue_dir, exist_ok=True)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            try:
+                os.write(fd, str(os.getpid()).encode())
+            finally:
+                os.close(fd)
+            return True
+        except FileExistsError:
+            if attempt == 2 or _flush_lock_held(queue_dir):
+                return False
+            _remove(path)  # протух — забираем и пробуем ровно один раз
+        except Exception:
+            return False
     return False
 
 
@@ -247,17 +384,33 @@ def flush():
     обратно в очередь. Если батч не отправился, в файл очереди переписывается
     только неотправленный остаток — уже подтверждённые батчи повторно не
     шлются.
+
+    Отправка одна на машину за раз (см. FLUSH_LOCK_STALE_S): если другой
+    процесс уже отправляет, возвращает 0, ничего не трогая — очередь
+    никуда не денется, её дочитает тот, кто держит замок, или следующий
+    вызов.
     """
+    cfg = None
     try:
-        return _flush_impl()
+        cfg = Config.from_env()
+        if not cfg.enabled:
+            return 0
+        if not _acquire_flush_lock(cfg.queue_dir):
+            return 0
     except Exception:
         return 0
-
-
-def _flush_impl():
-    cfg = Config.from_env()
-    if not cfg.enabled:
+    try:
+        return _flush_impl(cfg)
+    except Exception:
         return 0
+    finally:
+        try:
+            _remove(_flush_lock_path(cfg.queue_dir))
+        except Exception:
+            pass
+
+
+def _flush_impl(cfg):
     try:
         if not os.path.isdir(cfg.queue_dir):
             return 0

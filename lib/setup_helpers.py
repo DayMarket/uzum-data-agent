@@ -40,6 +40,40 @@ def write_env(path, values):
     os.chmod(path, 0o600)
 
 
+def drop_env(path, names):
+    """Убрать переменные из env-файла. Возвращает список реально удалённых.
+
+    Нужна ровно для одного случая — телеметрии. Раньше мастер спрашивал
+    хост/порт/логин/пароль телеметрии отдельно и записывал их в secrets.env
+    рядом с CH_WMS_*, хотя пишет она в тот же складской ClickHouse теми же
+    кредами. Теперь значения берутся прямо из CH_WMS_* (см.
+    lib/telemetry.py::Config.from_env), а оставшийся дубль в secrets.env
+    стал ловушкой: он перебивает CH_WMS_*, и после смены пароля склада
+    телеметрия молча перестала бы писаться — с исправным на вид доступом.
+
+    Удаляем только тогда, когда значение дословно совпадает с тем, что и
+    так придёт из CH_WMS_*; осознанно заданное другое значение (учётка-
+    писатель) — не дубль, его не трогаем. Решение о совпадении принимает
+    вызывающий код, здесь только запись файла.
+    """
+    if not os.path.exists(path):
+        return []
+    existing = envfile.read(path)
+    removed = [name for name in names if name in existing]
+    if not removed:
+        return []
+    for name in removed:
+        del existing[name]
+    dirpath = os.path.dirname(path) or "."
+    os.makedirs(dirpath, exist_ok=True)
+    os.chmod(dirpath, 0o700)
+    with open(path, "w", encoding="utf-8") as f:
+        for key, value in existing.items():
+            f.write(envfile.format_line(key, value))
+    os.chmod(path, 0o600)
+    return removed
+
+
 def read_dotenv(path):
     """Прочитать файл доступов `.env`, заполненный человеком вручную.
 

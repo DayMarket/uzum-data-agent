@@ -314,3 +314,145 @@ def test_codex_error_text_is_redacted(tmp_path):
     assert row["ok"] == 0
     assert "hunter2-secret" not in row["error_text"]
     assert "[СКРЫТО:CH_PASSWORD]" in row["error_text"]
+
+
+# --- Хук не ждёт сеть (находка живой сессии: «инструмент заметно тормозит») ---
+
+import os          # noqa: E402
+import socket      # noqa: E402
+import subprocess  # noqa: E402
+import sys         # noqa: E402
+import time        # noqa: E402
+
+HOOK = str(REPO_ROOT / ".claude" / "hooks" / "log_event.py")
+
+# Синхронная отправка упирается в telemetry.TIMEOUT_S (4 с). Порог посередине
+# и с большим запасом в обе стороны: измеренное «после» — 38-47 мс, измеренное
+# «до» — 4041-4045 мс.
+HOT_PATH_LIMIT_S = 1.5
+
+
+def _hanging_clickhouse():
+    """Слушающий сокет, который никто не читает: TCP-соединение установит
+    ядро, HTTP-ответа не будет никогда. Так ведёт себя моргнувшая сеть — но
+    без сети, без внешних адресов и одинаково на любой машине.
+
+    Настоящий адрес, а не подмена функции: хук — отдельный процесс, до его
+    внутренностей monkeypatch не достаёт, и проверять его можно только
+    снаружи, как это делает движок."""
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    return sock, sock.getsockname()[1]
+
+
+def _tool_call_payload():
+    return {
+        "session_id": "hot-path-session",
+        "transcript_path": A_CLAUDE_TRANSCRIPT_PATH,
+        "cwd": str(REPO_ROOT),
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "echo раз"},
+        "tool_response": {"stdout": "раз", "stderr": "", "interrupted": False},
+        "tool_use_id": "toolu_hot_path",
+        "duration_ms": 7,
+    }
+
+
+def _hook_env(state_dir, port):
+    return {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ["HOME"],
+        "UZUM_STATE_DIR": str(state_dir),
+        "TELEMETRY_CH_HOST": "127.0.0.1",
+        "TELEMETRY_CH_PORT": str(port),
+        "TELEMETRY_CH_USER": "u",
+        "TELEMETRY_CH_PASSWORD": "p",
+        "UZUM_USER": "hot-path-test",
+    }
+
+
+def test_hook_does_not_wait_for_clickhouse_on_every_tool_call(tmp_path):
+    """Хук висит на PostToolUse, то есть на каждом вызове инструмента. Пока
+    отправка была синхронной, каждый вызов стоил аналитику 283-423 мс на
+    живой сети и ровно 4 секунды (TIMEOUT_S) на моргнувшей — ход из десяти
+    вызовов превращался в 3-4,5 секунды ожидания.
+
+    Здесь ClickHouse отвечать не будет никогда, и хук всё равно обязан
+    вернуться сразу — а строка обязана остаться на диске, не потеряться."""
+    sock, port = _hanging_clickhouse()
+    try:
+        state = tmp_path / "state"
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps(_tool_call_payload()).encode(),
+            cwd=str(REPO_ROOT), env=_hook_env(state, port),
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+        )
+        elapsed = time.monotonic() - started
+
+        assert proc.returncode == 0, proc.stderr[:400]
+        assert elapsed < HOT_PATH_LIMIT_S, (
+            "хук ждал недоступный ClickHouse %.2f с — отправка снова в "
+            "горячем пути" % elapsed)
+        queued = list((state / "queue").glob("*.jsonl"))
+        assert len(queued) == 1, "строка события не сохранена локально"
+        row = json.loads(queued[0].read_text(encoding="utf-8").splitlines()[0])
+        assert row["table"] == "ai_usage_events"
+        assert row["row"]["tool_name"] == "Bash"
+    finally:
+        sock.close()
+
+
+def test_background_sender_does_not_hold_the_engines_output_pipe(tmp_path):
+    """Движок читает stdout процесса хука. Потомок, унаследовавший эту
+    трубу, держал бы её открытой, пока сам не завершится, — и движок ждал
+    бы EOF ровно столько, сколько живёт «фоновая» отправка. Тогда фон
+    перестаёт быть фоном, а мы получаем вторую копию той же беды, что уже
+    нашли в сторожевом таймере setup.sh.
+
+    Проверяем именно это: читаем stdout хука до конца (communicate) при
+    заведомо зависшей отправке — и он обязан закрыться сразу."""
+    sock, port = _hanging_clickhouse()
+    try:
+        state = tmp_path / "state"
+        proc = subprocess.Popen(
+            [sys.executable, HOOK],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            cwd=str(REPO_ROOT), env=_hook_env(state, port),
+        )
+        started = time.monotonic()
+        proc.communicate(json.dumps(_tool_call_payload()).encode(), timeout=60)
+        elapsed = time.monotonic() - started
+
+        assert elapsed < HOT_PATH_LIMIT_S, (
+            "stdout хука закрылся только через %.2f с — его держит фоновый "
+            "процесс отправки" % elapsed)
+    finally:
+        sock.close()
+
+
+def test_no_row_is_lost_when_the_session_ends_right_after_the_event(tmp_path):
+    """Сессия закончилась сразу после вызова инструмента, отправить не
+    успели. Строка обязана лежать в очереди и уехать при следующем запуске
+    — «быстро» не должно означать «иногда молча теряем»."""
+    sock, port = _hanging_clickhouse()
+    try:
+        state = tmp_path / "state"
+        for _ in range(3):
+            subprocess.run(
+                [sys.executable, HOOK],
+                input=json.dumps(_tool_call_payload()).encode(),
+                cwd=str(REPO_ROOT), env=_hook_env(state, port),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60,
+            )
+        rows = []
+        for path in (state / "queue").glob("*.jsonl"):
+            rows += [json.loads(line) for line in
+                     path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+        assert len(rows) == 3, "потеряны строки: %d из 3" % len(rows)
+    finally:
+        sock.close()

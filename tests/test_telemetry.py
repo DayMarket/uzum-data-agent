@@ -115,14 +115,36 @@ def test_utc_now_returns_utc_aware_datetime():
     assert before - datetime.timedelta(seconds=5) <= now <= after + datetime.timedelta(seconds=5)
 
 
-def test_write_queues_when_send_fails(monkeypatch, tmp_path):
+def test_write_goes_to_the_queue_and_never_to_the_network(monkeypatch, tmp_path):
+    """Главная проверка горячего пути: write() вызывают из хука на КАЖДОМ
+    вызове инструмента, и сети в нём быть не должно вовсе.
+
+    Сторож ЗАПИСЫВАЕТ вызовы, а не бросает исключение. Первая версия этого
+    теста как раз бросала — и мутация «вернуть синхронную отправку» его не
+    роняла: у write() снаружи стоит `except Exception`, который проглатывает
+    и AssertionError тоже. Проверка, которую нельзя провалить, — девятый
+    случай того же дефекта на этой задаче; поэтому здесь факт вызова
+    переживает любой except и сверяется уже после."""
     monkeypatch.setenv("TELEMETRY_CH_HOST", "ch.example.uz")
     monkeypatch.setenv("TELEMETRY_CH_USER", "u")
     monkeypatch.setenv("TELEMETRY_CH_PASSWORD", "test-token-xxx")
     monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(telemetry, "_post", lambda *a, **k: False)
 
-    assert telemetry.write("ai_usage_events", {"user": "denis", "ok": 1}) is False
+    posts = []
+    spawns = []
+    monkeypatch.setattr(telemetry, "_post",
+                        lambda *a, **k: posts.append(a) or False)
+    monkeypatch.setattr(telemetry, "flush_in_background",
+                        lambda *a, **k: spawns.append(a) or False)
+
+    assert telemetry.write("ai_usage_events", {"user": "denis", "ok": 1}) is True
+
+    assert posts == [], (
+        "write() пошёл в сеть: это горячий путь хука — 283-423 мс на каждый "
+        "вызов инструмента и 4 секунды при моргнувшей сети")
+    assert spawns == [], (
+        "write() сам запускает отправку: решать, отправлять ли сейчас, — "
+        "дело вызывающего хука, а не записи в очередь")
 
     queued = list((tmp_path / "queue").glob("*.jsonl"))
     assert len(queued) == 1
@@ -152,9 +174,12 @@ def test_write_never_raises(monkeypatch, tmp_path):
     monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
 
     def boom(*a, **k):
-        raise RuntimeError("сеть отвалилась")
+        raise RuntimeError("диск отвалился")
 
-    monkeypatch.setattr(telemetry, "_post", boom)
+    # Не сеть (её в write() больше нет), а единственное, что он делает —
+    # запись в очередь. Обещание «хук не мешает работе» держится в том
+    # числе на том, что отсюда наружу ничего не летит.
+    monkeypatch.setattr(telemetry, "_enqueue", boom)
     assert telemetry.write("ai_usage_events", {"user": "denis"}) is False
 
 
@@ -431,3 +456,231 @@ def test_queue_stats_reports_size_for_diagnostics(tmp_path):
 
 def test_queue_stats_on_missing_dir():
     assert telemetry.queue_stats("/nope/queue") == (0, 0, 0)
+
+
+# --- Отправка ушла с горячего пути (находка живой сессии: инструмент тормозит) ---
+
+
+class _RecordingClickHouse(object):
+    """Настоящий HTTP-сервер на localhost, принимающий INSERT'ы.
+
+    Не мок telemetry и не подмена _post: фоновая отправка идёт ОТДЕЛЬНЫМ
+    процессом, до которого monkeypatch не достаёт, — значит и проверять её
+    можно только тем, что реально доехало по сети."""
+
+    def __init__(self):
+        import http.server
+        import threading
+
+        received = self.received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length).decode("utf-8")
+                received.append({"path": self.path, "body": body})
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, *a):
+                pass
+
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.host, self.port = self._server.server_address
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def rows(self):
+        out = []
+        for item in self.received:
+            for line in item["body"].splitlines():
+                if line.strip():
+                    out.append(json.loads(line))
+        return out
+
+    def stop(self):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def test_background_flush_really_delivers_the_queued_rows(monkeypatch, tmp_path):
+    """Сквозная проверка фонового пути: строка кладётся в очередь локально,
+    а до ClickHouse её довозит отвязанный процесс — настоящий, отдельный,
+    а не подменённая функция."""
+    server = _RecordingClickHouse()
+    try:
+        monkeypatch.setenv("TELEMETRY_CH_HOST", "127.0.0.1")
+        monkeypatch.setenv("TELEMETRY_CH_PORT", str(server.port))
+        monkeypatch.setenv("TELEMETRY_CH_USER", "u")
+        monkeypatch.setenv("TELEMETRY_CH_PASSWORD", "p")
+        monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+
+        assert telemetry.write("ai_usage_events", {"user": "denis", "ok": 1}) is True
+        assert list((tmp_path / "queue").glob("*.jsonl")), "строка не легла в очередь"
+
+        assert telemetry.flush_in_background() is True
+
+        deadline = time.time() + 20
+        while time.time() < deadline and not server.rows():
+            time.sleep(0.05)
+
+        assert server.rows() == [{"user": "denis", "ok": 1}]
+        # Доехавшее из очереди убирается — иначе следующий запуск пришлёт дубль.
+        while time.time() < deadline and list((tmp_path / "queue").glob("*.jsonl")):
+            time.sleep(0.05)
+        assert list((tmp_path / "queue").glob("*.jsonl")) == []
+    finally:
+        server.stop()
+
+
+def test_background_flush_does_not_wait_for_the_network(monkeypatch, tmp_path):
+    """Фон обязан быть фоном: даже если отправка будет висеть до таймаута,
+    вызов возвращается сразу."""
+    hang = _hanging_socket()
+    try:
+        monkeypatch.setenv("TELEMETRY_CH_HOST", "127.0.0.1")
+        monkeypatch.setenv("TELEMETRY_CH_PORT", str(hang[1]))
+        monkeypatch.setenv("TELEMETRY_CH_USER", "u")
+        monkeypatch.setenv("TELEMETRY_CH_PASSWORD", "p")
+        monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+        telemetry.write("ai_usage_events", {"user": "denis"})
+
+        started = time.monotonic()
+        telemetry.flush_in_background()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 1.0, (
+            "flush_in_background ждал отправку %.2f с — это уже не фон" % elapsed)
+    finally:
+        hang[0].close()
+
+
+def _hanging_socket():
+    """Слушающий сокет, который никто не читает: TCP-соединение установится
+    (его завершает ядро), а HTTP-ответа не будет никогда — ровно то, как
+    ведёт себя моргнувшая сеть, но без сети и без внешних адресов."""
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(8)
+    return sock, sock.getsockname()[1]
+
+
+def test_two_flushes_at_once_do_not_send_the_same_rows_twice(monkeypatch, tmp_path):
+    """Хук стреляет на каждом вызове инструмента, то есть отправку могут
+    запустить десять раз подряд. Без замка два флашера прочитают один файл
+    очереди и отправят одни и те же строки дважды — в ClickHouse это дубли,
+    которые потом не отличить от настоящих повторов."""
+    _enable(monkeypatch, tmp_path)
+    telemetry.write("ai_usage_events", {"user": "denis"})
+
+    sent = []
+    in_flush = {"started": False}
+
+    def slow_post(cfg, table, rows):
+        in_flush["started"] = True
+        # Пока первый флашер «в сети», второй пытается начать свой.
+        assert telemetry.flush() == 0, "второй flush() пролез мимо замка"
+        sent.extend(rows)
+        return True
+
+    monkeypatch.setattr(telemetry, "_post", slow_post)
+    assert telemetry.flush() == 1
+    assert in_flush["started"]
+    assert sent == [{"user": "denis"}]
+    assert list((tmp_path / "queue").glob("*.jsonl")) == []
+
+
+def test_stale_lock_does_not_block_telemetry_forever(monkeypatch, tmp_path):
+    """Машина уснула/процесс убили — замок остался. Он не должен означать
+    «телеметрия больше не отправляется никогда»."""
+    _enable(monkeypatch, tmp_path)
+    telemetry.write("ai_usage_events", {"user": "denis"})
+    queue_dir = tmp_path / "queue"
+    lock = queue_dir / ".flush.lock"
+    lock.write_text("99999", encoding="utf-8")
+    old = time.time() - telemetry.FLUSH_LOCK_STALE_S - 10
+    os.utime(str(lock), (old, old))
+
+    monkeypatch.setattr(telemetry, "_post", lambda *a, **k: True)
+    assert telemetry.flush() == 1
+
+
+def test_lock_file_is_not_mistaken_for_a_queue_file(monkeypatch, tmp_path):
+    _enable(monkeypatch, tmp_path)
+    telemetry.write("ai_usage_events", {"user": "denis"})
+    (tmp_path / "queue" / ".flush.lock").write_text("1", encoding="utf-8")
+
+    files, _total, _oldest = telemetry.queue_stats(str(tmp_path / "queue"))
+    assert files == 1
+
+
+# --- Куда писать телеметрию: складской ClickHouse по умолчанию ---
+
+
+def _clear_telemetry_env(monkeypatch):
+    for name in ("TELEMETRY_CH_HOST", "TELEMETRY_CH_PORT", "TELEMETRY_CH_USER",
+                 "TELEMETRY_CH_PASSWORD", "TELEMETRY_CH_SECURE",
+                 "CH_WMS_HOST", "CH_WMS_PORT", "CH_WMS_USER",
+                 "CH_WMS_PASSWORD", "CH_WMS_SECURE"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_telemetry_uses_the_warehouse_clickhouse_by_default(monkeypatch, tmp_path):
+    """Решение владельца: таблицы sandbox.ai_usage_* живут на складском
+    кластере, и отдельного доступа к ним не существует. Значит достаточно
+    того, что аналитик уже настроил, — мастер про телеметрию не
+    спрашивает."""
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("CH_WMS_HOST", "wms-clickhouse.prod.um.internal")
+    monkeypatch.setenv("CH_WMS_PORT", "9000")
+    monkeypatch.setenv("CH_WMS_USER", "имя-фамилия")
+    monkeypatch.setenv("CH_WMS_PASSWORD", "пароль склада")
+    monkeypatch.setenv("CH_WMS_SECURE", "true")
+
+    cfg = telemetry.Config.from_env()
+
+    assert cfg.enabled is True
+    assert cfg.host == "wms-clickhouse.prod.um.internal"
+    assert cfg.port == "9000"
+    assert cfg.user == "имя-фамилия"
+    assert cfg.password == "пароль склада"
+    assert cfg.secure is True
+    assert cfg.database == "sandbox"
+
+
+def test_explicit_telemetry_settings_win_field_by_field(monkeypatch, tmp_path):
+    """Исключение, ради которого механизм и оставлен: у пилотной группы
+    может не быть прав INSERT, и запись пойдёт отдельной учёткой-писателем
+    на том же хосте. Тогда руками кладут только логин и пароль, а адрес
+    по-прежнему берётся от склада."""
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("CH_WMS_HOST", "wms-clickhouse.prod.um.internal")
+    monkeypatch.setenv("CH_WMS_PORT", "8123")
+    monkeypatch.setenv("CH_WMS_USER", "имя-фамилия")
+    monkeypatch.setenv("CH_WMS_PASSWORD", "пароль склада")
+    monkeypatch.setenv("TELEMETRY_CH_USER", "ai-usage-writer")
+    monkeypatch.setenv("TELEMETRY_CH_PASSWORD", "пароль писателя")
+
+    cfg = telemetry.Config.from_env()
+
+    assert cfg.user == "ai-usage-writer"
+    assert cfg.password == "пароль писателя"
+    assert cfg.host == "wms-clickhouse.prod.um.internal", (
+        "хост обязан остаться от склада — иначе ради двух значений пришлось "
+        "бы переписывать все четыре")
+
+
+def test_no_warehouse_and_no_override_means_no_telemetry(monkeypatch, tmp_path):
+    """Склад не настроен и своего адреса не задали — писать некуда, и это
+    не ошибка: аналитик мог ещё не получить доступ."""
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+
+    assert telemetry.Config.from_env().enabled is False
+    assert telemetry.write("ai_usage_events", {"user": "denis"}) is False
+    assert not (tmp_path / "queue").exists()

@@ -25,6 +25,32 @@ turn_context. Наблюдённые вложенные типы, использ
     двумя реальными промптами и одной служебной user-вставкой: role=="user"
     даёт 3 совпадения, event_msg/user_message — ровно 2, то есть правильно.
 
+    ВАЖНО (найдено на живых данных 10.08.2026, см. docs/codex-facts.md,
+    раздел 6): такие записи пишет ТОЛЬКО `codex exec`. У интерактивного
+    TUI — того самого режима, в котором работает аналитик, — промпт лежит
+    иначе (см. следующий пункт). Одна и та же версия codex (0.147.0), два
+    разных формата, различаются по session_meta.originator:
+    "codex_exec" против "codex-tui".
+
+  - event_msg / payload.type == "item_completed", payload.item.type ==
+    "UserMessage" — промпт человека в ИНТЕРАКТИВНОМ режиме (TUI). Текст —
+    не строка, а список блоков в item["content"]: {"type": "text",
+    "text": ...} плюс, если промпт вызвал скилл, ещё и {"type": "skill",
+    "name": ..., "path": ...}.
+
+    Именно из-за этой ветки телеметрия показывала n_prompts = 0 у всех
+    сессий Codex при непустых n_tools и токенах: разбор писался и
+    проверялся по транскриптам `codex exec` (все живые проверки этого
+    репозитория до сих пор шли через exec), а аналитик работает в TUI, где
+    записи user_message не бывает вовсе.
+
+    Считаем только item.type == "UserMessage". Промпты, вставленные
+    хуками (у нас это сообщение SessionStart про git pull), — отдельный
+    тип item'а "HookPrompt" (перечень типов виден в самом бинаре Codex
+    рядом с UserMessage: UserMessage, HookPrompt, AgentMessage, Reasoning,
+    DynamicToolCall, …), поэтому в n_prompts они не попадают, и это
+    структурная гарантия, а не удача.
+
   - response_item / payload.type == "custom_tool_call" — вызов инструмента,
     отдельная запись верхнего уровня (не блок внутри message.content, как у
     Claude Code). Один вызов — одна запись, дедупликация не нужна (раздел 6,
@@ -130,6 +156,29 @@ def _iter_records(raw_bytes):
             continue
         if isinstance(item, dict):
             yield item
+
+
+def _user_message_text(content):
+    """Текст промпта из item["content"] интерактивной записи UserMessage.
+
+    Список блоков; берём только текстовые. Рядом с ними встречается блок
+    {"type": "skill", "name": ..., "path": ...} — это не текст человека, а
+    разметка вызванного скилла, в _user_text ей делать нечего (по этому
+    тексту ищется ключ задачи Jira). Тип блока сверяем без учёта регистра:
+    у UserMessage он "text", у соседнего AgentMessage — "Text", и полагаться
+    на то, что дальше так и останется, не на чем."""
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if str(block.get("type", "")).lower() != "text":
+            continue
+        text = block.get("text")
+        if isinstance(text, str) and text:
+            parts.append(text)
+    return "\n".join(parts)
 
 
 def _extract_exit_info(output):
@@ -326,10 +375,28 @@ def read_transcript(path, secrets):
         payload_type = payload.get("type")
 
         if item_type == "event_msg" and payload_type == "user_message":
+            # Промпт в режиме `codex exec` — см. докстринг модуля.
             agg["n_prompts"] += 1
             message = payload.get("message")
             if isinstance(message, str):
                 user_text_parts.append(message)
+
+        elif item_type == "event_msg" and payload_type == "item_completed":
+            # Промпт в интерактивном режиме (TUI) — другая запись, другой
+            # формат текста. Именно её отсутствие давало n_prompts = 0 у
+            # живых сессий аналитиков. Обе ветки живут рядом, а не одна
+            # вместо другой: exec никуда не делся (мастер установки
+            # проверяет им доверие хукам), и оба формата встречаются на
+            # одной и той же версии Codex. Ни на одном наблюдённом
+            # транскрипте оба вида записей одновременно не встречались —
+            # каждый режим пишет свой (проверено на четырёх живых файлах:
+            # два exec, два TUI).
+            item = payload.get("item")
+            if isinstance(item, dict) and item.get("type") == "UserMessage":
+                agg["n_prompts"] += 1
+                text = _user_message_text(item.get("content"))
+                if text:
+                    user_text_parts.append(text)
 
         elif item_type == "event_msg" and payload_type == "token_count":
             info = payload.get("info")

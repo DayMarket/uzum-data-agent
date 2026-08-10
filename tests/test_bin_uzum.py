@@ -22,6 +22,8 @@ import stat
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN_UZUM = REPO_ROOT / "bin" / "uzum"
 
@@ -228,7 +230,17 @@ def _engine_env(dump_dir, engine):
     return env
 
 
-def test_codex_gets_the_variables_under_the_names_connectors_actually_expect(tmp_path):
+# Обе формы запуска: без аргументов (интерактивная сессия) и с аргументами
+# (любой неинтерактивный запуск — им же сдавалась приёмка). Находка ревью:
+# проверки окружения жили только на первой форме, и мутация «убрать мостик»
+# во второй ветке bin/uzum проходила зелёной.
+BOTH_LAUNCH_FORMS = pytest.mark.parametrize(
+    "extra_args", [[], ["exec", "перечисли инструменты"]],
+    ids=["no-args", "with-args"])
+
+
+@BOTH_LAUNCH_FORMS
+def test_codex_gets_the_variables_under_the_names_connectors_actually_expect(tmp_path, extra_args):
     """Главный тест находки: JIRA_TOKEN аналитика обязан доехать до Codex
     ещё и под именами JIRA_PERSONAL_TOKEN/CONFLUENCE_PERSONAL_TOKEN, иначе
     uvx mcp-atlassian стартует без токена и не отдаёт ни одного
@@ -240,7 +252,7 @@ def test_codex_gets_the_variables_under_the_names_connectors_actually_expect(tmp
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    result = _run_uzum(repo, home, path, args=["--codex"], dump_dir=dump_dir)
+    result = _run_uzum(repo, home, path, args=["--codex", *extra_args], dump_dir=dump_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "STUB codex" in result.stdout
@@ -254,7 +266,8 @@ def test_codex_gets_the_variables_under_the_names_connectors_actually_expect(tmp
     assert env.get("JIRA_TOKEN") == JIRA_TOKEN_VALUE
 
 
-def test_codex_gets_the_defaults_for_addresses_nobody_filled_in(tmp_path):
+@BOTH_LAUNCH_FORMS
+def test_codex_gets_the_defaults_for_addresses_nobody_filled_in(tmp_path, extra_args):
     """Адреса Jira/Confluence/Trino в secrets.env не лежат: раньше их
     подставлял `${JIRA_URL:-https://jira.uzum.com}` в .mcp.json, и под Codex
     подставить их было некому."""
@@ -265,7 +278,7 @@ def test_codex_gets_the_defaults_for_addresses_nobody_filled_in(tmp_path):
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    _run_uzum(repo, home, path, args=["--codex"], dump_dir=dump_dir)
+    _run_uzum(repo, home, path, args=["--codex", *extra_args], dump_dir=dump_dir)
 
     env = _engine_env(dump_dir, "codex")
     assert env.get("JIRA_URL") == "https://jira.uzum.com"
@@ -292,7 +305,8 @@ def test_codex_is_still_launched_with_our_profile_and_the_users_arguments(tmp_pa
     assert JIRA_TOKEN_VALUE not in " ".join(argv)
 
 
-def test_claude_code_environment_is_left_exactly_as_it_was(tmp_path):
+@BOTH_LAUNCH_FORMS
+def test_claude_code_environment_is_left_exactly_as_it_was(tmp_path, extra_args):
     """Граница задачи: у Claude Code подстановка своя и работает
     (`${JIRA_TOKEN}` внутри .mcp.json), переименовывать ему ничего не надо.
     Целевые имена в его окружении означали бы, что мостик применился не там,
@@ -304,7 +318,7 @@ def test_claude_code_environment_is_left_exactly_as_it_was(tmp_path):
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    result = _run_uzum(repo, home, path, args=["--claude"], dump_dir=dump_dir)
+    result = _run_uzum(repo, home, path, args=["--claude", *extra_args], dump_dir=dump_dir)
 
     assert result.returncode == 0, result.stdout + result.stderr
     env = _engine_env(dump_dir, "claude")

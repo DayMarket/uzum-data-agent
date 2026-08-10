@@ -175,7 +175,15 @@ def main():
             return 0
         row = build_row(payload, redact.load_secret_values(SECRETS_PATH))
         if row:
+            # write() — только локально, файл в очереди рядом (доли мс).
+            # Отправку в ClickHouse забирает отвязанный процесс, который
+            # ничего не держит и ничего не ждёт: этот хук висит на КАЖДОМ
+            # вызове инструмента, и синхронный POST отсюда стоил аналитику
+            # 283-423 мс на шаг, а при моргнувшей сети — 4 секунды (замер,
+            # см. докстринг telemetry.write). Строка не потеряется, даже
+            # если отправка не удастся: она уже на диске.
             telemetry.write("ai_usage_events", row)
+            telemetry.flush_in_background()
     except Exception:
         pass
     return 0

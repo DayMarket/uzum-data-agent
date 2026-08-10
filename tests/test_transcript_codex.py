@@ -27,6 +27,70 @@ TRANSCRIPT = str(FIXTURES / "rollout-2026-08-07T20-49-54-019fdd21-9868-7633-a9ca
 TURN_ID_SUCCESS = "019fdd21-9884-7b10-ae30-98a741054015"
 TURN_ID_FAILURE = "019fdd22-355c-7721-a656-5e7416f795f2"
 
+# Транскрипт ИНТЕРАКТИВНОЙ сессии (TUI) — того режима, в котором работает
+# аналитик. Снят живым запуском 10.08.2026 в изолированном CODEX_HOME:
+# настоящий codex 0.147.0 под псевдотерминалом, один промпт («Ответь ровно
+# одним словом: готово.»), ответ модели, выход по Ctrl-D. Файл не собран
+# руками и не отредактирован — ровно то, что записал Codex.
+#
+# Нужен отдельно от exec-транскрипта выше, потому что промпт человека в
+# этих двух режимах лежит в РАЗНЫХ записях (см. докстринг
+# lib/transcript_codex.py). Пока фикстур было только две и обе от `codex
+# exec`, разбор промптов TUI был сломан, а тесты — зелёные: n_prompts = 0 у
+# всех живых сессий Codex в sandbox.ai_usage_sessions.
+TRANSCRIPT_TUI = str(FIXTURES / "rollout-tui-2026-08-10T18-11-56-019fec04.jsonl")
+
+
+def _payload_kinds(path):
+    """Сколько записей каждого вида (тип записи, тип payload) в файле.
+    Считает сам тест, по сырому файлу, не спрашивая разбор — иначе
+    проверка предпосылки опиралась бы на то, что проверяет."""
+    kinds = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            item = json.loads(line)
+            payload = item.get("payload")
+            key = (item.get("type"),
+                   payload.get("type") if isinstance(payload, dict) else None)
+            kinds[key] = kinds.get(key, 0) + 1
+    return _Counting(kinds)
+
+
+class _Counting(dict):
+    """dict, у которого отсутствующий ключ — это 0: чтобы утверждение «таких
+    записей в файле нет» писалось так же, как «их две»."""
+
+    def __missing__(self, key):
+        return 0
+
+
+def _item_completed(item_type, content):
+    """Запись интерактивного режима. Форма — с живых транскриптов TUI
+    (rollout-tui-…jsonl в фикстурах и сессия приёмки), а не выдумана."""
+    return {
+        "timestamp": "2026-08-10T18:11:57.000Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "item_completed",
+            "thread_id": "019fec04-0de1-79f2-9897-9212dfc25265",
+            "turn_id": "019fec04-1a2b-7000-8000-000000000001",
+            "item": {"type": item_type,
+                     "id": "item-%s" % item_type.lower(),
+                     "content": content},
+        },
+    }
+
+
+def _write_records(tmp_path, records):
+    path = tmp_path / "rollout-synthetic.jsonl"
+    with open(path, "w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return str(path)
+
 
 # --- read_transcript ---------------------------------------------------------
 
@@ -39,6 +103,76 @@ def test_reads_real_transcript_and_counts_prompts_and_tools():
     assert agg["n_prompts"] == 2
     assert agg["n_tools"] == 2
     assert "hello-fixture-success" in text
+
+
+def test_counts_the_prompt_of_an_interactive_session():
+    """Находка живых данных: у всех сессий Codex n_prompts был 0 при
+    непустых n_tools и токенах. Причина — интерактивный режим пишет промпт
+    другой записью, а разбор знал только про формат `codex exec`."""
+    # Проверка предпосылки, а не украшение: если фикстура вдруг окажется
+    # exec-формата, тест ниже пройдёт по старой ветке и снова ничего не
+    # проверит — ровно так этот дефект и дожил до живых данных.
+    kinds = _payload_kinds(TRANSCRIPT_TUI)
+    assert kinds[("event_msg", "user_message")] == 0, (
+        "фикстура не интерактивная: в ней есть записи формата codex exec")
+    assert kinds[("event_msg", "item_completed")] > 0
+
+    text, agg = transcript_codex.read_transcript(TRANSCRIPT_TUI, {})
+
+    assert agg["n_prompts"] == 1
+    assert agg["_user_text"] == "Ответь ровно одним словом: готово."
+    assert "готово" in text
+
+
+def test_exec_and_interactive_transcripts_are_really_two_different_shapes():
+    """Держит в тесте сам факт, из-за которого всё сломалось: одна версия
+    Codex, два формата. Если однажды они сойдутся, этот тест упадёт — и это
+    будет поводом упростить разбор, а не тихо носить лишнюю ветку."""
+    exec_kinds = _payload_kinds(TRANSCRIPT)
+    tui_kinds = _payload_kinds(TRANSCRIPT_TUI)
+
+    assert exec_kinds[("event_msg", "user_message")] == 2
+    assert exec_kinds[("event_msg", "item_completed")] == 0
+    assert tui_kinds[("event_msg", "user_message")] == 0
+    assert tui_kinds[("event_msg", "item_completed")] > 0
+
+
+def test_prompts_injected_by_hooks_are_not_counted_as_human_prompts(tmp_path):
+    """У нас хук SessionStart вставляет в сессию своё сообщение (что
+    приехало по git pull). Codex помечает такие вставки отдельным типом
+    item'а — HookPrompt (перечень типов лежит в самом бинаре рядом с
+    UserMessage). Считать их промптами человека значит завысить главную
+    метрику адопшена на каждую сессию."""
+    path = _write_records(tmp_path, [
+        _item_completed("UserMessage", [{"type": "text", "text": "настоящий промпт"}]),
+        _item_completed("HookPrompt", [{"type": "text", "text": "приехали скиллы"}]),
+        _item_completed("AgentMessage", [{"type": "Text", "text": "ответ модели"}]),
+    ])
+
+    _, agg = transcript_codex.read_transcript(path, {})
+
+    assert agg["n_prompts"] == 1
+    assert agg["_user_text"] == "настоящий промпт"
+
+
+def test_skill_markup_next_to_the_prompt_is_not_part_of_the_text(tmp_path):
+    """Промпт, вызвавший скилл, приходит двумя блоками: текст человека и
+    разметка скилла. Форма блоков — с живой сессии приёмки ($task OE-3491).
+    По _user_text ищется ключ задачи, и путь к SKILL.md в нём — лишний
+    источник ложных совпадений."""
+    path = _write_records(tmp_path, [
+        _item_completed("UserMessage", [
+            {"type": "text", "text": "$task OE-3491", "text_elements": []},
+            {"type": "skill", "name": "task",
+             "path": "/Users/analyst/uzum-data-agent/.agents/skills/task/SKILL.md"},
+        ]),
+    ])
+
+    _, agg = transcript_codex.read_transcript(path, {})
+
+    assert agg["n_prompts"] == 1
+    assert agg["_user_text"] == "$task OE-3491"
+    assert "SKILL.md" not in agg["_user_text"]
 
 
 def test_tokens_come_from_last_token_count_event_not_summed():

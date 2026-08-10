@@ -59,38 +59,47 @@ def _stubs(tmp_path, engines=("claude",)):
     """Подставные внешние команды. `curl` и `uv` — содержательные (см.
     докстринг модуля), остальные нужны только чтобы `command -v` их нашёл."""
     stub_dir = tmp_path / "stubs"
-    stub_dir.mkdir()
+    stub_dir.mkdir(exist_ok=True)
 
     _script(stub_dir / "curl", """#!/usr/bin/env python3
 # Подставной curl: код ответа и тело берутся из правил теста по подстроке
 # URL. Аргументы разбираются так же, как их передаёт curl_check в setup.sh.
+# Заголовки (в них логин и пароль) приходят конфигом на стандартный вход —
+# читаем и записываем в лог вместе с URL: без этого нельзя проверить, ЧЕМ
+# мастер стучался, а «той ли учёткой» — это ровно то, что тут ломалось.
 import json, os, sys
 argv = sys.argv[1:]
 url = argv[-1]
 out = argv[argv.index("-o") + 1] if "-o" in argv else None
+config = sys.stdin.read() if "--config" in argv else ""
 code, body = "000", ""
 for pattern, rule_code, rule_body in json.load(open(os.environ["UZUM_TEST_CURL_RULES"])):
     if pattern in url:
         code, body = str(rule_code), rule_body
         break
 with open(os.environ["UZUM_TEST_CURL_LOG"], "a") as log:
-    log.write(url + "\\n")
+    log.write(json.dumps({"url": url, "config": config}, ensure_ascii=False) + "\\n")
 if out:
     open(out, "w").write(body)
 sys.stdout.write(code)
 """)
 
     _script(stub_dir / "uv", """#!/usr/bin/env python3
-# Подставной uv: единственное, ради чего мастер его зовёт — живая проверка
-# Superset (`uv run connectors/superset_mcp.py --check`). Записывает, ЧТО
-# ему передали (аргументы и SUPERSET_*-окружение), и печатает заданный
-# тестом результат.
+# Подставной uv. Мастер зовёт его для двух разных дел, и стаб их различает
+# так же, как настоящий uv: `uv sync --script <файл>` и `uv run <файл>` —
+# прогрев окружений коннекторов; `uv run …superset_mcp.py --check` — живая
+# проверка Superset. Записывает всё, что ему передали.
 import json, os, sys
+argv = sys.argv[1:]
 with open(os.environ["UZUM_TEST_UV_LOG"], "a") as log:
     log.write(json.dumps({
-        "argv": sys.argv[1:],
+        "argv": argv,
         "superset_env": {k: v for k, v in os.environ.items() if k.startswith("SUPERSET_")},
     }) + "\\n")
+if argv[:1] == ["sync"]:
+    sys.exit(0)
+if "--check" not in argv:
+    sys.exit(0)   # прогрев: скрипт «завершился на EOF»
 answer = os.environ.get("UZUM_TEST_SUPERSET_CHECK", "OK:7")
 print(answer)
 sys.exit(0 if answer.startswith("OK:") else 1)
@@ -110,7 +119,8 @@ sys.exit(0 if answer.startswith("OK:") else 1)
 
 
 def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
-               superset_check="OK:7", engines=("claude",), answers=None):
+               superset_check="OK:7", engines=("claude",), answers=None,
+               stub_overrides=None):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     if "codex" in engines:
@@ -120,6 +130,8 @@ def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
         (home / ".codex").mkdir(exist_ok=True)
         (home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
     stub_dir = _stubs(tmp_path, engines=engines)
+    for name, body in (stub_overrides or {}).items():
+        _script(stub_dir / name, body)
     rules_path = tmp_path / "curl-rules.json"
     rules_path.write_text(json.dumps(list(curl_rules)), encoding="utf-8")
     if dotenv is not None:
@@ -377,8 +389,11 @@ def test_superset_credentials_reach_the_check_through_the_environment(tmp_path):
 
     calls = [json.loads(line)
              for line in (tmp_path / "uv.log").read_text(encoding="utf-8").splitlines()]
-    assert calls, "живая проверка Superset не запускалась вовсе"
-    call = calls[-1]
+    # Не «последний вызов uv»: тем же uv мастер ещё и прогревает окружения
+    # коннекторов, и последним оказывается прогрев, а не проверка.
+    checks = [c for c in calls if "--check" in c["argv"]]
+    assert checks, "живая проверка Superset не запускалась вовсе"
+    call = checks[-1]
     assert call["argv"][0] == "run" and call["argv"][-1] == "--check", call["argv"]
     assert call["superset_env"]["SUPERSET_USERNAME"] == "логин-аналитика"
     assert call["superset_env"]["SUPERSET_PASSWORD"] == "пароль-superset"
@@ -411,3 +426,180 @@ def test_superset_without_credentials_is_skipped_not_silently_enabled(tmp_path):
     assert "не введён" in result.stdout, result.stdout
     assert "./setup.sh --add superset" in result.stdout
     assert "superset" not in _enabled(repo)
+
+
+# ── Телеметрия: доступ тот же, что у складского ClickHouse ───────────────
+
+TELEMETRY_OK = ["sandbox.ai_usage_sessions", 200, "128"]
+
+
+def _curl_calls(tmp_path):
+    """Что мастер реально спрашивал у сервера: URL и заголовки (в них логин
+    и пароль). Заголовки нужны, чтобы проверять не только «сходил», но и
+    «той ли учёткой» — а это и есть предмет находки."""
+    path = tmp_path / "curl.log"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_telemetry_asks_nothing_and_checks_the_warehouse_access(tmp_path):
+    """Решение владельца: телеметрия пишется в складской ClickHouse теми же
+    логином и паролем — значит спрашивать нечего. Живая проверка при этом
+    обязана остаться: это единственное место, где человек узнаёт, что
+    телеметрия работает."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                              curl_rules=[TELEMETRY_OK], dotenv=DOTENV_WMS_AND_JIRA)
+
+    out = result.stdout
+    assert "sandbox.ai_usage_sessions на месте, строк: 128" in out, out
+    for asked in ("Хост телеметрии", "  Логин:", "  Пароль:"):
+        assert asked not in out, "мастер снова спрашивает про телеметрию:\n%s" % out
+    # И ничего лишнего в secrets.env: дубль складских значений — ловушка,
+    # он перебивает CH_WMS_* и после смены пароля тихо остановит запись.
+    assert "TELEMETRY_CH_" not in _secrets(home), _secrets(home)
+
+
+def test_telemetry_check_goes_with_the_warehouse_credentials(tmp_path):
+    """Мутация «телеметрия берёт не те креды» обязана быть видна: смотрим,
+    какие именно логин и пароль ушли в проверку."""
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+               curl_rules=[TELEMETRY_OK], dotenv=DOTENV_WMS_AND_JIRA)
+
+    calls = [c for c in _curl_calls(tmp_path) if "ai_usage_sessions" in c["url"]]
+    assert calls, "живой проверки телеметрии не было вовсе"
+    assert "wms.internal:8123" in calls[0]["url"], calls[0]["url"]
+    assert "X-ClickHouse-User: имя-фамилия" in calls[0]["config"], calls[0]["config"]
+    assert "X-ClickHouse-Key: пароль-склада" in calls[0]["config"]
+
+
+def test_telemetry_without_the_warehouse_says_so_instead_of_asking(tmp_path):
+    """Склад ещё не настроен — писать некуда. Это не ошибка установки и не
+    повод задавать вопросы: доступ появится, телеметрия включится сама."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                              curl_rules=[TELEMETRY_OK])
+
+    assert "складской ClickHouse ещё не настроен" in result.stdout, result.stdout
+    assert "TELEMETRY_CH_" not in _secrets(home)
+    assert not [c for c in _curl_calls(tmp_path) if "ai_usage_sessions" in c["url"]]
+
+
+def test_wizard_removes_telemetry_duplicates_of_the_warehouse_values(tmp_path):
+    """Машина, установленная до этой правки: в secrets.env лежат
+    TELEMETRY_CH_*, дословно повторяющие CH_WMS_*. Они перебивают складские
+    значения — после смены пароля склада телеметрия молча перестала бы
+    писаться. Мастер обязан их убрать."""
+    repo = _make_repo_copy(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config" / "uzum-ai").mkdir(parents=True, exist_ok=True)
+    (home / ".config" / "uzum-ai" / "secrets.env").write_text(
+        "CH_WMS_HOST='wms.internal'\n"
+        "CH_WMS_PORT='8123'\n"
+        "CH_WMS_USER='имя-фамилия'\n"
+        "CH_WMS_PASSWORD='пароль-склада'\n"
+        "TELEMETRY_CH_HOST='wms.internal'\n"
+        "TELEMETRY_CH_PORT='8123'\n"
+        "TELEMETRY_CH_USER='имя-фамилия'\n"
+        "TELEMETRY_CH_PASSWORD='пароль-склада'\n",
+        encoding="utf-8")
+
+    _run_setup(repo, tmp_path, args=["--add", "telemetry"], curl_rules=[TELEMETRY_OK])
+
+    secrets = _secrets(home)
+    assert "TELEMETRY_CH_" not in secrets, secrets
+    assert "CH_WMS_PASSWORD='пароль-склада'" in secrets, "снесли лишнее:\n%s" % secrets
+
+
+def test_wizard_keeps_a_deliberate_writer_account_and_checks_it(tmp_path):
+    """Исключение, ради которого механизм оставлен: у пилотной группы может
+    не быть прав INSERT, и запись пойдёт отдельной учёткой-писателем.
+    Заданное руками значение — не дубль: его нельзя ни стереть, ни
+    проигнорировать при проверке."""
+    repo = _make_repo_copy(tmp_path)
+    home = tmp_path / "home"
+    (home / ".config" / "uzum-ai").mkdir(parents=True, exist_ok=True)
+    (home / ".config" / "uzum-ai" / "secrets.env").write_text(
+        "CH_WMS_HOST='wms.internal'\n"
+        "CH_WMS_PORT='8123'\n"
+        "CH_WMS_USER='имя-фамилия'\n"
+        "CH_WMS_PASSWORD='пароль-склада'\n"
+        "TELEMETRY_CH_USER='ai-usage-writer'\n"
+        "TELEMETRY_CH_PASSWORD='пароль-писателя'\n",
+        encoding="utf-8")
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                           curl_rules=[TELEMETRY_OK])
+
+    secrets = _secrets(home)
+    assert "TELEMETRY_CH_USER='ai-usage-writer'" in secrets, secrets
+    calls = [c for c in _curl_calls(tmp_path) if "ai_usage_sessions" in c["url"]]
+    assert calls, "живой проверки телеметрии не было"
+    assert "X-ClickHouse-User: ai-usage-writer" in calls[0]["config"], (
+        "проверили складскую учётку, а писать будет другая — это и есть "
+        "«зелёная установка, пустая таблица»")
+    # Адрес при этом остаётся складским: ради смены учётки не должно
+    # приходиться переписывать все четыре значения.
+    assert "wms.internal:8123" in calls[0]["url"]
+    assert "заданы отдельно" in result.stdout
+
+
+# ── Первая сессия не должна молчать: окружения коннекторов готовит мастер ──
+
+def test_wizard_prepares_the_environment_of_every_local_connector(tmp_path):
+    """Замер: `uv run connectors/trino_proxy.py` на чистой машине — 17,7 с,
+    Codex столько старта MCP-сервера не ждёт и просто не показывает
+    коннектор, молча. Значит окружение должно быть собрано на установке, где
+    человек и так ждёт.
+
+    Список файлов берётся из реестра, а не из ожиданий теста: если в
+    registry.py появится ещё один локальный коннектор, а прогрев про него не
+    узнает — тест упадёт."""
+    import sys
+    sys.path.insert(0, str(REPO_ROOT))
+    from connectors.registry import CONNECTORS, ProjectScript
+
+    expected = []
+    for connector in CONNECTORS:
+        branches = [connector.args]
+        if connector.codex is not None:
+            branches.append(connector.codex.args)
+        for args in branches:
+            for arg in args:
+                if isinstance(arg, ProjectScript) and arg.path not in expected:
+                    expected.append(arg.path)
+    assert expected, "в реестре не осталось локальных коннекторов — тест потерял смысл"
+
+    repo = _make_repo_copy(tmp_path)
+    _run_setup(repo, tmp_path, args=["--add", "growthbook"], answers="ключ-gb\n\n")
+
+    calls = [json.loads(line) for line in
+             (tmp_path / "uv.log").read_text(encoding="utf-8").splitlines()]
+    synced = {c["argv"][2] for c in calls if c["argv"][:2] == ["sync", "--script"]}
+    ran = {c["argv"][1] for c in calls if c["argv"][:1] == ["run"] and len(c["argv"]) > 1}
+
+    for path in expected:
+        assert path in synced, "зависимости %s не готовятся на установке" % path
+        assert path in ran, (
+            "окружение %s не собирается: после одного лишь sync первый запуск "
+            "всё равно занимал 12 секунд" % path)
+
+
+def test_warmup_failure_is_reported_not_swallowed(tmp_path):
+    """Сети нет — зависимости не доехали. Это не повод останавливать
+    установку, но и молчать нельзя: именно так выглядит «первая сессия без
+    коннекторов», ради которой всё это и делается."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "growthbook"],
+                           answers="ключ-gb\n\n",
+                           stub_overrides={"uv": "#!/usr/bin/env bash\nexit 1\n"})
+
+    assert "зависимости не скачались" in result.stdout, result.stdout[-2000:]
+    assert result.returncode == 0, "прогрев не должен останавливать установку"

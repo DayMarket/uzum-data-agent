@@ -551,40 +551,86 @@ setup_clickhouse_dwh() {
 }
 
 # ── Телеметрия ───────────────────────────────────────────────────────────
-# Отдельный вопрос, а не «тот же хост, что и складской ClickHouse»: таблицы
+# Вопросов больше нет ни одного: таблицы
 # sandbox.ai_usage_{sessions,events,verdicts} созданы ТОЛЬКО на складском
-# кластере (wms-clickhouse). Аналитик, который вместо него указал бы здесь
-# dwh-clickhouse, раньше получал TELEMETRY_CH_HOST=dwh-... — каждый INSERT
-# падал бы с «unknown table», а telemetry.write() по контракту не бросает
-# исключений и молча складывал бы строку в локальную очередь навсегда: ноль
-# телеметрии при зелёной установке.
+# кластере (wms-clickhouse) и пишутся той же учёткой, которой аналитик и
+# так туда ходит. Спрашивать хост отдельно было не просто лишней работой:
+# указавший вместо склада dwh-clickhouse получал TELEMETRY_CH_HOST=dwh-…,
+# каждый INSERT падал с «unknown table», а telemetry.write() по контракту
+# молчит — ноль телеметрии при зелёной установке. Теперь ошибиться негде,
+# адрес не вводится.
 #
-# Поэтому и смоук-запрос здесь не «жив ли сервер» (SELECT count() FROM
-# system.databases отвечает на любом кластере), а SELECT count() FROM
-# sandbox.ai_usage_sessions — он проверяет ровно тот путь, которым пойдут
-# хуки: тот кластер, та база, та таблица, те права.
+# Смоук-запрос остаётся и остаётся именно таким: не «жив ли сервер» (SELECT
+# count() FROM system.databases отвечает на любом кластере), а SELECT
+# count() FROM sandbox.ai_usage_sessions — он проверяет ровно тот путь,
+# которым пойдут хуки: тот кластер, та база, та таблица, те права. Это
+# единственное место, где человек узнаёт, что телеметрия работает.
+# Куда и чем пишет телеметрия — спрашиваем у самого lib/telemetry.py, а не
+# повторяем его развилку в bash. Иначе мастер проверял бы один доступ, а хуки
+# писали бы другим, и разошлись бы они молча при первой же правке правила.
+#
+# Источники — те же, что у хука: значения из secrets.env (их мастер туда уже
+# записал) плюс окружение этого запуска (значения из .env, если человек
+# заполнил файл). Окружение сильнее: в нём то, что проверено прямо сейчас.
+# Пароль печатается в стандартный вывод (труба, не argv) — в `ps` он не
+# попадает, как и в curl_check ниже.
+telemetry_target() {
+  UZUM_SECRETS="$SECRETS" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import envfile, telemetry
+path = os.environ.get('UZUM_SECRETS', '')
+values = envfile.read(path) if os.path.exists(path) else {}
+values.update({k: v for k, v in os.environ.items() if v})
+os.environ.clear()
+os.environ.update(values)
+cfg = telemetry.Config.from_env()
+override = any(os.environ.get(name) for name in (
+    'TELEMETRY_CH_HOST', 'TELEMETRY_CH_PORT', 'TELEMETRY_CH_USER',
+    'TELEMETRY_CH_PASSWORD', 'TELEMETRY_CH_SECURE'))
+print(cfg.host)
+print(cfg.port)
+print(cfg.user)
+print(cfg.password)
+print('override' if override else '')
+"
+}
+
 setup_telemetry() {
   say "── Телеметрия ── куда хуки пишут статистику работы (sandbox.ai_usage_*)"
-  printf "  Таблицы живут на складском кластере (WMS) — обычно это дефолт ниже.\n"
-  # Seed из .env (TELEMETRY_CH_* — так значения названы в secrets.env, а не
-  # T_HOST/T_PORT — те локальные для этой функции, см. put_env ниже).
-  T_HOST="${TELEMETRY_CH_HOST:-}"
-  ask T_HOST "  Хост телеметрии [wms-clickhouse.prod.um.internal]: "
-  T_HOST=${T_HOST:-wms-clickhouse.prod.um.internal}
-  T_PORT="${TELEMETRY_CH_PORT:-}"
-  ask T_PORT "  Порт [8123]: "
-  T_PORT=${T_PORT:-8123}
 
-  local T_USER T_PASSWORD
-  if [ "$CH_WMS_OK" = "1" ] && [ "$T_HOST" = "${CH_WMS_HOST:-}" ] && [ "$T_PORT" = "${CH_WMS_PORT:-}" ]; then
-    T_USER="$CH_WMS_USER"
-    T_PASSWORD="$CH_WMS_PASSWORD"
-    ok "тот же хост, что и складской ClickHouse (clickhouse-wms) — беру уже проверенный логин $T_USER"
-  else
-    T_USER="${TELEMETRY_CH_USER:-}"
-    ask T_USER "  Логин: "
-    T_PASSWORD="${TELEMETRY_CH_PASSWORD:-}"
-    ask_secret T_PASSWORD "  Пароль: "
+  # Ничего не спрашиваем. Решение владельца: таблицы sandbox.ai_usage_*
+  # живут на складском кластере (WMS), пишутся теми же логином и паролем,
+  # отдельного доступа к ним не существует — значит четыре отдельных
+  # вопроса и четыре строки в .env были лишней работой на установке и
+  # лишним поводом ошибиться.
+  #
+  # Здесь остаётся только живая проверка: это единственное место, где
+  # человек узнаёт, что телеметрия работает.
+  #
+  # Развилки "тот же хост или другой" больше нет. Раньше логин и пароль
+  # склада переиспользовались только при дословном совпадении хоста и
+  # порта, иначе спрашивались заново; теперь адрес не спрашивается вовсе,
+  # так что сравнивать нечего — мёртвой ветки не остаётся, она убрана.
+  # Исключение (другой адрес или отдельная учётка-писатель) задаётся
+  # руками в secrets.env через TELEMETRY_CH_* и перебивает WMS
+  # поколоночно — ровно так же, как это читает lib/telemetry.py, чтобы
+  # мастер проверял именно тот доступ, которым потом пишут хуки.
+  local target T_HOST T_PORT T_USER T_PASSWORD T_OVERRIDE
+  target="$(telemetry_target)"
+  T_HOST="$(printf '%s\n' "$target" | sed -n '1p')"
+  T_PORT="$(printf '%s\n' "$target" | sed -n '2p')"
+  T_USER="$(printf '%s\n' "$target" | sed -n '3p')"
+  T_PASSWORD="$(printf '%s\n' "$target" | sed -n '4p')"
+  T_OVERRIDE="$(printf '%s\n' "$target" | sed -n '5p')"
+
+  if [ -z "$T_HOST" ] || [ -z "$T_USER" ]; then
+    fail "складской ClickHouse ещё не настроен — телеметрии некуда писать"
+    fail "она включится сама, когда появится доступ: ./setup.sh --add clickhouse-wms"
+    return
+  fi
+  if [ -n "$T_OVERRIDE" ]; then
+    note "адрес или учётка телеметрии заданы отдельно (TELEMETRY_CH_* в $SECRETS) — проверяю их, а не складские"
   fi
 
   local http_out https_out http_code https_code scheme
@@ -608,22 +654,45 @@ setup_telemetry() {
 
   if [ -n "$scheme" ]; then
     ok "sandbox.ai_usage_sessions на месте, строк: $(cat "$http_out" 2>/dev/null)"
-    put_env TELEMETRY_CH_HOST "$T_HOST"
-    put_env TELEMETRY_CH_PORT "$T_PORT"
-    put_env TELEMETRY_CH_USER "$T_USER"
-    put_env TELEMETRY_CH_PASSWORD "$T_PASSWORD"
-    put_env TELEMETRY_CH_SECURE "$scheme"
+    drop_redundant_telemetry_env
     return
   fi
 
-  # Ничего не записываем: без TELEMETRY_CH_HOST телеметрия просто выключена
-  # (см. Config.from_env в lib/telemetry.py). Это честнее, чем записать
-  # заведомо нерабочий хост и копить очередь на диске месяцами.
+  # Ничего не записываем и ничего не выключаем: адрес и креды телеметрия
+  # берёт из CH_WMS_* сама. Отказ здесь означает "проверка не прошла" —
+  # чаще всего нет прав INSERT в sandbox у пилотной учётки, — и это стоит
+  # сказать словами, а не тишиной.
   fail "таблица sandbox.ai_usage_sessions не ответила (http: $http_code, https: ${https_code:-—})"
   if [ "$http_code" != "000" ]; then
     fail "$(head -c 300 "$http_out" 2>/dev/null)"
   fi
-  fail "телеметрия выключена — включить позже: ./setup.sh --add telemetry"
+  fail "телеметрия писаться не будет — перепроверить: ./setup.sh --add telemetry"
+}
+
+# Убрать из secrets.env те TELEMETRY_CH_*, которые дословно повторяют
+# CH_WMS_*. Это не уборка ради красоты: дубль ПЕРЕБИВАЕТ складские
+# значения (см. lib/telemetry.py::Config.from_env), поэтому после смены
+# пароля склада телеметрия молча перестала бы писаться — с полностью
+# исправным на вид доступом. Осознанно заданное другое значение (учётка-
+# писатель, другой адрес) не совпадает с CH_WMS_* и остаётся на месте.
+drop_redundant_telemetry_env() {
+  local out
+  out="$(python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import envfile, setup_helpers
+path = '$SECRETS'
+values = envfile.read(path) if os.path.exists(path) else {}
+pairs = [('TELEMETRY_CH_HOST', 'CH_WMS_HOST'), ('TELEMETRY_CH_PORT', 'CH_WMS_PORT'),
+         ('TELEMETRY_CH_USER', 'CH_WMS_USER'), ('TELEMETRY_CH_PASSWORD', 'CH_WMS_PASSWORD'),
+         ('TELEMETRY_CH_SECURE', 'CH_WMS_SECURE')]
+same = [t for t, w in pairs if t in values and values[t] == values.get(w)]
+removed = setup_helpers.drop_env(path, same)
+if removed:
+    print('убрал из %s дубли складских значений: %s' % (path, ', '.join(removed)))
+")"
+  [ -n "$out" ] && note "$out"
+  return 0
 }
 
 # ── Jira / Confluence (общий токен) ─────────────────────────────────────
@@ -893,6 +962,61 @@ render_engine_configs() {
   printf "  %s\n" "$out"
 }
 
+# ── Прогрев окружений локальных коннекторов ──────────────────────────────
+#
+# Находка прошлого круга, подтверждённая замером: `uv run
+# connectors/trino_proxy.py` на ЧИСТОЙ машине идёт 17,7 секунды — uv
+# разрешает и скачивает зависимости из PEP 723-заголовка. Codex ждёт старта
+# MCP-сервера меньше и просто не показывает коннектор: ни ошибки, ни
+# предупреждения, «всё настроено, ничего нет». Бьёт это по первому запуску
+# сразу после установки — по человеку, который ещё не знает, как инструмент
+# выглядит в норме.
+#
+# Лечится тем, что окружение готовится здесь, на установке, где человек и
+# так ждёт. Именно `uv run`, а не `uv sync --script`: замерено, что после
+# одного лишь sync первый `uv run` всё равно шёл 12 секунд (sync наполняет
+# кэш пакетов, но не собирает окружение самого скрипта). После прогрева —
+# 0,4 секунды.
+#
+# Стандартный ввод закрыт: каждый из этих скриптов — MCP-сервер по stdio,
+# на EOF он завершается сам. Ошибки и вывод не показываем: цель — построить
+# окружение, а не проверить доступ (для этого есть живые проверки выше).
+# Список файлов берётся из connectors/registry.py — второго перечня
+# коннекторов не заводим.
+warm_local_connectors() {
+  local scripts script
+  scripts="$(python3 -c "
+import sys
+sys.path.insert(0, '$REPO_DIR')
+from connectors.registry import CONNECTORS, ProjectScript
+seen = []
+for c in CONNECTORS:
+    for args in (c.args, c.codex.args if c.codex else ()):
+        for a in args:
+            if isinstance(a, ProjectScript) and a.path not in seen:
+                seen.append(a.path)
+print('\n'.join(seen))
+")"
+  [ -z "$scripts" ] && return 0
+  say "Готовлю окружения коннекторов (разово, чтобы первая сессия не молчала)…"
+  for script in $scripts; do
+    [ -f "$REPO_DIR/$script" ] || continue
+    # Два шага, и оба нужны. `uv sync --script` — единственный, по чьему
+    # коду возврата видно, доехали ли зависимости: у `uv run` код возврата
+    # принадлежит самому скрипту (а он законно завершается ошибкой, если
+    # переменные ещё не заполнены). `uv run` — то, что реально собирает
+    # окружение скрипта: после одного лишь sync первый запуск всё равно
+    # занимал 12 секунд, замерено.
+    if (cd "$REPO_DIR" && uv sync --script "$script" >/dev/null 2>&1); then
+      (cd "$REPO_DIR" && uv run "$script" </dev/null >/dev/null 2>&1)
+      ok "$script"
+    else
+      fail "$script — зависимости не скачались (нет сети?); первая сессия может не увидеть этот коннектор, повтори ./setup.sh позже"
+    fi
+  done
+  return 0
+}
+
 # Доставляет .codex/config.toml профилем ($CODEX_HOME/uzum.config.toml, см.
 # докстринг deploy_codex_profile в lib/setup_helpers.py про то, почему не
 # слияние в базовый config.toml и не переключение $CODEX_HOME) и сливает
@@ -1117,6 +1241,10 @@ fi
 # MISSING, не до неё — незачем генерировать и доставлять конфиг, если
 # установка всё равно сейчас оборвётся с ошибкой нехватки доступов.
 render_engine_configs
+
+# Окружения локальных коннекторов — сразу после генерации конфигов и до
+# доставки в Codex: к первой сессии всё должно быть уже собрано.
+warm_local_connectors
 
 # Codex: доставить конфиг и хуки туда, где движок их реально видит.
 #

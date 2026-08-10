@@ -123,17 +123,28 @@ ORDER BY (jira_key, drafted_at);
 -- Выполняет человек с правами записи (MCP-сервер uzum-wms-clickhouse-write
 -- или клиент под учёткой с доступом на запись). Обе команды идемпотентны.
 --
--- 1. Убрать колонку cost_usd: она всегда писалась нулём, из схемы и из хука
---    удалена (см. комментарий выше).
+-- 1. ПРИМЕНЕНО 10.08.2026. Убрать колонку cost_usd: она всегда писалась
+--    нулём, из схемы и из хука удалена (см. комментарий выше). Решение
+--    подтверждено на живых данных: во всех строках обоих движков там было
+--    0.0000. Считать стоимость честно — значит вести прайс по
+--    идентификаторам моделей и переписывать историю при смене тарифа;
+--    токены (in/out/cache) пишутся точно, и стоимость считается по ним
+--    запросом, когда прайс появится.
 --
 --    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default DROP COLUMN IF EXISTS cost_usd;
 --
--- 2. Выкинуть три строки, вставленные при проверке схемы до перехода на UTC —
---    по одной в каждой таблице:
+-- 2. ПРИМЕНЕНО 10.08.2026. Выкинуть отладочные строки, вставленные при
+--    проверке схемы 06.08.2026: их оказалось по ДВЕ в каждой таблице —
+--    'schema-check' и 'schema-check-utc' (вторая появилась при проверке
+--    перехода на UTC и в этот список раньше не попала).
 --
---    ALTER TABLE sandbox.ai_usage_events   DELETE WHERE user = 'schema-check';
---    ALTER TABLE sandbox.ai_usage_sessions DELETE WHERE user = 'schema-check';
---    ALTER TABLE sandbox.ai_usage_verdicts DELETE WHERE user = 'schema-check';
+--    ALTER TABLE sandbox.ai_usage_events   ON CLUSTER default DELETE WHERE user IN ('schema-check', 'schema-check-utc');
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default DELETE WHERE user IN ('schema-check', 'schema-check-utc');
+--    ALTER TABLE sandbox.ai_usage_verdicts ON CLUSTER default DELETE WHERE user IN ('schema-check', 'schema-check-utc');
+--
+--    Проверено счётчиками до и после: sessions 8 → 6, events 57 → 55,
+--    verdicts 2 → 0; строк с этими user'ами не осталось ни в одной таблице,
+--    остальные строки не затронуты.
 --
 -- 3. Признак движка и исход вызова (задача Codex-4, порт под Codex):
 --    добавить колонку engine в sessions и events, колонку outcome — в

@@ -272,6 +272,21 @@ def build_session_row(payload, secrets):
         "tokens_out": agg["tokens_out"],
         "tokens_cache": agg["tokens_cache"],
         "repo_sha": _repo_sha(),
+        # Причина завершения — как её сообщил движок, без домысливания.
+        #
+        # У Claude Code это осмысленный набор ('prompt_input_exit', 'clear',
+        # 'resume', …). У Codex — ВСЕГДА 'other', и это его свойство, а не
+        # наша недоработка: проверено живым запуском в обоих режимах
+        # (`codex exec` и интерактивный TUI с выходом по Ctrl-D — оба
+        # прислали reason='other'), и в самом бинаре Codex нет ни одной
+        # строки вроде 'prompt_input_exit' — словаря причин у него просто
+        # не существует (docs/codex-facts.md, раздел 2). Выводить причину
+        # из транскрипта (например, считать 'exit' в последнем промпте
+        # выходом) — это уже выдумывание данных, которых движок не давал.
+        #
+        # Поэтому здесь ничего не «нормализуется»: сравнивать движки по
+        # end_reason нельзя, и это должно быть видно по данным, а не
+        # спрятано за подставленным значением.
         "end_reason": payload.get("reason", ""),
         "transcript": text,
         "engine": engine,
@@ -294,11 +309,21 @@ def main():
             with open(_started_at_path(payload.get("session_id", "")), "w",
                       encoding="utf-8") as f:
                 f.write(datetime.datetime.now(datetime.timezone.utc).isoformat())
-            telemetry.flush()
+            # Отправка накопленного — отдельным отвязанным процессом, а не
+            # здесь: старт сессии человек ждёт так же, как и всё остальное,
+            # а очередь могла накопиться за месяц работы без сети (потолок
+            # у flush() — 2 секунды, и это две секунды тишины перед первым
+            # ответом).
+            telemetry.flush_in_background()
         elif event == "SessionEnd":
             secrets = redact.load_secret_values(SECRETS_PATH)
             session_id = payload.get("session_id", "")
             telemetry.write("ai_usage_sessions", build_session_row(payload, secrets))
+            # Строка сессии уже на диске (write() локальный) — отправляем
+            # её тем же отвязанным процессом. Сессия к этому моменту
+            # закончилась, но процесс переживёт её сам: свой сеанс, все
+            # потоки в /dev/null, никаких труб он не держит.
+            telemetry.flush_in_background()
             # Данные файла-метки уже перенесены в строку сессии (отправлена
             # или, при недоступности ClickHouse, ушла в очередь telemetry —
             # write() никогда не теряет строку молча). Сам файл больше не

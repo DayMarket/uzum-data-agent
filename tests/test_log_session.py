@@ -303,6 +303,12 @@ CODEX_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "codex"
 CODEX_TRANSCRIPT = str(
     CODEX_FIXTURES / "rollout-2026-08-07T20-49-54-019fdd21-9868-7633-a9ca-63122c263433.jsonl"
 )
+# Транскрипт интерактивной сессии (TUI) — снят живым запуском 10.08.2026,
+# см. докстринг tests/test_transcript_codex.py. Разбор промптов у exec и TUI
+# разный, и до этой правки телеметрия считала промпты только в exec.
+CODEX_TRANSCRIPT_TUI = str(
+    CODEX_FIXTURES / "rollout-tui-2026-08-10T18-11-56-019fec04.jsonl"
+)
 
 
 def test_claude_session_row_has_engine_claude(tmp_path):
@@ -347,6 +353,44 @@ def test_codex_session_row_has_engine_codex_and_real_counts():
     assert row["n_prompts"] == 2
     assert row["n_tools"] == 2
     assert row["tokens_in"] == 58109
+
+
+def test_interactive_codex_session_row_counts_the_prompts():
+    """Строка сессии из ИНТЕРАКТИВНОГО Codex — того режима, в котором
+    работает аналитик. На живых данных у всех таких сессий было
+    n_prompts = 0 при непустых n_tools и токенах: разбор знал только формат
+    `codex exec`. Здесь тот же путь, что у хука на SessionEnd, но на
+    транскрипте TUI."""
+    payload = {
+        "session_id": "019fec04-0de1-79f2-9897-9212dfc25265",
+        "transcript_path": CODEX_TRANSCRIPT_TUI,
+        "cwd": "/tmp/codex-project",
+        "hook_event_name": "SessionEnd",
+        "reason": "other",
+    }
+    row = log_session.build_session_row(payload, {})
+
+    assert row["engine"] == "codex"
+    assert row["n_prompts"] == 1, (
+        "промпт интерактивной сессии снова не посчитан — это и есть "
+        "n_prompts = 0 в sandbox.ai_usage_sessions")
+
+
+def test_end_reason_is_written_as_the_engine_reported_it():
+    """Codex сообщает только 'other' — словаря причин у него нет вовсе
+    (проверено живым запуском обоих режимов и строками самого бинаря,
+    docs/codex-facts.md, раздел 2). Значение пишется как пришло: любая
+    «нормализация» здесь была бы выдуманной причиной завершения, а по этой
+    колонке сравнивают движки."""
+    for reason in ("other", "prompt_input_exit", "clear"):
+        payload = {
+            "session_id": "s-reason",
+            "transcript_path": CODEX_TRANSCRIPT_TUI,
+            "cwd": "/tmp/codex-project",
+            "hook_event_name": "SessionEnd",
+            "reason": reason,
+        }
+        assert log_session.build_session_row(payload, {})["end_reason"] == reason
 
 
 def test_row_columns_match_the_table_schema_for_codex_engine():
