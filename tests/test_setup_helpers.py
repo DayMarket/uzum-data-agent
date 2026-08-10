@@ -830,3 +830,74 @@ def test_codex_home_respects_env_override(monkeypatch, tmp_path):
 def test_codex_home_defaults_to_dot_codex_under_home(monkeypatch):
     monkeypatch.delenv("CODEX_HOME", raising=False)
     assert setup_helpers.codex_home() == os.path.expanduser("~/.codex")
+
+
+# ── Готовность коннектора: «переменная есть» ≠ «в переменной что-то есть» ──
+#
+# Находка ревью: условие `.strip()` в connector_readiness не проверялось
+# ничем — замена его на `name not in values` оставляла весь набор зелёным.
+# А путь реальный: write_env пишет пустое значение как KEY='' (проверено
+# ниже), и такой файл сделал бы «готовыми» все девять коннекторов разом,
+# молча отменив весь гейт.
+
+def _readiness(secrets_path):
+    return dict(setup_helpers.connector_readiness(str(secrets_path)))
+
+
+def test_empty_value_is_not_a_value(tmp_path):
+    """Переменная в файле есть, значения в ней нет. Именно так write_env
+    сохраняет пустой ответ, и именно так выглядит `.env`, заполненный
+    наполовину."""
+    path = tmp_path / "secrets.env"
+    setup_helpers.write_env(str(path), {"OMD_URL": "", "OMD_TOKEN": ""})
+
+    # Предпосылка, а не украшение: если бы файл вообще не содержал этих
+    # имён, тест проверял бы совсем другой случай — «ключа нет».
+    assert "OMD_URL=''" in path.read_text(encoding="utf-8")
+
+    assert _readiness(path)["openmetadata"] == ("OMD_URL", "OMD_TOKEN")
+    assert "openmetadata" not in setup_helpers.configured_connector_ids(str(path))
+
+
+def test_whitespace_only_value_is_not_a_value(tmp_path):
+    """Пробел или табуляция — это опечатка при заполнении файла руками, а не
+    адрес и не токен. Коннектор с таким «значением» не поднимется."""
+    path = tmp_path / "secrets.env"
+    setup_helpers.write_env(str(path), {"GRAFANA_URL": "   ", "GRAFANA_TOKEN": "\t"})
+
+    assert _readiness(path)["grafana"] == ("GRAFANA_URL", "GRAFANA_TOKEN")
+    assert "grafana" not in setup_helpers.configured_connector_ids(str(path))
+
+
+def test_a_filled_value_really_makes_the_connector_ready(tmp_path):
+    """Положительный контроль. Без него все проверки выше прошли бы и на
+    сломанной функции, которая всегда отвечает «ничего не готово»."""
+    path = tmp_path / "secrets.env"
+    setup_helpers.write_env(str(path), {"OMD_URL": "https://omd.internal",
+                                        "OMD_TOKEN": "токен"})
+
+    assert _readiness(path)["openmetadata"] == ()
+    assert "openmetadata" in setup_helpers.configured_connector_ids(str(path))
+
+
+def test_secrets_file_made_of_empty_values_enables_nothing_but_trino(tmp_path):
+    """Тот самый путь целиком: `.env.example` поставляется с двумя десятками
+    пустых переменных, и если они окажутся в secrets.env (write_env кладёт
+    их как KEY=''), гейт обязан остаться закрытым для всех восьми
+    коннекторов, которым нужны креды. Девятый — trino, он ходит по SSO и
+    кредов не требует вовсе.
+
+    Имена берутся из настоящего `.env.example`, а не переписаны сюда: файл
+    меняется вместе с реестром, и тест обязан меняться вместе с ним."""
+    example = (Path(setup_helpers.__file__).resolve().parent.parent
+               / ".env.example").read_text(encoding="utf-8")
+    names = [line.split("=", 1)[0].strip()
+             for line in example.splitlines()
+             if "=" in line and not line.strip().startswith("#")]
+    assert len(names) >= 10, "в .env.example не осталось переменных — тест ослеп"
+
+    path = tmp_path / "secrets.env"
+    setup_helpers.write_env(str(path), {name: "" for name in names})
+
+    assert setup_helpers.configured_connector_ids(str(path)) == ["trino"], (
+        "пустышки из .env.example приняты за настроенные доступы")
