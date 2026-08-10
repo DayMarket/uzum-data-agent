@@ -14,6 +14,7 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "lib"))
 
+import envfile  # noqa: E402
 import hook_payload  # noqa: E402
 import hook_scope  # noqa: E402
 import redact  # noqa: E402
@@ -118,7 +119,8 @@ def _read_transcript_bytes(path):
 def read_transcript(path, secrets):
     """Прочитать JSONL-лог сессии: замаскированный текст и агрегаты."""
     agg = {"n_prompts": 0, "n_tools": 0, "tokens_in": 0, "tokens_out": 0,
-           "tokens_cache": 0, "skills_used": [], "_user_text": ""}
+           "tokens_cache": 0, "skills_used": [], "_user_text": "",
+           "_models": []}
     try:
         raw_bytes, original_size, truncated = _read_transcript_bytes(path)
     except OSError:
@@ -158,6 +160,14 @@ def read_transcript(path, secrets):
 
         if is_prompt:
             user_text_parts.append(_content_text(message.get("content")))
+
+        # Модель, на которой отвечал ассистент. По записи на сообщение —
+        # какую из них считать моделью сессии, решает build_session_row
+        # (правило одно на оба движка).
+        if item.get("type") == "assistant":
+            model = message.get("model")
+            if isinstance(model, str) and model:
+                agg["_models"].append(model)
 
         usage = message.get("usage")
         message_id = message.get("id")
@@ -210,6 +220,67 @@ def find_jira_key(text):
     return match.group(1) if match else ""
 
 
+def pick_model(models):
+    """Одна модель на строку сессии из всех, что встретились в транскрипте.
+
+    Правило общее для обоих движков (извлечение — разное, оно в парсерах):
+    ПРЕОБЛАДАЮЩАЯ по числу ходов, при равенстве — последняя. Не «последняя»
+    как таковая: колонка отвечает на вопрос «какой моделью работали», и
+    сессия, где двадцать ходов прошли на одной модели, а последний — на
+    другой, ответила бы неверно. Не «список» — в отчётности по нему нельзя
+    сгруппировать, а случай смены модели посреди сессии редкий; если он
+    станет частым, это будет видно и колонку можно будет расширить осознанно.
+
+    Пусто — модели в транскрипте не нашлось (сессия без единого ответа
+    модели). Пустая строка честнее подстановки «наверное, дефолтная».
+    """
+    if not models:
+        return ""
+    counts = {}
+    for name in models:
+        counts[name] = counts.get(name, 0) + 1
+    best = max(counts.values())
+    # При равенстве берём ту, что встретилась последней: reversed() + первое
+    # совпадение.
+    for name in reversed(models):
+        if counts[name] == best:
+            return name
+    return ""
+
+
+def clickhouse_users(environ=None, secrets_path=SECRETS_PATH):
+    """(ch_wms_user, ch_dwh_user) — две учётки ClickHouse, под которыми шла
+    работа. Обе как есть, ничего не выбирая и не сливая.
+
+    Почему две, а не одна «корпоративная»: на рабочей машине владельца в
+    складской кластер ходят под ЗАИМСТВОВАННОЙ учёткой (n-lyubchenko → 200),
+    а его личная там не заведена вовсе (a-bir → 403 «password is incorrect,
+    or there is no user with such name»). Записать одну — либо потерять
+    человека, либо соврать про то, чьим доступом читались данные. Две
+    колонки делают заимствование видимым: один ch_wms_user на несколько
+    разных ch_dwh_user.
+
+    Опознание человека — уже вывод из этих двух (ch_dwh_user, иначе
+    ch_wms_user), и делается он при чтении, в запросе. Здесь его нет
+    намеренно: вывод не должен затвердевать в данных.
+
+    Смотрим сначала в окружение (bin/uzum разворачивает туда secrets.env
+    перед запуском движка), потом в сам secrets.env — сессию могли начать и
+    не через наш лаунчер. Чего нет — пустая строка: выдуманная учётка хуже
+    отсутствующей.
+    """
+    environ = os.environ if environ is None else environ
+    try:
+        stored = envfile.read(secrets_path)
+    except Exception:
+        stored = {}
+
+    def value(name):
+        return (environ.get(name) or stored.get(name) or "").strip()
+
+    return value("CH_WMS_USER"), value("CH_DWH_USER")
+
+
 def _repo_sha():
     try:
         return subprocess.check_output(
@@ -252,8 +323,13 @@ def build_session_row(payload, secrets):
     # реально пришёл аналитик. Только если в сообщениях пользователя ключа
     # нет, ищем по всему тексту.
     jira_key = find_jira_key(agg.get("_user_text", "")) or find_jira_key(text)
+    ch_wms_user, ch_dwh_user = clickhouse_users()
     return {
         "session_id": session_id,
+        # Учётка МАШИНЫ, а не человека в компании: раньше сюда пытались
+        # подставить корпоративный логин через UZUM_USER, но переменная,
+        # из которой он брался, давно исчезла (см. bin/uzum). Личность
+        # теперь считается из ch_dwh_user/ch_wms_user ниже.
         "user": os.environ.get("UZUM_USER", os.environ.get("USER", "")),
         # Единственное место, где определён формат времени для колонок
         # DateTime('UTC') — telemetry.format_utc()/utc_now_str(). "started"
@@ -271,6 +347,12 @@ def build_session_row(payload, secrets):
         "tokens_in": agg["tokens_in"],
         "tokens_out": agg["tokens_out"],
         "tokens_cache": agg["tokens_cache"],
+        "model": pick_model(agg.get("_models") or []),
+        # Порядок распаковки — единственное место, где эти две можно
+        # перепутать местами, и снаружи такая ошибка незаметна: обе строки,
+        # обе похожи на логин.
+        "ch_wms_user": ch_wms_user,
+        "ch_dwh_user": ch_dwh_user,
         "repo_sha": _repo_sha(),
         # Причина завершения — как её сообщил движок, без домысливания.
         #

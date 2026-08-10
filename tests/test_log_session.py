@@ -3,7 +3,10 @@ import importlib.util
 import io
 import json
 import os
+import pathlib
 from pathlib import Path
+
+import transcript_codex
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location(
@@ -437,3 +440,155 @@ def test_session_end_removes_started_at_marker_file(tmp_path, monkeypatch):
     monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
     assert log_session.main() == 0
     assert not os.path.exists(started_path)
+
+
+# --- Модель и корпоративный аккаунт в строке сессии ------------------------
+#
+# Обе колонки заведены по запросу владельца: по данным нельзя было ответить
+# ни «какой моделью работали», ни «кто это был» (колонка user — имя
+# пользователя ноутбука). Проверяется на НАСТОЯЩИХ транскриптах обоих
+# движков, а не на выдуманных: у Claude Code и Codex модель лежит в разных
+# местах, и «работает на моей фикстуре» тут ничего не значит.
+
+CLAUDE_TRANSCRIPT_REAL = str(
+    REPO_ROOT / "tests" / "fixtures" / "claude" / "transcript-7dc1bb17.jsonl"
+)
+
+
+def test_model_is_taken_from_a_real_claude_transcript():
+    """Живой файл Claude Code: одна сессия, один ответ модели.
+    message.model записей assistant — единственное место, где движок её
+    называет."""
+    _text, agg = log_session.read_transcript(CLAUDE_TRANSCRIPT_REAL, {})
+
+    assert agg["_models"] == ["claude-opus-5"], agg["_models"]
+    assert log_session.pick_model(agg["_models"]) == "claude-opus-5"
+
+
+def test_model_is_taken_from_a_real_codex_transcript():
+    """Живой файл Codex (интерактивная сессия). Модель там называется в
+    turn_context — в session_meta ключа model нет вовсе, проверено."""
+    _text, agg = transcript_codex.read_transcript(CODEX_TRANSCRIPT_TUI, {})
+
+    assert agg["_models"] == ["gpt-5.6-sol"], agg["_models"]
+
+
+def test_session_row_carries_the_model_of_each_engine(tmp_path):
+    """Та же проверка, но через строку, которая реально уходит в
+    ClickHouse: колонка не должна теряться по дороге от парсера к строке.
+
+    Файл Claude Code кладём по НАСТОЯЩЕЙ раскладке
+    (~/.claude/projects/<slug>/<session_id>.jsonl) — движок определяется по
+    имени и пути файла (lib/hook_payload.detect_engine), и из каталога
+    фикстур он был бы «unknown», то есть тест проверял бы не тот путь."""
+    projects = tmp_path / ".claude" / "projects" / "slug"
+    projects.mkdir(parents=True)
+    claude_path = projects / "7dc1bb17-2de2-4ad4-972c-a486d894bb6b.jsonl"
+    claude_path.write_bytes(pathlib.Path(CLAUDE_TRANSCRIPT_REAL).read_bytes())
+
+    claude_row = log_session.build_session_row(
+        {"session_id": "s-claude", "transcript_path": str(claude_path),
+         "hook_event_name": "SessionEnd", "reason": "clear"}, {})
+    codex_row = log_session.build_session_row(
+        {"session_id": "s-codex", "transcript_path": CODEX_TRANSCRIPT_TUI,
+         "cwd": "/tmp/codex-project", "hook_event_name": "SessionEnd",
+         "reason": "other"}, {})
+
+    assert claude_row["engine"] == "claude"
+    assert claude_row["model"] == "claude-opus-5"
+    assert codex_row["engine"] == "codex"
+    assert codex_row["model"] == "gpt-5.6-sol"
+
+
+def test_dominant_model_wins_over_the_one_that_happened_to_be_last():
+    """Правило выбора, если модель меняли за сессию. «Последняя» ответила бы
+    неверно на вопрос «какой моделью работали»: двадцать ходов на одной
+    модели и один в конце на другой — это работа на первой."""
+    models = ["claude-opus-5"] * 20 + ["claude-fable-5"]
+
+    assert log_session.pick_model(models) == "claude-opus-5"
+
+
+def test_tie_between_models_is_broken_by_the_last_one():
+    """Поровну — берём последнюю: это единственный детерминированный выбор,
+    который не зависит от порядка ключей в словаре."""
+    assert log_session.pick_model(["a", "b", "a", "b"]) == "b"
+
+
+def test_no_model_in_the_transcript_leaves_the_column_empty():
+    """Сессия без единого ответа модели. Пустая строка честнее подстановки
+    «наверное, дефолтная»."""
+    assert log_session.pick_model([]) == ""
+
+
+def test_both_clickhouse_logins_are_recorded_and_not_swapped(tmp_path):
+    """Две учётки, и они не взаимозаменяемы: на рабочей машине владельца в
+    складской кластер ходят под заимствованной учёткой, а личная там не
+    заведена вовсе. Перепутать их местами — самая вероятная и самая
+    незаметная ошибка здесь: обе строки, обе похожи на логин."""
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("CH_WMS_USER='n-lyubchenko'\nCH_DWH_USER='a-bir'\n",
+                       encoding="utf-8")
+
+    wms, dwh = log_session.clickhouse_users({}, str(secrets))
+
+    assert wms == "n-lyubchenko", "в ch_wms_user не та учётка"
+    assert dwh == "a-bir", "в ch_dwh_user не та учётка"
+
+
+def test_dwh_login_is_empty_when_only_the_warehouse_is_configured(tmp_path):
+    """DWH при установке необязателен. Пусто — это факт «личной учётки нет»,
+    а не повод подставить складскую: опознание человека собирается при
+    чтении, и подмена здесь спрятала бы заимствованную учётку."""
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("CH_WMS_USER='i-petrov'\n", encoding="utf-8")
+
+    wms, dwh = log_session.clickhouse_users({}, str(secrets))
+
+    assert wms == "i-petrov"
+    assert dwh == ""
+
+
+def test_both_logins_are_empty_when_nothing_is_configured(tmp_path):
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("JIRA_TOKEN='t'\n", encoding="utf-8")
+
+    assert log_session.clickhouse_users({}, str(secrets)) == ("", "")
+    assert log_session.clickhouse_users({}, str(tmp_path / "нет-такого")) == ("", "")
+
+
+def test_logins_are_read_from_the_environment_the_launcher_prepared(tmp_path):
+    """bin/uzum разворачивает secrets.env в окружение перед запуском
+    движка — оттуда и берём в первую очередь."""
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("CH_DWH_USER='из-файла'\n", encoding="utf-8")
+
+    wms, dwh = log_session.clickhouse_users(
+        {"CH_DWH_USER": "из-окружения"}, str(secrets))
+
+    assert dwh == "из-окружения"
+    assert wms == ""
+
+
+def test_session_row_keeps_machine_user_and_both_logins_apart(monkeypatch, tmp_path):
+    """Три разных значения в одной строке, и ни одно не подменяет другое:
+    user — учётка ноутбука, ch_wms_user — та, под которой ходят в склад,
+    ch_dwh_user — личная в DWH. Раньше в user пытались положить
+    корпоративный логин через переменную, которой давно нет (см. bin/uzum),
+    и там молча оказывалось имя пользователя машины."""
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("CH_WMS_USER='n-lyubchenko'\nCH_DWH_USER='a-bir'\n",
+                       encoding="utf-8")
+    monkeypatch.setattr(log_session, "SECRETS_PATH", str(secrets))
+    monkeypatch.setenv("UZUM_USER", "ноутбук-аналитика")
+    monkeypatch.delenv("CH_WMS_USER", raising=False)
+    monkeypatch.delenv("CH_DWH_USER", raising=False)
+
+    row = log_session.build_session_row(
+        {"session_id": "s", "transcript_path": CLAUDE_TRANSCRIPT_REAL,
+         "hook_event_name": "SessionEnd", "reason": "clear"}, {})
+
+    assert row["user"] == "ноутбук-аналитика"
+    assert row["ch_wms_user"] == "n-lyubchenko"
+    assert row["ch_dwh_user"] == "a-bir"
+    assert len({row["user"], row["ch_wms_user"], row["ch_dwh_user"]}) == 3

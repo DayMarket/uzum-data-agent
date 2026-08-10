@@ -352,7 +352,8 @@ def read_transcript(path, secrets):
     read_transcript(): (text, agg), agg содержит n_prompts, n_tools,
     tokens_in, tokens_out, tokens_cache, skills_used, _user_text."""
     agg = {"n_prompts": 0, "n_tools": 0, "tokens_in": 0, "tokens_out": 0,
-           "tokens_cache": 0, "skills_used": [], "_user_text": ""}
+           "tokens_cache": 0, "skills_used": [], "_user_text": "",
+           "_models": []}
 
     try:
         original_size = os.path.getsize(path)
@@ -403,6 +404,16 @@ def read_transcript(path, secrets):
             usage = info.get("total_token_usage") if isinstance(info, dict) else None
             if isinstance(usage, dict):
                 last_token_usage = usage
+
+        elif item_type == "turn_context":
+            # Модель этого хода. Единственное место, где Codex её называет:
+            # в session_meta ключа model НЕТ вовсе (там только
+            # model_provider) — проверено на живых файлах 0.147.0. Пишем по
+            # записи на ход, а какую из них считать моделью сессии, решает
+            # один общий для обоих движков код (см. log_session.py).
+            model = payload.get("model")
+            if isinstance(model, str) and model:
+                agg["_models"].append(model)
 
         elif item_type == "response_item" and payload_type == "custom_tool_call":
             agg["n_tools"] += 1

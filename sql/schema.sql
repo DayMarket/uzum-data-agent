@@ -23,6 +23,12 @@
 CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
 (
     session_id   String,
+    -- Учётка МАШИНЫ (имя пользователя ноутбука, 'anastasiabir'), а не логин
+    -- человека в компании. Раньше сюда пытались подставить корпоративный
+    -- через переменную CH_USER, но она исчезла при разделении ClickHouse на
+    -- два кластера, и подстановка молча уходила в $USER — никто не замечал,
+    -- потому что значение выглядело правдоподобно. Личность теперь читается
+    -- из ch_dwh_user/ch_wms_user ниже, а эта колонка честно означает машину.
     user         LowCardinality(String),
     started_at   DateTime('UTC'),
     ended_at     DateTime('UTC'),
@@ -51,6 +57,37 @@ CREATE TABLE IF NOT EXISTS sandbox.ai_usage_sessions ON CLUSTER default
     -- Значение пишет .claude/hooks/log_session.py по hook_payload.detect_engine() —
     -- по содержимому события, не по переменной окружения.
     engine       LowCardinality(String) DEFAULT 'claude',
+    -- Модель, на которой реально шла работа: 'claude-opus-5', 'gpt-5.6-sol'
+    -- и т.п. Берётся из транскрипта тем же проходом, что и остальные
+    -- агрегаты (у Claude Code — message.model записей assistant, у Codex —
+    -- ключ model в turn_context). Если за сессию модель меняли, пишется
+    -- ПРЕОБЛАДАЮЩАЯ по числу ходов, при равенстве — последняя (см.
+    -- .claude/hooks/log_session.py и lib/transcript_codex.py): на вопрос
+    -- «какой моделью работали» последняя отвечала бы неверно, если человек
+    -- переключился на один ход в конце. Пусто — модель в транскрипте не
+    -- нашлась (например, сессия без единого ответа модели).
+    model        LowCardinality(String) DEFAULT '',
+    -- Две учётки ClickHouse, под которыми шла работа. Колонка user рядом
+    -- хранит имя пользователя ноутбука ('anastasiabir') — идентификатором
+    -- человека в команде оно не является.
+    --
+    -- Их именно две, и это не избыточность. На рабочей машине владельца
+    -- проверено запуском: в складской кластер ходят под ЗАИМСТВОВАННОЙ
+    -- учёткой (n-lyubchenko → 200), а личная там просто не заведена
+    -- (a-bir → 403 «password is incorrect, or there is no user with such
+    -- name»). Одной колонкой это не выразить: записать складскую — потерять
+    -- человека; записать личную — соврать про то, чьим доступом читались
+    -- данные. Разделение делает заимствование ВИДИМЫМ: один ch_wms_user на
+    -- несколько разных ch_dwh_user.
+    --
+    -- Опознание человека — выражение при чтении: coalesce'ом
+    -- ch_dwh_user → ch_wms_user (личная учётка DWH, а если DWH не настроен,
+    -- то складская). Третьей колонки с «итоговым аккаунтом» здесь нет
+    -- намеренно: две колонки — это факты, а идентичность — вывод из них, и
+    -- вывод не должен затвердевать в данных.
+    ch_wms_user  LowCardinality(String) DEFAULT '',
+    -- Пусто, если DWH не настроен: он необязателен при установке.
+    ch_dwh_user  LowCardinality(String) DEFAULT '',
     inserted_at  DateTime('UTC') DEFAULT now()
 )
 ENGINE = ReplicatedMergeTree('/clickhouse/tables/{shard}/sandbox/ai_usage_sessions', '{replica}')
@@ -146,7 +183,31 @@ ORDER BY (jira_key, drafted_at);
 --    verdicts 2 → 0; строк с этими user'ами не осталось ни в одной таблице,
 --    остальные строки не затронуты.
 --
--- 3. Признак движка и исход вызова (задача Codex-4, порт под Codex):
+-- 3. ПРИМЕНЕНО 10.08.2026. Модель и корпоративный аккаунт в строке сессии:
+--    по данным нельзя было ответить ни «какой моделью работали», ни «кто
+--    это был» (колонка user — имя пользователя ноутбука).
+--
+--    Миграция сделана ДО того, как хук начал писать эти поля, и это не
+--    формальность: на этом кластере `input_format_skip_unknown_fields = 1`
+--    (см. пункт ниже), то есть вставка с лишним полем проходит с кодом 200,
+--    а значение молча пропадает — «пишем и не сохраняется», без единой
+--    ошибки. Проверено DESCRIBE TABLE сразу после ALTER.
+--
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default
+--        ADD COLUMN IF NOT EXISTS model LowCardinality(String) DEFAULT '';
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default
+--        ADD COLUMN IF NOT EXISTS ch_wms_user LowCardinality(String) DEFAULT '';
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default
+--        ADD COLUMN IF NOT EXISTS ch_dwh_user LowCardinality(String) DEFAULT '';
+--
+--    Колонка corp_account (одна, с готовым «итоговым» аккаунтом) была
+--    заведена этой же миграцией и снесена в тот же день, до первой записи в
+--    неё (проверено: 0 непустых значений на 9 строк): владелец уточнил, что
+--    нужны обе учётки по отдельности, см. комментарий у ch_wms_user выше.
+--
+--    ALTER TABLE sandbox.ai_usage_sessions ON CLUSTER default DROP COLUMN IF EXISTS corp_account;
+--
+-- 4. Признак движка и исход вызова (задача Codex-4, порт под Codex):
 --    добавить колонку engine в sessions и events, колонку outcome — в
 --    events. DEFAULT закрывает и старые строки (ADD COLUMN ... DEFAULT в
 --    MergeTree отдаёт значение по умолчанию при чтении для строк,

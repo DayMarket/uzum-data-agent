@@ -362,3 +362,36 @@ def test_healthy_path_without_flag_launches_the_only_configured_engine(tmp_path)
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "STUB claude" in result.stdout
+
+
+def test_machine_user_is_passed_through_and_an_explicit_one_survives(tmp_path):
+    """Колонка `user` в телеметрии берётся из UZUM_USER. Здесь стояла
+    подстановка `${CH_USER:-$USER}`, а переменной CH_USER не существует с
+    тех пор, как ClickHouse развели на два кластера — она молча уходила в
+    запасной вариант, и никто не замечал, потому что $USER выглядит
+    правдоподобно.
+
+    Два факта разом: без явного значения приезжает учётка машины, а
+    заданное снаружи значение переживает запуск (прежняя строка его
+    затирала — это второй дефект в той же строке)."""
+    repo = _make_repo(tmp_path, broken_helper=False)
+    engine_bin = tmp_path / "engine-bin"
+    home = _isolated_home(tmp_path, engine_bin, secrets=SECRETS_WITH_JIRA)
+    path = _curated_path([engine_bin], include_python=True)
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    _run_uzum(repo, home, path, args=["--claude"], dump_dir=dump_dir)
+    env = _engine_env(dump_dir, "claude")
+    assert env.get("UZUM_USER") == "test", (
+        "в UZUM_USER не учётка машины: %r" % env.get("UZUM_USER"))
+
+    env_with_override = {"HOME": str(home), "PATH": path, "USER": "test",
+                         "TERM": "xterm", "UZUM_TEST_DUMP_DIR": str(dump_dir),
+                         "UZUM_USER": "явно-заданный"}
+    subprocess.run(["bash", str(repo / "bin" / "uzum"), "--claude"],
+                   env=env_with_override, cwd=str(repo), input="\n",
+                   capture_output=True, text=True, timeout=30)
+    env2 = _engine_env(dump_dir, "claude")
+    assert env2.get("UZUM_USER") == "явно-заданный", (
+        "заданный снаружи UZUM_USER затёрт: %r" % env2.get("UZUM_USER"))
