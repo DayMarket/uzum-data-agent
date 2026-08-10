@@ -603,3 +603,115 @@ def test_warmup_failure_is_reported_not_swallowed(tmp_path):
 
     assert "зависимости не скачались" in result.stdout, result.stdout[-2000:]
     assert result.returncode == 0, "прогрев не должен останавливать установку"
+
+
+# ── Коннектор без кредов не включается ───────────────────────────────────
+#
+# Живая проверка всех девяти показала: `openmetadata` без кредов не «просто
+# не работает», а падает с кодом 1 ещё до рукопожатия — на каждом старте
+# сессии, при полностью исправной установке. Проверено рукопожатием:
+# openmetadata — код 1, ноль инструментов; grafana — код 0, но 65
+# инструментов против молча подставленного http://localhost:3000; growthbook
+# — код 0, три инструмента без ключа. Правило общее: нет кредов — нет
+# коннектора, и человеку сказано, каких именно значений не хватает.
+
+NO_CREDS_CONNECTORS = ("grafana", "openmetadata", "growthbook", "sheets",
+                       "clickhouse-dwh", "superset")
+
+
+def test_connectors_without_credentials_do_not_get_enabled(tmp_path):
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK],
+               dotenv=DOTENV_WMS_AND_JIRA)
+
+    enabled = _enabled(repo)
+    assert "clickhouse-wms" in enabled and "atlassian" in enabled
+    # trino кредов не требует вовсе (SSO) — его отсутствие в списке означало
+    # бы, что правило рубит лишнее.
+    assert "trino" in enabled, enabled
+    for cid in NO_CREDS_CONNECTORS:
+        assert cid not in enabled, (
+            "%s включён без кредов: под Codex это падение на каждом старте "
+            "сессии, под Claude Code — «Connected» у нерабочего сервера" % cid)
+
+
+def test_codex_config_has_no_connector_that_cannot_start(tmp_path):
+    """Тот же гейт должен действовать и на конфиг Codex — он собирается из
+    того же списка."""
+    repo = _make_repo_copy(tmp_path)
+
+    _, home = _run_setup(repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK],
+                         dotenv=DOTENV_WMS_AND_JIRA, engines=("claude", "codex"))
+
+    config = (home / ".codex" / "uzum.config.toml").read_text(encoding="utf-8")
+    assert "[mcp_servers.clickhouse-wms]" in config
+    for cid in NO_CREDS_CONNECTORS:
+        assert "[mcp_servers.%s]" % cid not in config, (
+            "%s попал в конфиг Codex без кредов" % cid)
+
+
+def test_wizard_says_which_values_are_missing_not_just_that_it_is_absent(tmp_path):
+    """«Человек должен понимать, почему коннектора нет, а не искать его
+    молча»: в итоге названы конкретные переменные."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK],
+                           dotenv=DOTENV_WMS_AND_JIRA)
+
+    out = result.stdout
+    assert "openmetadata" in out and "нет OMD_URL, OMD_TOKEN" in out, out[-2500:]
+    assert "нет GRAFANA_URL, GRAFANA_TOKEN" in out
+    assert "нет GROWTHBOOK_TOKEN" in out
+    assert "./setup.sh --add openmetadata" in out
+
+
+def test_stale_enabled_connectors_are_removed_when_credentials_are_gone(tmp_path):
+    """Состояние клона приёмки: в settings.local.json включены все девять,
+    хотя кредов на три из них нет ни у кого. Список раньше только
+    дополнялся и никогда не чистился — поэтому один раз включённый
+    openmetadata падал в каждой сессии месяцами."""
+    repo = _make_repo_copy(tmp_path)
+    settings = repo / ".claude" / "settings.local.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"enabledMcpjsonServers": [
+        "atlassian", "clickhouse-dwh", "clickhouse-wms", "sheets", "superset",
+        "trino", "grafana", "openmetadata", "growthbook"]}), encoding="utf-8")
+
+    _run_setup(repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK],
+               dotenv=DOTENV_WMS_AND_JIRA)
+
+    enabled = _enabled(repo)
+    for cid in NO_CREDS_CONNECTORS:
+        assert cid not in enabled, (
+            "%s остался включённым с прошлого раза — список чистится только "
+            "добавлением" % cid)
+    assert "clickhouse-wms" in enabled and "atlassian" in enabled
+
+
+def test_a_connector_configured_earlier_survives_a_failed_live_check(tmp_path):
+    """Обратная сторона правила: истёкший токен — не повод выкинуть
+    коннектор из конфига. Правило про «кредов нет вовсе», а не про «сейчас
+    не ответил».
+
+    Машина, где Jira когда-то настроили успешно (токен лежит в secrets.env),
+    а сегодня он протух: живая проверка отвечает 401, новый токен в
+    secrets.env не пишется — и коннектор обязан остаться включённым, чтобы
+    человек увидел внятную ошибку авторизации, а не молчаливое исчезновение
+    инструментов Jira из сессии."""
+    repo = _make_repo_copy(tmp_path)
+    settings = repo / ".claude" / "settings.local.json"
+    settings.parent.mkdir(parents=True, exist_ok=True)
+    settings.write_text(json.dumps({"enabledMcpjsonServers": ["atlassian"]}),
+                        encoding="utf-8")
+    home = tmp_path / "home"
+    (home / ".config" / "uzum-ai").mkdir(parents=True, exist_ok=True)
+    (home / ".config" / "uzum-ai" / "secrets.env").write_text(
+        "JIRA_TOKEN='токен-с-прошлой-установки'\n", encoding="utf-8")
+
+    _run_setup(repo, tmp_path, curl_rules=[WMS_OK, JIRA_REJECTED],
+               dotenv=DOTENV_WMS_AND_JIRA)
+
+    assert "atlassian" in _enabled(repo), (
+        "коннектор с уже настроенными кредами выкинут из-за отказа живой "
+        "проверки — человек потеряет инструменты Jira вместо понятной 401")

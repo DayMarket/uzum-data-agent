@@ -40,6 +40,52 @@ def write_env(path, values):
     os.chmod(path, 0o600)
 
 
+def connector_readiness(secrets_path):
+    """[(id коннектора, кортеж недостающих переменных)] по всему реестру.
+
+    Одно правило на все девять: коннектор готов, когда у него заполнены все
+    переменные без дефолта (registry.Connector.required_sources). Коннектор,
+    которому кредов не дали, включать нельзя — и это общее правило, а не
+    заплатка на конкретный пакет.
+
+    Почему это важнее, чем кажется: `openmetadata` без кредов не «просто не
+    работает», а падает с кодом 1 ещё до рукопожатия — на каждом старте
+    сессии, в лицо человеку, у которого установка полностью исправна
+    (проверено рукопожатием: код возврата 1, ноль инструментов). Соседние
+    `grafana` и `growthbook` ведут себя приличнее лишь на вид: grafana молча
+    подставляет http://localhost:3000 и предлагает 65 инструментов, ни один
+    из которых не может сработать. Оба случая — один и тот же дефект
+    установки, и лечится он одинаково: нет кредов — нет коннектора.
+
+    Читаем secrets.env, а не окружение: мастер только что сам туда всё
+    записал, а вот в его собственном окружении значений может не быть (режим
+    ./setup.sh --add, где .env уже удалён).
+    """
+    import sys
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from connectors.registry import CONNECTORS
+
+    values = {}
+    if os.path.exists(secrets_path):
+        try:
+            values = envfile.read(secrets_path)
+        except Exception:
+            values = {}
+    out = []
+    for connector in CONNECTORS:
+        missing = tuple(name for name in connector.required_sources()
+                        if not (values.get(name) or "").strip())
+        out.append((connector.id, missing))
+    return out
+
+
+def configured_connector_ids(secrets_path):
+    """Только те, у кого всё нужное заполнено."""
+    return [cid for cid, missing in connector_readiness(secrets_path) if not missing]
+
+
 def drop_env(path, names):
     """Убрать переменные из env-файла. Возвращает список реально удалённых.
 

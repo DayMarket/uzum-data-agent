@@ -396,3 +396,41 @@ def test_codex_toml_connector_section_does_not_depend_on_repo_root(tmp_path):
     b = tomllib.loads(render_configs.render_codex_toml(CONNECTORS, repo_root=tmp_path / "b"))
     assert a["mcp_servers"] == b["mcp_servers"]
     assert a["permissions"] != b["permissions"]
+
+
+# ── Коннектор без кредов не включается (живая проверка всех девяти) ────────
+
+
+def test_required_sources_match_the_placeholders_without_defaults_in_mcp_json():
+    """Правило «обязательна переменная без дефолта» — не наше внутреннее
+    соглашение, а то же самое, что читает сам Claude Code.
+
+    Сверяем с ДРУГОЙ стороны: не по реестру, а по готовому .mcp.json —
+    какие `${VAR}` в нём стоят без `:-дефолта`. Claude Code по этому же
+    файлу печатает «Missing environment variables», и на клоне без кредов
+    его список совпал с нашим дословно (JIRA_TOKEN у atlassian,
+    GRAFANA_URL+GRAFANA_TOKEN у grafana, ни одной у trino)."""
+    servers = _mcp_json_servers()
+
+    for connector in CONNECTORS:
+        entry = servers[connector.id]
+        from_config = set()
+        for value in (entry.get("env") or {}).values():
+            match = re.fullmatch(r"\$\{([A-Z0-9_]+)\}", value)
+            if match:
+                from_config.add(match.group(1))
+        assert set(connector.required_sources()) == from_config, (
+            "%s: реестр считает обязательными %s, а в .mcp.json без дефолта "
+            "стоят %s" % (connector.id, connector.required_sources(), from_config))
+
+
+def test_trino_requires_nothing_and_openmetadata_requires_both_values():
+    """Две крайности правила, названные явно: trino ходит по SSO и кредов не
+    требует вовсе (его нельзя «выключить за отсутствие доступа»), а
+    openmetadata без обоих значений падает с кодом 1 до рукопожатия."""
+    by_id = {c.id: c for c in CONNECTORS}
+
+    assert by_id["trino"].required_sources() == ()
+    assert set(by_id["openmetadata"].required_sources()) == {"OMD_URL", "OMD_TOKEN"}
+    assert set(by_id["grafana"].required_sources()) == {"GRAFANA_URL", "GRAFANA_TOKEN"}
+    assert by_id["growthbook"].required_sources() == ("GROWTHBOOK_TOKEN",)

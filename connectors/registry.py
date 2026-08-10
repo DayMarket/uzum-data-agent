@@ -158,6 +158,33 @@ class Connector:
     def static_env(self) -> Tuple[StaticEnv, ...]:
         return tuple(item for item in self.env if isinstance(item, StaticEnv))
 
+    def required_sources(self) -> Tuple[str, ...]:
+        """Имена переменных в secrets.env, без которых коннектор бесполезен.
+
+        Правило одно на все девять и берётся из самого описания: обязательна
+        та переменная, у которой НЕТ дефолта. У секрета дефолт невозможен по
+        построению, у структурной он либо есть (порт, адрес Jira), либо её
+        неоткуда взять (адрес Grafana, путь к ключу Google) — и тогда она
+        такая же обязательная, как токен.
+
+        Совпадение с чужим прочтением, а не только с нашим: `claude mcp list`
+        сам считает по `.mcp.json` «Missing environment variables» и выдаёт
+        ровно эти же наборы (проверено живым запуском на клоне без кредов —
+        JIRA_TOKEN у atlassian, GRAFANA_URL+GRAFANA_TOKEN у grafana и т.д.,
+        и ни одной у trino).
+
+        Считаем по обеим веткам запуска (общей и Codex): у clickhouse-* они
+        просят одни и те же CH_*_*, но полагаться на это совпадение как на
+        вечное не стоит.
+        """
+        names = []
+        for branch in (self.env, self.codex.env if self.codex is not None else ()):
+            for item in branch:
+                if isinstance(item, EnvVar) and item.default is None:
+                    if item.source not in names:
+                        names.append(item.source)
+        return tuple(names)
+
     def codex_spec(self):
         """(command, args, env) — то, что реально запускается под Codex:
         своя ветка (`self.codex`), если она задана, иначе общая с Claude

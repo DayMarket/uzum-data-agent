@@ -165,10 +165,41 @@ $x"
 import os, sys
 sys.path.insert(0, '$REPO_DIR/lib')
 import setup_helpers
-servers = [s for s in os.environ.get('UZUM_SERVERS', '').split(chr(10)) if s.strip()]
+asked = [s for s in os.environ.get('UZUM_SERVERS', '').split(chr(10)) if s.strip()]
+# Единственные ворота на оба движка: включаем только то, чему есть чем
+# работать. Правило общее и берётся из реестра (переменная без дефолта =
+# обязательная), а не перечислением коннекторов здесь.
+#
+# Фильтр стоит именно на объединённом списке, а не на добавляемом: иначе
+# коннектор, попавший в settings.local.json когда-то раньше, оставался бы
+# включённым навсегда — список только дополнялся и никогда не чистился.
+# Ровно так на клоне приёмки оказались включены все девять, включая
+# openmetadata, который падает на старте, и его падение человек видел в
+# каждой сессии.
+ready = set(setup_helpers.configured_connector_ids('$SECRETS'))
+servers = [s for s in asked if s in ready]
 setup_helpers.write_enabled_servers('$SETTINGS_LOCAL', servers)
 print(' '.join(setup_helpers.read_enabled_servers('$SETTINGS_LOCAL') or []))
 "
+}
+
+# Чего не хватает каждому коннектору — один раз, из реестра (переменная без
+# дефолта = обязательная, см. registry.Connector.required_sources). Строки
+# вида "<id><TAB>OMD_URL, OMD_TOKEN"; пустое второе поле значит «всё на месте».
+READINESS=""
+load_readiness() {
+  READINESS="$(python3 -c "
+import sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import setup_helpers
+for cid, missing in setup_helpers.connector_readiness('$SECRETS'):
+    print('%s\t%s' % (cid, ', '.join(missing)))
+")"
+  return 0
+}
+
+missing_vars_for() {
+  printf '%s\n' "$READINESS" | awk -F'\t' -v id="$1" '$1 == id {print $2}'
 }
 
 # Коннекторы из общего списка, которых нет в итоговом состоянии установки.
@@ -1286,12 +1317,24 @@ say "Готово. Включено в этом запуске: ${#ENABLED[@]}"
 # в первой же задаче. Только в полном прогоне: после ./setup.sh --add
 # одного коннектора перечень остальных восьми — не ответ на заданный
 # вопрос.
+load_readiness
 if [ "$MODE" != "add" ]; then
   NOT_ENABLED="$(not_enabled_servers)"
   if [ -n "$NOT_ENABLED" ]; then
     printf "\nНе подключено — по команде на каждое:\n"
     for s in $NOT_ENABLED; do
-      printf "  · %-15s ./setup.sh --add %s\n" "$s" "$s"
+      MISS="$(missing_vars_for "$s")"
+      if [ -n "$MISS" ]; then
+        # Человек должен понимать, ПОЧЕМУ коннектора нет, а не искать его
+        # молча. Без этих значений он всё равно не поднимется: openmetadata
+        # падает с кодом 1 ещё до рукопожатия, grafana молча уходит на
+        # localhost:3000 и предлагает 65 инструментов, ни один из которых не
+        # может сработать.
+        printf "  · %-15s нет %s\n" "$s" "$MISS"
+        printf "  %-17s ./setup.sh --add %s\n" "" "$s"
+      else
+        printf "  · %-15s ./setup.sh --add %s\n" "$s" "$s"
+      fi
     done
     printf "Это можно сделать в любой момент, полный мастер перезапускать не нужно.\n"
   fi
