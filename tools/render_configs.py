@@ -147,15 +147,6 @@ def _codex_arg(item) -> str:
     return item
 
 
-def _codex_spec(connector: Connector):
-    """(command, args, env) для рендера Codex — своя ветка (`connector.codex`),
-    если она задана (сейчас только у clickhouse-wms/clickhouse-dwh, см.
-    докстринг registry.py, "РЕШЁННАЯ НАХОДКА"), иначе общая с Claude Code."""
-    if connector.codex is not None:
-        return connector.codex.command, connector.codex.args, connector.codex.env
-    return connector.command, connector.args, connector.env
-
-
 # ── Codex: именованный профиль разрешений (задача Codex-5, "разрешения") ───
 #
 # У Codex нет allow/deny-списка инструментов, как у Claude Code
@@ -412,7 +403,12 @@ def render_codex_toml(connectors: Iterable[Connector], repo_root: Path = None,
         connectors = [c for c in connectors if c.id in allowed]
     blocks = [_render_codex_permission_profile(repo_root)]
     for connector in connectors:
-        command, raw_args, env_items = _codex_spec(connector)
+        # Своя ветка запуска (`connector.codex`), если она задана — сейчас
+        # только у clickhouse-wms/clickhouse-dwh, см. докстринг registry.py,
+        # "РЕШЁННАЯ НАХОДКА". Развилка одна на весь репозиторий и живёт в
+        # реестре (`Connector.codex_spec`): те же имена читает мостик
+        # окружения connectors/codex_env_bridge.py.
+        command, raw_args, env_items = connector.codex_spec()
         args = [_codex_arg(a) for a in raw_args]
         lines = [
             "[mcp_servers.%s]" % connector.id,

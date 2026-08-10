@@ -29,9 +29,21 @@ BIN_UZUM = REPO_ROOT / "bin" / "uzum"
 def _stub_engine(path):
     """Заглушка claude/codex — печатает, что её вызвали, и с чем, и
     завершается успешно. Если она хоть раз попадёт в вывод в тестах ниже —
-    значит движок реально запустился, это и есть проверяемый факт."""
+    значит движок реально запустился, это и есть проверяемый факт.
+
+    Плюс, когда задан UZUM_TEST_DUMP_DIR, сбрасывает туда СВОЁ окружение и
+    СВОЙ argv. Это именно снимок процесса, а не список того, что заглушка
+    согласилась подтвердить: она не знает, какие имена от неё ждут, и
+    печатает всё подряд (`env`). Нужен для тестов про мостик окружения
+    Codex ниже."""
     path.write_text(
-        "#!/usr/bin/env bash\necho \"STUB $(basename \"$0\") called args=[$*]\"\n",
+        "#!/usr/bin/env bash\n"
+        "name=\"$(basename \"$0\")\"\n"
+        "echo \"STUB $name called args=[$*]\"\n"
+        "if [ -n \"${UZUM_TEST_DUMP_DIR:-}\" ]; then\n"
+        "  env > \"$UZUM_TEST_DUMP_DIR/$name.env\"\n"
+        "  printf '%s\\n' \"$@\" > \"$UZUM_TEST_DUMP_DIR/$name.argv\"\n"
+        "fi\n",
         encoding="utf-8",
     )
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -44,9 +56,15 @@ def _make_repo(tmp_path, broken_helper=False):
     repo = tmp_path / "repo"
     (repo / "bin").mkdir(parents=True)
     (repo / "lib").mkdir(parents=True)
+    (repo / "connectors").mkdir()
     (repo / "work").mkdir()
     shutil.copy(BIN_UZUM, repo / "bin" / "uzum")
     (repo / "bin" / "uzum").chmod(0o755)
+    # Мостик окружения Codex и реестр, из которого он берёт соответствие
+    # source→target (см. тесты про запуск Codex ниже).
+    shutil.copy(REPO_ROOT / "connectors" / "registry.py", repo / "connectors" / "registry.py")
+    shutil.copy(REPO_ROOT / "connectors" / "codex_env_bridge.py",
+                repo / "connectors" / "codex_env_bridge.py")
     if broken_helper:
         # Синтаксически валидный python-модуль, который безусловно падает
         # при импорте — воспроизводит "вспомогательный процесс не
@@ -63,10 +81,10 @@ def _make_repo(tmp_path, broken_helper=False):
     return repo
 
 
-def _isolated_home(tmp_path, engine_bin_dir):
+def _isolated_home(tmp_path, engine_bin_dir, secrets="CH_USER='t'\n"):
     home = tmp_path / "home"
     (home / ".config" / "uzum-ai").mkdir(parents=True)
-    (home / ".config" / "uzum-ai" / "secrets.env").write_text("CH_USER='t'\n", encoding="utf-8")
+    (home / ".config" / "uzum-ai" / "secrets.env").write_text(secrets, encoding="utf-8")
     engine_bin_dir.mkdir()
     _stub_engine(engine_bin_dir / "claude")
     _stub_engine(engine_bin_dir / "codex")
@@ -90,7 +108,7 @@ def _curated_path(extra_dirs, include_python):
     tools_dir = extra_dirs[0].parent / ("coreutils-with-python" if include_python else "coreutils-no-python")
     tools_dir.mkdir(exist_ok=True)
     needed = ["dirname", "basename", "readlink", "cat", "mkdir", "sed",
-              "printf", "grep", "rm", "ls", "bash", "true", "false"]
+              "printf", "grep", "rm", "ls", "bash", "true", "false", "env"]
     if include_python:
         needed.append("python3")
     for name in needed:
@@ -102,8 +120,10 @@ def _curated_path(extra_dirs, include_python):
     return ":".join(parts)
 
 
-def _run_uzum(repo, home, path, args=(), input_text="\n"):
+def _run_uzum(repo, home, path, args=(), input_text="\n", dump_dir=None):
     env = {"HOME": str(home), "PATH": path, "USER": "test", "TERM": "xterm"}
+    if dump_dir is not None:
+        env["UZUM_TEST_DUMP_DIR"] = str(dump_dir)
     return subprocess.run(
         ["bash", str(repo / "bin" / "uzum"), *args],
         env=env, cwd=str(repo), input=input_text,
@@ -168,6 +188,151 @@ def test_healthy_path_still_launches_the_requested_engine(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "STUB codex" in result.stdout
+
+
+# ── мостик окружения для Codex ───────────────────────────────────────────
+#
+# Находка живой приёмки: под Codex шесть коннекторов из девяти стартовали
+# без переменных. У Codex нет ${VAR}-подстановки в config.toml — только
+# `env_vars = ["ИМЯ"]`, «переслать под тем же именем» (docs/codex-facts.md,
+# раздел 4), а аналитик держит в secrets.env наши имена (JIRA_TOKEN), тогда
+# как процессы коннекторов ждут свои (JIRA_PERSONAL_TOKEN). Значит целевые
+# имена обязан выставить тот, кто запускает codex, — то есть bin/uzum.
+#
+# Проверяется это снимком окружения РЕАЛЬНО ЗАПУЩЕННОЙ заглушки движка
+# (`env` в файл), а не возвратом функции: заглушка не знает, каких имён от
+# неё ждут, и сбрасывает всё подряд. Значения намеренно со спецсимволами —
+# пробел и `$`: они проходят через `source secrets.env`, python и execvpe, и
+# любое лишнее раскрытие в шелле было бы видно.
+
+SECRETS_WITH_JIRA = (
+    "CH_USER='t'\n"
+    "CH_WMS_HOST='wms.internal'\n"
+    "CH_WMS_USER='u'\n"
+    "CH_WMS_PASSWORD='пароль с пробелом'\n"
+    "JIRA_TOKEN='токен-9f3a с пробелом и $знаком'\n"
+    "GRAFANA_TOKEN='граф-токен'\n"
+)
+JIRA_TOKEN_VALUE = "токен-9f3a с пробелом и $знаком"
+
+
+def _engine_env(dump_dir, engine):
+    """Окружение процесса-движка из снимка `env`. Разбираем по первому «=»:
+    это сырые строки чужого процесса, а не подготовленный тестом словарь."""
+    text = (dump_dir / ("%s.env" % engine)).read_text(encoding="utf-8")
+    env = {}
+    for line in text.splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            env[name] = value
+    return env
+
+
+def test_codex_gets_the_variables_under_the_names_connectors_actually_expect(tmp_path):
+    """Главный тест находки: JIRA_TOKEN аналитика обязан доехать до Codex
+    ещё и под именами JIRA_PERSONAL_TOKEN/CONFLUENCE_PERSONAL_TOKEN, иначе
+    uvx mcp-atlassian стартует без токена и не отдаёт ни одного
+    инструмента."""
+    repo = _make_repo(tmp_path, broken_helper=False)
+    engine_bin = tmp_path / "engine-bin"
+    home = _isolated_home(tmp_path, engine_bin, secrets=SECRETS_WITH_JIRA)
+    path = _curated_path([engine_bin], include_python=True)
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    result = _run_uzum(repo, home, path, args=["--codex"], dump_dir=dump_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "STUB codex" in result.stdout
+    env = _engine_env(dump_dir, "codex")
+    assert env.get("JIRA_PERSONAL_TOKEN") == JIRA_TOKEN_VALUE, (
+        "JIRA_PERSONAL_TOKEN = %r" % env.get("JIRA_PERSONAL_TOKEN"))
+    assert env.get("CONFLUENCE_PERSONAL_TOKEN") == JIRA_TOKEN_VALUE
+    assert env.get("GRAFANA_SERVICE_ACCOUNT_TOKEN") == "граф-токен"
+    # Исходные имена никуда не делись — их читает, например, trino_proxy.py
+    # из secrets.env, и ломать это не входило в задачу.
+    assert env.get("JIRA_TOKEN") == JIRA_TOKEN_VALUE
+
+
+def test_codex_gets_the_defaults_for_addresses_nobody_filled_in(tmp_path):
+    """Адреса Jira/Confluence/Trino в secrets.env не лежат: раньше их
+    подставлял `${JIRA_URL:-https://jira.uzum.com}` в .mcp.json, и под Codex
+    подставить их было некому."""
+    repo = _make_repo(tmp_path, broken_helper=False)
+    engine_bin = tmp_path / "engine-bin"
+    home = _isolated_home(tmp_path, engine_bin, secrets=SECRETS_WITH_JIRA)
+    path = _curated_path([engine_bin], include_python=True)
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    _run_uzum(repo, home, path, args=["--codex"], dump_dir=dump_dir)
+
+    env = _engine_env(dump_dir, "codex")
+    assert env.get("JIRA_URL") == "https://jira.uzum.com"
+    assert env.get("CONFLUENCE_URL") == "https://confluence.uzum.com"
+    assert env.get("TRINO_HOST") == "trino.prod-data.internal.daymarket.uz"
+    assert env.get("TRINO_CATALOG") == "dwh-iceberg"
+
+
+def test_codex_is_still_launched_with_our_profile_and_the_users_arguments(tmp_path):
+    """Мостик не должен ничего поменять в самом запуске: тот же `-p uzum`,
+    те же аргументы человека — и значения по-прежнему не в командной строке
+    (в `ps` их быть не должно, как и раньше)."""
+    repo = _make_repo(tmp_path, broken_helper=False)
+    engine_bin = tmp_path / "engine-bin"
+    home = _isolated_home(tmp_path, engine_bin, secrets=SECRETS_WITH_JIRA)
+    path = _curated_path([engine_bin], include_python=True)
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    _run_uzum(repo, home, path, args=["--codex", "экспорт отчёта"], dump_dir=dump_dir)
+
+    argv = (dump_dir / "codex.argv").read_text(encoding="utf-8").splitlines()
+    assert argv == ["-p", "uzum", "экспорт отчёта"], argv
+    assert JIRA_TOKEN_VALUE not in " ".join(argv)
+
+
+def test_claude_code_environment_is_left_exactly_as_it_was(tmp_path):
+    """Граница задачи: у Claude Code подстановка своя и работает
+    (`${JIRA_TOKEN}` внутри .mcp.json), переименовывать ему ничего не надо.
+    Целевые имена в его окружении означали бы, что мостик применился не там,
+    где надо."""
+    repo = _make_repo(tmp_path, broken_helper=False)
+    engine_bin = tmp_path / "engine-bin"
+    home = _isolated_home(tmp_path, engine_bin, secrets=SECRETS_WITH_JIRA)
+    path = _curated_path([engine_bin], include_python=True)
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    result = _run_uzum(repo, home, path, args=["--claude"], dump_dir=dump_dir)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    env = _engine_env(dump_dir, "claude")
+    assert env.get("JIRA_TOKEN") == JIRA_TOKEN_VALUE, "секреты перестали доезжать"
+    for name in ("JIRA_PERSONAL_TOKEN", "CONFLUENCE_PERSONAL_TOKEN",
+                 "GRAFANA_SERVICE_ACCOUNT_TOKEN", "JIRA_URL", "TRINO_HOST"):
+        assert name not in env, (
+            "%s появился в окружении Claude Code — поведение изменилось там, "
+            "где меняться не должно" % name)
+
+
+def test_missing_bridge_file_stops_the_launch_instead_of_starting_codex_blind(tmp_path):
+    """Защитное условие в bin/uzum, проверенное само по себе: без файла
+    мостика запуск обязан оборваться с объяснением. Тихий `exec codex` тут
+    дал бы ровно ту сессию с шестью мёртвыми коннекторами, ради которой всё
+    это и делалось."""
+    repo = _make_repo(tmp_path, broken_helper=False)
+    (repo / "connectors" / "codex_env_bridge.py").unlink()
+    engine_bin = tmp_path / "engine-bin"
+    home = _isolated_home(tmp_path, engine_bin, secrets=SECRETS_WITH_JIRA)
+    path = _curated_path([engine_bin], include_python=True)
+
+    result = _run_uzum(repo, home, path, args=["--codex"])
+
+    assert result.returncode != 0, "молча запустился без мостика"
+    combined = result.stdout + result.stderr
+    assert "STUB codex" not in combined, combined
+    assert "codex_env_bridge.py" in combined
 
 
 def test_healthy_path_without_flag_launches_the_only_configured_engine(tmp_path):

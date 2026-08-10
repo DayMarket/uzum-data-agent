@@ -26,6 +26,20 @@ SECRETS="$HOME/.config/uzum-ai/secrets.env"
 SETTINGS_LOCAL="$REPO_DIR/.claude/settings.local.json"
 SERVERS_LIST="clickhouse-wms clickhouse-dwh atlassian superset trino grafana openmetadata growthbook sheets"
 
+# Без чего установка неполна. Не «важные», а именно те, без которых
+# инструмент не делает того, ради чего его ставят: задача приходит ключом
+# Jira, данные лежат в складском ClickHouse. Ровно это обещают README и
+# страница в Confluence («начинать можно, имея только ClickHouse и Jira»).
+# Остальные семь коннекторов расширяют круг задач и добавляются позже одной
+# командой. Список короткий и стоит рядом с SERVERS_LIST намеренно: он
+# читается вместе с ним.
+REQUIRED_SERVERS="clickhouse-wms atlassian"
+
+# Итоговое состояние установки: что включено ВООБЩЕ (этот запуск плюс всё,
+# настроенное раньше) — заполняется из write_enabled в конце. Не то же, что
+# ENABLED: тот про один запуск. Пустая строка до присваивания — set -u.
+ENABLED_ALL=""
+
 # Профиль, которым Codex подключает наш конфиг: `codex -p uzum` /
 # `codex exec -p uzum`, слоем поверх $CODEX_HOME/config.toml — тот же
 # CODEX_PROFILE_NAME, что и в lib/setup_helpers.py (держи в синхроне).
@@ -122,6 +136,12 @@ setup_helpers.write_env('$SECRETS', {os.environ['PUT_ENV_KEY']: os.environ['PUT_
 # Пишет итоговый список включённых серверов, объединяя с уже включёнными
 # раньше (а не затирая их) — иначе ./setup.sh --add одного коннектора молча
 # выключил бы все остальные, настроенные в прошлый раз.
+#
+# Печатает этот же объединённый список одной строкой — из него итог в конце
+# мастера считает, чего не хватает. Именно объединённый, а не ENABLED этого
+# запуска: человек, который на повторном прогоне нажал Enter на уже
+# работающем коннекторе, не должен читать про него «не подключено», и
+# наоборот — «включено 2» не значит, что всё остальное настроено.
 write_enabled() {
   local existing joined x
   existing="$(python3 -c "
@@ -147,7 +167,35 @@ sys.path.insert(0, '$REPO_DIR/lib')
 import setup_helpers
 servers = [s for s in os.environ.get('UZUM_SERVERS', '').split(chr(10)) if s.strip()]
 setup_helpers.write_enabled_servers('$SETTINGS_LOCAL', servers)
+print(' '.join(setup_helpers.read_enabled_servers('$SETTINGS_LOCAL') or []))
 "
+}
+
+# Коннекторы из общего списка, которых нет в итоговом состоянии установки.
+# По одному имени в строке.
+not_enabled_servers() {
+  local s x found
+  for s in $SERVERS_LIST; do
+    found=0
+    for x in $ENABLED_ALL; do
+      [ "$x" = "$s" ] && found=1
+    done
+    [ "$found" = "0" ] && printf "%s\n" "$s"
+  done
+  return 0
+}
+
+# То же, но только по обязательным (REQUIRED_SERVERS).
+missing_required_servers() {
+  local s x found
+  for s in $REQUIRED_SERVERS; do
+    found=0
+    for x in $ENABLED_ALL; do
+      [ "$x" = "$s" ] && found=1
+    done
+    [ "$found" = "0" ] && printf "%s\n" "$s"
+  done
+  return 0
 }
 
 # ── Заполнение доступов файлом (.env) вместо вопросов ───────────────────
@@ -582,6 +630,15 @@ setup_telemetry() {
 setup_jira() {
   say "── Jira ── Профиль → Personal Access Tokens → Create token"
   ask_required_secret JIRA_TOKEN "  Токен: " "JIRA_TOKEN (токен Jira)"
+  # Пустой ввод — это не «токен не подошёл». Без этой развилки Enter на
+  # вопросе давал пустой Bearer, Jira отвечала 401, и человек читал «токен
+  # не принят» — шёл перевыпускать нормальный токен вместо того, чтобы
+  # просто вставить его (ровно так и произошло на приёмке).
+  if [ -z "$JIRA_TOKEN" ]; then
+    fail "токен не введён — проверять нечего"
+    fail "пропущено — подключить позже: ./setup.sh --add atlassian"
+    return
+  fi
   local out code name
   out="$(mk_tmp)"
   code=$(curl_check "$out" 10 "https://jira.uzum.com/rest/api/2/myself" \
@@ -597,16 +654,63 @@ setup_jira() {
   fi
 }
 
-# ── Superset ── SSO, но SUPERSET_URL — обязательная переменная в .mcp.json
-# без дефолта: без неё superset_mcp.py падает на старте, а не "не смог
-# подключиться" — поэтому URL всё равно нужно записать, даже без кредов.
+# ── Superset ── нужны и адрес, и креды, по коду коннектора:
+#   · SUPERSET_URL обязателен и без дефолта — superset_mcp.py бросает
+#     ValueError прямо в __init__, то есть без него процесс не стартует
+#     вовсе, а не "поднялся и не смог подключиться";
+#   · SUPERSET_USERNAME/SUPERSET_PASSWORD не проверяются на старте — без
+#     них коннектор поднимется, а первый же запрос уйдёт в _login(),
+#     отправит Keycloak пустую форму и вернётся ошибкой.
+# Именно это и произошло на приёмке: мастер писал "кредов не нужно, вход
+# через SSO в браузере", записывал один URL и включал коннектор — а в
+# сессии агент сообщал, что Superset заблокирован и нужны
+# SUPERSET_USERNAME/SUPERSET_PASSWORD в secrets.env. Никакого SSO в
+# браузере тут нет и не было: форму Keycloak отправляет сам коннектор
+# (superset_mcp.py::_login), браузер не открывается.
 setup_superset() {
-  say "── Superset ── кредов не нужно, вход через Keycloak SSO в браузере при первом обращении"
+  say "── Superset ── логин и пароль корп-учётки (Keycloak): форму входа отправляет сам коннектор, браузер не открывается"
   ask SUPERSET_URL "  URL Superset [https://bi.uzum.uz]: "
   SUPERSET_URL=${SUPERSET_URL:-https://bi.uzum.uz}
-  put_env SUPERSET_URL "$SUPERSET_URL"
-  ENABLED+=("superset")
-  ok "включён"
+  ask_required SUPERSET_USERNAME "  Логин: " "SUPERSET_USERNAME (логин Superset)"
+  ask_required_secret SUPERSET_PASSWORD "  Пароль: " "SUPERSET_PASSWORD (пароль Superset)"
+  if [ -z "$SUPERSET_USERNAME" ] || [ -z "$SUPERSET_PASSWORD" ]; then
+    fail "логин или пароль не введён — проверять нечего"
+    fail "пропущено — подключить позже: ./setup.sh --add superset"
+    return
+  fi
+
+  # Проверяем тем же кодом, которым коннектор потом и ходит
+  # (superset_mcp.py --check → _ensure_session/_login): вход в Keycloak на
+  # curl означал бы написать его второй раз и разойтись при первой правке.
+  # Значения уходят в окружении, а не в аргументах — в `ps` их быть не
+  # должно (как и в curl_check выше). SUPERSET_COOKIE_FILE — временный:
+  # без этого уцелевшая с прошлого раза cookie сказала бы "доступ есть" на
+  # любом, в том числе неверном, введённом сейчас пароле.
+  local cookie_jar out detail
+  cookie_jar="$(mk_tmp)"
+  out="$(mk_tmp)"
+  printf "  Проверяю вход (в первый раз дольше — uv доставляет httpx)…\n"
+  SUPERSET_URL="$SUPERSET_URL" \
+  SUPERSET_USERNAME="$SUPERSET_USERNAME" \
+  SUPERSET_PASSWORD="$SUPERSET_PASSWORD" \
+  SUPERSET_COOKIE_FILE="$cookie_jar" \
+    uv run "$REPO_DIR/connectors/superset_mcp.py" --check >"$out" 2>&1
+
+  if grep -q '^OK:' "$out"; then
+    ok "вижу $(grep -m1 '^OK:' "$out" | cut -d: -f2-) дашбордов"
+    put_env SUPERSET_URL "$SUPERSET_URL"
+    put_env SUPERSET_USERNAME "$SUPERSET_USERNAME"
+    put_env SUPERSET_PASSWORD "$SUPERSET_PASSWORD"
+    ENABLED+=("superset")
+    return
+  fi
+
+  detail="$(grep -m1 '^ERROR:' "$out" | cut -d: -f2- | head -c 200)"
+  if [ -z "$detail" ]; then
+    detail="$(tail -n 3 "$out" | tr '\n' ' ' | head -c 200)"
+  fi
+  fail "вход не прошёл: $detail"
+  fail "пропущено — подключить позже: ./setup.sh --add superset"
 }
 
 # ── Trino ── тоже SSO. TRINO_USER не идёт через .mcp.json (это не секрет),
@@ -885,7 +989,11 @@ check_codex_hook_trust() {
     ok "доверие хукам Codex выдано — телеметрия будет писаться"
   else
     fail "доверие хукам Codex ещё не выдано — телеметрия из Codex писаться НЕ БУДЕТ, пока это не исправить"
-    printf "  Сделай один раз: запусти просто 'codex -p %s' (не exec, обычный интерактивный запуск) в этой папке.\n" "$CODEX_PROFILE_NAME"
+    # Именно 'uzum --codex', а не голый 'codex -p uzum': запуск через uzum
+    # выставляет коннекторам переменные окружения под теми именами, которых
+    # они ждут (connectors/codex_env_bridge.py). Голый codex этого не делает
+    # — сессия поднимется, но шесть коннекторов из девяти будут пустыми.
+    printf "  Сделай один раз: запусти 'uzum --codex' (обычный интерактивный запуск, не exec) в этой папке.\n"
     printf "  На первом экране подтверди доверие папке («1. Yes, continue»).\n"
     printf "  На экране «Hooks need review» выбери «2. Trust all and continue».\n"
     printf "  Доверие сохранится навсегда для этой машины — проверить снова: ./setup.sh --add codex-hooks\n"
@@ -904,9 +1012,11 @@ run_codex_hooks_target() {
     fail "Поставь: npm install -g @openai/codex — и запусти ./setup.sh --add codex-hooks ещё раз"
     return
   fi
-  render_engine_configs
-  deploy_codex_artifacts
-  check_codex_hook_trust
+  # Генерация конфига, доставка и живая проверка доверия — в общем хвосте
+  # мастера (конец файла). Здесь их больше нет: доставка нужна после ЛЮБОГО
+  # --add, а не только этого, и держать её в двух местах значило бы делать
+  # её дважды за один запуск.
+  :
 }
 
 # ── разбор аргументов ────────────────────────────────────────────────────
@@ -985,7 +1095,7 @@ else
   setup_sheets
 fi
 
-write_enabled
+ENABLED_ALL="$(write_enabled)"
 
 if [ "$NONINTERACTIVE" = "1" ] && [ "${#MISSING[@]}" -gt 0 ]; then
   say "Без вопросов (--non-interactive) не хватает значений:"
@@ -1008,16 +1118,31 @@ fi
 # установка всё равно сейчас оборвётся с ошибкой нехватки доступов.
 render_engine_configs
 
-# Codex: доставить конфиг и хуки туда, где движок их реально видит, и
-# проверить живым запуском, что доверие хукам выдано — только когда Codex
-# вообще стоит на машине, и только в полном прогоне мастера (--add одного
-# коннектора не должен каждый раз заново дёргать живой codex exec — это
-# настоящий запрос к модели, не бесплатный curl; для точечной перепроверки
-# есть ./setup.sh --add codex-hooks).
-if [ "$MODE" != "add" ] && [ "$ENGINE_CODEX_FOUND" = "1" ]; then
+# Codex: доставить конфиг и хуки туда, где движок их реально видит.
+#
+# ПОСЛЕ ЛЮБОГО ЗАПУСКА, включая --add. Раньше здесь стояло `[ "$MODE" !=
+# "add" ]`, и это отсекало доставку заодно с живой проверкой доверия —
+# доводы у них разные, а условие было одно. Следствие поймали на приёмке:
+# ./setup.sh --add atlassian обновлял .codex/config.toml в папке
+# репозитория, но копию в $CODEX_HOME/uzum.config.toml — единственную,
+# которую Codex реально читает (deploy_codex_profile), — не трогал. То
+# есть команда, которую инструмент сам советует при отвалившемся доступе
+# («пропущено — подключить позже: ./setup.sh --add atlassian»), под Codex
+# не давала ничего до следующего полного прогона мастера, и человек видел
+# ровно то же, что и до неё.
+#
+# Доставка дешёвая, идемпотентная и не обращается к модели, поэтому
+# делать её каждый раз ничего не стоит.
+if [ "$ENGINE_CODEX_FOUND" = "1" ]; then
   say "── Codex: доставка конфига и хуков ──"
   deploy_codex_artifacts
-  check_codex_hook_trust
+
+  # А вот живая проверка доверия хукам — настоящий запрос к модели, не
+  # бесплатный curl. Она остаётся у полного прогона и у отдельной цели
+  # ./setup.sh --add codex-hooks, ради которой эта цель и существует.
+  if [ "$MODE" != "add" ] || [ "$ADD_SERVER" = "codex-hooks" ]; then
+    check_codex_hook_trust
+  fi
 fi
 
 mkdir -p "$HOME/.local/bin"
@@ -1025,6 +1150,24 @@ ln -sf "$REPO_DIR/bin/uzum" "$HOME/.local/bin/uzum"
 chmod +x "$REPO_DIR/bin/uzum" "$REPO_DIR/setup.sh" 2>/dev/null || true
 
 say "Готово. Включено в этом запуске: ${#ENABLED[@]}"
+
+# Что осталось неподключённым — списком и с командой на каждый пункт.
+# Раньше здесь было только число включённых: установка, в которой половина
+# доступов не доехала, выглядела ровно так же, как полная. На приёмке так и
+# вышло — человек получил рабочую с виду установку без Jira и узнал об этом
+# в первой же задаче. Только в полном прогоне: после ./setup.sh --add
+# одного коннектора перечень остальных восьми — не ответ на заданный
+# вопрос.
+if [ "$MODE" != "add" ]; then
+  NOT_ENABLED="$(not_enabled_servers)"
+  if [ -n "$NOT_ENABLED" ]; then
+    printf "\nНе подключено — по команде на каждое:\n"
+    for s in $NOT_ENABLED; do
+      printf "  · %-15s ./setup.sh --add %s\n" "$s" "$s"
+    done
+    printf "Это можно сделать в любой момент, полный мастер перезапускать не нужно.\n"
+  fi
+fi
 
 if ! command -v uzum >/dev/null 2>&1; then
   say "Команда uzum пока не видна в PATH."
@@ -1048,8 +1191,8 @@ fi
 if [ "$ENGINE_CODEX_FOUND" = "1" ]; then
   cat <<EOF
 
-ВАЖНО (Codex): при первом запуске (обычный интерактивный 'codex -p $CODEX_PROFILE_NAME',
-не exec) он спросит доверие папке, а следом отдельным экраном — доверие
+ВАЖНО (Codex): при первом запуске ('uzum --codex' — обычный интерактивный
+запуск, не exec) он спросит доверие папке, а следом отдельным экраном — доверие
 хукам («Hooks need review»). На нём выбери «2. Trust all and continue» —
 без этого телеметрия из Codex писаться не будет, и никакого другого
 сигнала об этом не будет (см. connectors/ACCESS.md). Мастер уже проверил
@@ -1108,4 +1251,34 @@ if [ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ]; then
         ;;
     esac
   fi
+fi
+
+# ── Последняя строка мастера: чего не хватает, чтобы работать ────────────
+#
+# Обязательные доступы (REQUIRED_SERVERS) отделены от остальных намеренно:
+# без ClickHouse WMS и Jira установка не неудачна — она неполна, инструмент
+# просто не сможет сделать то, ради чего его ставят. Раньше об этом
+# сообщали две строки в середине вывода, между настройкой восьми других
+# коннекторов, и в конце — «Готово». На приёмке человек прочитал «Готово» и
+# узнал про отсутствие Jira только в первой задаче.
+#
+# Печатается САМЫМ ПОСЛЕДНИМ, после всех блоков «ВАЖНО» и вопроса про .env,
+# и в любом режиме, включая --add: это утверждение про состояние установки
+# в целом, а не про то, что делалось в этот раз. И это не ошибка: доступ
+# можно донести позже, человек не должен только не заметить, что его нет.
+MISSING_REQUIRED="$(missing_required_servers)"
+if [ -n "$MISSING_REQUIRED" ]; then
+  printf "\nУстановка неполна — нет обязательного доступа:\n"
+  for s in $MISSING_REQUIRED; do
+    case "$s" in
+      clickhouse-wms)
+        printf "  · ClickHouse WMS — данные склада, на них считается всё остальное\n" ;;
+      atlassian)
+        printf "  · Jira — работа начинается с ключа задачи, без неё агенту нечего читать\n" ;;
+      *)
+        printf "  · %s\n" "$s" ;;
+    esac
+    printf "    ./setup.sh --add %s\n" "$s"
+  done
+  printf "Остальным можно пользоваться уже сейчас — это добавляется отдельно, когда доступ будет.\n"
 fi

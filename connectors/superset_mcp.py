@@ -1877,6 +1877,49 @@ class SupersetMCPServer:
             return f"Unknown tool: {name}"
 
 
+async def check() -> int:
+    """Живая проверка доступа для мастера установки (`--check`).
+
+    Мастер проверяет каждый доступ настоящим запросом, а не «записал и
+    надеюсь». Для Superset такой запрос нельзя собрать на curl, не написав
+    вход в Keycloak второй раз, — поэтому проверка зовёт тот же самый код,
+    которым потом ходит коннектор (`_ensure_session` → `_login`), и только
+    печатает результат человеку. Ни одной строки логики входа тут нет.
+
+    Печатает одну машиночитаемую строку: `OK:<число дашбордов>` или
+    `ERROR:<причина>` — по ней setup.sh отличает успех от отказа, не гадая
+    по коду возврата (`uv run` пишет в тот же поток свою установку пакетов).
+
+    Мастер запускает это с временным SUPERSET_COOKIE_FILE: иначе уцелевшая
+    с прошлого раза cookie дала бы «доступ есть» на любых, в том числе
+    неверных, введённых сейчас логине и пароле.
+    """
+    try:
+        server = SupersetMCPServer()
+    except ValueError as exc:  # нет SUPERSET_URL — коннектор не стартует вовсе
+        print(f"ERROR:{exc}")
+        return 1
+    if not server.username or not server.password:
+        print("ERROR:не заданы SUPERSET_USERNAME/SUPERSET_PASSWORD")
+        return 1
+    try:
+        await server._ensure_session()
+        client = await server._get_client()
+        r = await client.get(f"{server.api}/dashboard/?q=(page_size:1)",
+                             headers=server._headers())
+        if r.status_code != 200:
+            print(f"ERROR:Superset ответил {r.status_code} на список дашбордов")
+            return 1
+        print(f"OK:{r.json().get('count', '?')}")
+        return 0
+    except Exception as exc:
+        print(f"ERROR:{exc}")
+        return 1
+    finally:
+        if server._client is not None and not server._client.is_closed:
+            await server._client.aclose()
+
+
 async def main():
     server = SupersetMCPServer()
     sys.stderr.write(f"Superset MCP server started for {server.base_url}\n")
@@ -1956,4 +1999,6 @@ async def main():
 if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore", category=DeprecationWarning)
+    if len(sys.argv) > 1 and sys.argv[1] == "--check":
+        sys.exit(asyncio.run(check()))
     asyncio.run(main())

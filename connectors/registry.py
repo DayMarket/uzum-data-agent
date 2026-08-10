@@ -158,6 +158,20 @@ class Connector:
     def static_env(self) -> Tuple[StaticEnv, ...]:
         return tuple(item for item in self.env if isinstance(item, StaticEnv))
 
+    def codex_spec(self):
+        """(command, args, env) — то, что реально запускается под Codex:
+        своя ветка (`self.codex`), если она задана, иначе общая с Claude
+        Code. Живёт здесь, а не в генераторе конфига, потому что читателей
+        у этого решения два: `tools/render_configs.py` (что писать в
+        `env_vars` конфига Codex) и `connectors/codex_env_bridge.py` (какие
+        переменные выставить в окружении перед запуском Codex). Две копии
+        этой развилки разошлись бы при первой же правке `codex=...` у
+        любого коннектора — и разошлись бы молча: конфиг просил бы одни
+        имена, мостик выставлял бы другие."""
+        if self.codex is not None:
+            return self.codex.command, self.codex.args, self.codex.env
+        return self.command, self.args, self.env
+
 
 # Порядок — тот же, что в исходном .mcp.json: atlassian, clickhouse-wms,
 # clickhouse-dwh, trino, superset, grafana, openmetadata, growthbook, sheets.
@@ -250,6 +264,18 @@ CONNECTORS: Tuple[Connector, ...] = (
         args=("run", ProjectScript("connectors/superset_mcp.py")),
         env=(
             EnvVar(target="SUPERSET_URL", source="SUPERSET_URL", secret=False),
+            # Вход в Superset проходит сам коннектор: superset_mcp.py::_login
+            # отправляет форму Keycloak (логин + пароль) и держит cookie —
+            # браузер в этом не участвует. Раньше этих двух переменных тут не
+            # было, а мастер писал «кредов не нужно, вход через SSO в
+            # браузере»: коннектор числился включённым, поднимался и падал на
+            # первом же запросе, потому что взять логин с паролем было
+            # неоткуда (найдено на живой приёмке, под Claude Code).
+            # Логин — корп-учётка, тот же класс, что CLICKHOUSE_USER:
+            # secret=True, в закоммиченный конфиг попадает только имя
+            # переменной.
+            EnvVar(target="SUPERSET_USERNAME", source="SUPERSET_USERNAME", secret=True),
+            EnvVar(target="SUPERSET_PASSWORD", source="SUPERSET_PASSWORD", secret=True),
         ),
     ),
     Connector(
