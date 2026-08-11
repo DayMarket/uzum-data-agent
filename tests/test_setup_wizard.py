@@ -120,7 +120,7 @@ sys.exit(0 if answer.startswith("OK:") else 1)
 
 def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
                superset_check="OK:7", engines=("claude",), answers=None,
-               stub_overrides=None):
+               stub_overrides=None, extra_env=None, saved_secrets=None):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     if "codex" in engines:
@@ -136,6 +136,11 @@ def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
     rules_path.write_text(json.dumps(list(curl_rules)), encoding="utf-8")
     if dotenv is not None:
         (repo / ".env").write_text(dotenv, encoding="utf-8")
+    if saved_secrets is not None:
+        # Машина, где установка уже проходила: доступы лежат в secrets.env.
+        (home / ".config" / "uzum-ai").mkdir(parents=True, exist_ok=True)
+        (home / ".config" / "uzum-ai" / "secrets.env").write_text(
+            saved_secrets, encoding="utf-8")
 
     env = {
         "HOME": str(home),
@@ -148,6 +153,7 @@ def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
         "UZUM_TEST_ENGINE_LOG": str(tmp_path / "engine.log"),
         "UZUM_TEST_SUPERSET_CHECK": superset_check,
     }
+    env.update(extra_env or {})
     # Вывод — в файлы, а не в трубу. Сторожевой таймер живой проверки
     # доверия хукам (`( sleep 90; kill … ) &` в check_codex_hook_trust)
     # переживает свой субшелл и держит унаследованный дескриптор открытым:
@@ -715,3 +721,196 @@ def test_a_connector_configured_earlier_survives_a_failed_live_check(tmp_path):
     assert "atlassian" in _enabled(repo), (
         "коннектор с уже настроенными кредами выкинут из-за отказа живой "
         "проверки — человек потеряет инструменты Jira вместо понятной 401")
+
+
+# ── Повторная установка не спрашивает то, что уже сохранено ──────────────
+#
+# Находка живого пользователя: на машине, где установка уже проходила и
+# secrets.env полон, `./setup.sh --non-interactive` падал со списком «не
+# хватает значений» — все пять значений лежали в файле. Мастер жил только
+# окружением (ask_required_secret смотрит туда), а в окружение попадал
+# только .env; secrets.env читали лишь отдельные места (телеметрия, Trino,
+# connector_readiness, clickhouse_users). Отсюда же `default:` в ошибке
+# DWH — коннектор уходил в свою дефолтную учётку.
+
+DWH_OK = ["dwh.internal", 200, "9"]
+
+# Ровно то, что write_env пишет после удачной первой установки: значения в
+# одинарных кавычках, тем же форматом, что читает envfile.
+SAVED_EVERYTHING = (
+    "CH_WMS_HOST='wms.internal'\n"
+    "CH_WMS_PORT='8123'\n"
+    "CH_WMS_USER='имя-фамилия'\n"
+    "CH_WMS_PASSWORD='пароль-склада'\n"
+    "CH_WMS_SECURE='false'\n"
+    "CH_DWH_HOST='dwh.internal'\n"
+    "CH_DWH_PORT='8123'\n"
+    "CH_DWH_USER='учётка-dwh'\n"
+    "CH_DWH_PASSWORD='пароль-dwh'\n"
+    "CH_DWH_SECURE='false'\n"
+    "JIRA_TOKEN='токен-с-прошлой-установки'\n"
+    "SUPERSET_URL='https://bi.uzum.uz'\n"
+    "SUPERSET_USERNAME='логин-аналитика'\n"
+    "SUPERSET_PASSWORD='пароль-superset'\n"
+)
+
+SAVED_ALL_RULES = [WMS_OK, DWH_OK, JIRA_OK]
+
+
+def test_second_run_does_not_ask_again_for_what_is_already_saved(tmp_path):
+    """Дословная находка: `./setup.sh --non-interactive` на настроенной
+    машине. Ни одного «не хватает значений» и код возврата 0 — раньше здесь
+    был список из пяти значений, каждое из которых лежало в secrets.env."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES,
+                           saved_secrets=SAVED_EVERYTHING)
+
+    out = result.stdout
+    assert "не хватает значений" not in out, out[-3000:]
+    for label in ("CH_WMS_USER", "CH_WMS_PASSWORD", "CH_DWH_USER",
+                  "CH_DWH_PASSWORD", "JIRA_TOKEN"):
+        assert "✗ %s" % label not in out, (
+            "%s спрошен заново, хотя лежит в secrets.env:\n%s" % (label, out[-3000:]))
+    assert result.returncode == 0, out[-3000:]
+
+
+def test_saved_dwh_credentials_go_into_the_live_check_not_the_default_account(tmp_path):
+    """Вторая половина находки: «Code: 194 … default: Authentication
+    failed». Без подхвата сохранённого CH_DWH_USER пуст, заголовок уходит
+    пустым, и ClickHouse подставляет свою учётку `default`. Смотрим, ЧЕМ
+    мастер постучался."""
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, args=["--non-interactive"],
+               curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING)
+
+    calls = [c for c in _curl_calls(tmp_path) if "dwh.internal" in c["url"]]
+    assert calls, "живой проверки DWH под сохранённой учёткой не было вовсе"
+    assert "X-ClickHouse-User: учётка-dwh" in calls[0]["config"], calls[0]["config"]
+    assert "X-ClickHouse-Key: пароль-dwh" in calls[0]["config"]
+
+
+def test_saved_values_are_still_checked_live_not_taken_on_faith(tmp_path):
+    """Смысл мастера — показать работающий доступ, а не то, что он нашёл
+    строчку в файле. Сохранённый токен протух: запрос обязан уйти, отказ —
+    прозвучать, коннектор — не включиться."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=[WMS_OK, DWH_OK, JIRA_REJECTED],
+                           saved_secrets=SAVED_EVERYTHING)
+
+    calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
+    assert calls, "сохранённый токен приняли на веру — живой проверки не было"
+    assert "Bearer токен-с-прошлой-установки" in calls[0]["config"], calls[0]["config"]
+    assert "токен не принят" in result.stdout, result.stdout[-3000:]
+    assert "atlassian" not in _enabled(repo)
+
+
+def test_dotenv_wins_over_the_saved_value(tmp_path):
+    """Приоритет: файл доступов правят именно затем, чтобы поменять
+    значение. Если сохранённое перебивает .env, поменять пароль повторным
+    прогоном стало бы нечем."""
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, args=["--non-interactive"],
+               curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING,
+               dotenv="JIRA_TOKEN=токен-из-файла\n")
+
+    calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
+    assert calls, "живой проверки Jira не было"
+    assert "Bearer токен-из-файла" in calls[0]["config"], calls[0]["config"]
+    assert "токен-с-прошлой-установки" not in calls[0]["config"]
+
+
+def test_explicitly_given_environment_wins_over_the_saved_value(tmp_path):
+    """Та же граница со стороны окружения: `JIRA_TOKEN=… ./setup.sh` —
+    разовая подстановка, и сохранённое не должно её затирать."""
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, args=["--non-interactive"],
+               curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING,
+               extra_env={"JIRA_TOKEN": "токен-из-окружения"})
+
+    calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
+    assert calls, "живой проверки Jira не было"
+    assert "Bearer токен-из-окружения" in calls[0]["config"], calls[0]["config"]
+    assert "токен-с-прошлой-установки" not in calls[0]["config"]
+
+
+def test_a_blank_saved_value_is_still_not_a_value(tmp_path):
+    """Сторож прошлого круга: `write_env` пишет пустой ответ как `KEY=''`, и
+    такой «доступ» не настроен. Правило одно на оба источника — мастер и
+    гейт «коннектор без кредов не включается» читают secrets.env одним
+    разборщиком и одинаково считают пробелы отсутствием значения."""
+    repo = _make_repo_copy(tmp_path)
+    blank_user = SAVED_EVERYTHING.replace(
+        "CH_WMS_USER='имя-фамилия'", "CH_WMS_USER='   '")
+    assert blank_user != SAVED_EVERYTHING, "подмена значения в образце не сработала"
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES, saved_secrets=blank_user)
+
+    out = result.stdout
+    assert "не хватает значений" in out, out[-3000:]
+    assert "CH_WMS_USER (логин ClickHouse WMS)" in out, out[-3000:]
+    # Остальное сохранённое подхвачено — недостающим объявлено ровно пустое.
+    assert "CH_DWH_USER" not in out.split("не хватает значений")[1]
+    assert result.returncode == 1
+    assert "clickhouse-wms" not in _enabled(repo), (
+        "мастер и гейт разошлись в том, что считать заданным значением")
+
+
+def test_first_install_on_a_clean_machine_is_unchanged(tmp_path):
+    """Обратная сторона: без secrets.env всё как было — ни строки про
+    сохранённое, и все пять значений честно объявлены недостающими."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"])
+
+    out = result.stdout
+    assert "Нашёл сохранённые доступы" not in out, out[-3000:]
+    assert "не хватает значений" in out, out[-3000:]
+    for label in ("CH_WMS_USER (логин ClickHouse WMS)",
+                  "CH_WMS_PASSWORD (пароль ClickHouse WMS)",
+                  "CH_DWH_USER (логин ClickHouse DWH)",
+                  "CH_DWH_PASSWORD (пароль ClickHouse DWH)",
+                  "JIRA_TOKEN (токен Jira)"):
+        assert label in out, out[-3000:]
+    assert result.returncode == 1
+
+
+def test_saved_secrets_do_not_open_the_gate_for_connectors_without_credentials(tmp_path):
+    """Гейт прошлого круга не должен поехать: подхват сохранённого добавляет
+    значения, а не готовность. Чего в secrets.env нет — того нет и в
+    списке включённых."""
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, args=["--non-interactive"],
+               curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING)
+
+    enabled = _enabled(repo)
+    for cid in ("clickhouse-wms", "clickhouse-dwh", "atlassian", "superset"):
+        assert cid in enabled, "%s настроен, но не включён: %s" % (cid, enabled)
+    for cid in ("grafana", "openmetadata", "growthbook", "sheets"):
+        assert cid not in enabled, (
+            "%s включён, хотя его кредов в secrets.env нет" % cid)
+
+
+def test_add_still_asks_for_a_value_that_is_already_saved(tmp_path):
+    """`./setup.sh --add <коннектор>` существует ровно затем, чтобы ввести
+    значение заново (протух токен, сменился пароль). Подставить сохранённое
+    здесь значило бы отнять единственный способ его поменять: вопроса нет, а
+    живая проверка снова падает на старом значении."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "atlassian"],
+                           curl_rules=[JIRA_OK], saved_secrets=SAVED_EVERYTHING,
+                           answers="токен-введённый-сейчас\n\n")
+
+    assert "Нашёл сохранённые доступы" not in result.stdout, result.stdout[-2000:]
+    calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
+    assert calls, "вопрос не задали и проверять стало нечего"
+    assert "Bearer токен-введённый-сейчас" in calls[0]["config"], calls[0]["config"]
