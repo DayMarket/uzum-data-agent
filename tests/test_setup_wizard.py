@@ -792,10 +792,50 @@ def test_saved_dwh_credentials_go_into_the_live_check_not_the_default_account(tm
     assert "X-ClickHouse-Key: пароль-dwh" in calls[0]["config"]
 
 
-def test_saved_values_are_still_checked_live_not_taken_on_faith(tmp_path):
+def test_every_saved_access_is_still_checked_live_not_taken_on_faith(tmp_path):
     """Смысл мастера — показать работающий доступ, а не то, что он нашёл
-    строчку в файле. Сохранённый токен протух: запрос обязан уйти, отказ —
-    прозвучать, коннектор — не включиться."""
+    строчку в файле. Проверяем это на КАЖДОМ сохранённом доступе, а не на
+    одной Jira: имя теста отвечает за принцип, значит и держать он должен
+    принцип. Смотрим, что ушёл запрос и что он ушёл с сохранённым
+    значением, — «сходил куда-то» тут ничего не доказывает."""
+    repo = _make_repo_copy(tmp_path)
+
+    _run_setup(repo, tmp_path, args=["--non-interactive"],
+               curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING)
+
+    calls = _curl_calls(tmp_path)
+
+    def checked(where, credential):
+        return [c for c in calls if where in c["url"] and credential in c["config"]]
+
+    # Складской ClickHouse, общий ClickHouse, телеметрия (тот же кластер, но
+    # другая таблица — отдельный доступ с точки зрения прав) и Jira.
+    for where, credential, what in (
+            ("wms.internal:8123/?query=SELECT+count()+FROM+system.databases",
+             "X-ClickHouse-User: имя-фамилия", "ClickHouse WMS"),
+            ("dwh.internal:8123/?query=SELECT+count()+FROM+system.databases",
+             "X-ClickHouse-User: учётка-dwh", "ClickHouse DWH"),
+            ("sandbox.ai_usage_sessions",
+             "X-ClickHouse-User: имя-фамилия", "телеметрия"),
+            ("jira.uzum.com", "Bearer токен-с-прошлой-установки", "Jira")):
+        assert checked(where, credential), (
+            "%s: сохранённое значение приняли на веру — живого запроса с ним "
+            "не было. Запросы, которые ушли: %s"
+            % (what, [c["url"] for c in calls]))
+
+    # Superset проверяется не curl'ом, а тем же кодом, которым потом ходит
+    # коннектор (superset_mcp.py --check), — смотрим в лог uv.
+    uv_calls = [json.loads(line) for line in
+                (tmp_path / "uv.log").read_text(encoding="utf-8").splitlines()]
+    superset = [c for c in uv_calls if "--check" in c["argv"]]
+    assert superset, "Superset: сохранённые логин и пароль не пошли в живую проверку"
+    assert superset[-1]["superset_env"]["SUPERSET_USERNAME"] == "логин-аналитика"
+    assert superset[-1]["superset_env"]["SUPERSET_PASSWORD"] == "пароль-superset"
+
+
+def test_a_stale_saved_token_is_reported_and_the_connector_is_not_enabled(tmp_path):
+    """Обратная сторона живой проверки: сохранённый токен протух — отказ
+    обязан прозвучать, а коннектор не включиться."""
     repo = _make_repo_copy(tmp_path)
 
     result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
@@ -914,3 +954,69 @@ def test_add_still_asks_for_a_value_that_is_already_saved(tmp_path):
     calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
     assert calls, "вопрос не задали и проверять стало нечего"
     assert "Bearer токен-введённый-сейчас" in calls[0]["config"], calls[0]["config"]
+
+
+def test_add_without_questions_reuses_the_saved_value_instead_of_failing(tmp_path):
+    """Граница проходит по «будет ли задан вопрос», а не по режиму. С
+    --non-interactive вопроса нет вовсе, поэтому отказ от подстановки ничего
+    не сохраняет — только гарантирует падение на значении, которое лежит в
+    secrets.env. А `./setup.sh --add atlassian` — та самая команда, которую
+    мастер сам советует строкой «пропущено — подключить позже»."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path,
+                           args=["--add", "atlassian", "--non-interactive"],
+                           curl_rules=[JIRA_OK], saved_secrets=SAVED_EVERYTHING)
+
+    assert "не хватает значений" not in result.stdout, result.stdout[-2500:]
+    assert result.returncode == 0, result.stdout[-2500:]
+    calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
+    assert calls, "сохранённый доступ не перепроверен живым запросом"
+    assert "Bearer токен-с-прошлой-установки" in calls[0]["config"], calls[0]["config"]
+    assert "atlassian" in _enabled(repo)
+
+
+# ── Необязательный коннектор не роняет прогон без вопросов ───────────────
+#
+# У grafana (GRAFANA_URL), openmetadata (OMD_URL) и sheets (GOOGLE_SA_FILE)
+# первым спрашивается значение без дефолта, и пустой ответ выводит из
+# коннектора целиком. У SUPERSET_URL дефолт есть, поэтому «нет URL» не
+# наступало никогда, и Superset доходил до ask_required — на машине, где его
+# осознанно не заводили, `./setup.sh --non-interactive` выходил с кодом 1.
+
+SAVED_WITHOUT_SUPERSET = "".join(
+    line + "\n" for line in SAVED_EVERYTHING.splitlines()
+    if not line.startswith("SUPERSET_"))
+
+
+def test_a_connector_nobody_configured_does_not_fail_the_run_without_questions(tmp_path):
+    """Superset не в REQUIRED_SERVERS — значит человек, который его не
+    заводил, не должен получать красный выход. Ровно как у трёх соседей."""
+    assert "SUPERSET_" not in SAVED_WITHOUT_SUPERSET, SAVED_WITHOUT_SUPERSET
+    assert "JIRA_TOKEN" in SAVED_WITHOUT_SUPERSET, "из образца вырезали лишнее"
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES,
+                           saved_secrets=SAVED_WITHOUT_SUPERSET)
+
+    assert "не хватает значений" not in result.stdout, result.stdout[-3000:]
+    assert result.returncode == 0, result.stdout[-3000:]
+    # Пропущен так же, как остальные необязательные: строкой и командой.
+    assert "./setup.sh --add superset" in result.stdout
+    assert "superset" not in _enabled(repo)
+
+
+def test_half_configured_superset_is_still_reported_as_missing(tmp_path):
+    """Обратная сторона: логин есть, пароля нет — это не «Superset не
+    нужен», а незаконченная настройка, и молчать о ней нельзя. Иначе
+    развилка «необязателен» проглотила бы настоящую нехватку значения."""
+    repo = _make_repo_copy(tmp_path)
+    half = SAVED_WITHOUT_SUPERSET + "SUPERSET_USERNAME='логин-аналитика'\n"
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES, saved_secrets=half)
+
+    assert "не хватает значений" in result.stdout, result.stdout[-3000:]
+    assert "SUPERSET_PASSWORD" in result.stdout, result.stdout[-3000:]
+    assert result.returncode == 1
