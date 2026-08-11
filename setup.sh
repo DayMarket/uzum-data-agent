@@ -816,21 +816,39 @@ setup_clickhouse_dwh() {
 # молчит — ноль телеметрии при зелёной установке. Теперь ошибиться негде,
 # адрес не вводится.
 #
-# Смоук-запрос остаётся и остаётся именно таким: не «жив ли сервер» (SELECT
-# count() FROM system.databases отвечает на любом кластере), а SELECT
-# count() FROM sandbox.ai_usage_sessions — он проверяет ровно тот путь,
-# которым пойдут хуки: тот кластер, та база, та таблица, те права. Это
-# единственное место, где человек узнаёт, что телеметрия работает.
-# Куда и чем пишет телеметрия — спрашиваем у самого lib/telemetry.py, а не
-# повторяем его развилку в bash. Иначе мастер проверял бы один доступ, а хуки
-# писали бы другим, и разошлись бы они молча при первой же правке правила.
+# Живая проверка здесь — ЗАПИСЬ, а не чтение. Мастер обещает человеку, что
+# телеметрия работает; работает она тогда, когда строка реально вставляется.
+# Раньше здесь стоял SELECT count() FROM sandbox.ai_usage_sessions — у учётки
+# только на чтение он ПРОХОДИТ, и мастер зелёной галочкой подтверждал
+# телеметрию, которая писать не может. Проверено живьём на двух настоящих
+# учётках одного кластера: SELECT 200 у обеих, INSERT — 200 у одной и 500
+# «Code: 164 … (READONLY)» у другой. Следствие уже случилось: сессии молча
+# копились в очереди на диске, а установка выглядела полной. Это единственное
+# место, где человек узнаёт, что телеметрия работает, — значит проверять надо
+# то, что обещаем.
+#
+# Проверка идёт ТЕМ ЖЕ путём, которым пишут хуки: вызовом
+# lib/telemetry.py::check_write(), а не вторым экземпляром запроса на curl.
+# Иначе мастер проверял бы один доступ, а хуки писали бы другим, и разошлись
+# бы они молча при первой же правке правила. Там же, в докстринге
+# check_write(), написано, почему вставка пустая и почему после неё в таблице
+# не остаётся следа.
 #
 # Источники — те же, что у хука: значения из secrets.env (их мастер туда уже
 # записал) плюс окружение этого запуска (значения из .env, если человек
 # заполнил файл). Окружение сильнее: в нём то, что проверено прямо сейчас.
-# Пароль печатается в стандартный вывод (труба, не argv) — в `ps` он не
-# попадает, как и в curl_check ниже.
-telemetry_target() {
+# Пароль в bash теперь не возвращается вовсе — он нужен только внутри python.
+#
+# Схему соединения (http/https) здесь больше не подбираем перебором: её берёт
+# cfg.secure из CH_WMS_SECURE — ровно то значение, с которым пойдёт хук.
+# Перебор был бы новым способом соврать: мастер достучался бы по https, а хук
+# пошёл бы по http и молча не записал. Настоящий подбор делается один раз, в
+# setup_clickhouse_wms, и его результат лежит в secrets.env.
+#
+# Печатает четыре строки: исход (unconfigured|ok|denied|error|disabled),
+# «хост:порт» для сообщений, признак отдельно заданной цели, ответ сервера
+# одной строкой.
+telemetry_probe() {
   UZUM_SECRETS="$SECRETS" python3 -c "
 import os, sys
 sys.path.insert(0, '$REPO_DIR/lib')
@@ -844,11 +862,14 @@ cfg = telemetry.Config.from_env()
 override = any(os.environ.get(name) for name in (
     'TELEMETRY_CH_HOST', 'TELEMETRY_CH_PORT', 'TELEMETRY_CH_USER',
     'TELEMETRY_CH_PASSWORD', 'TELEMETRY_CH_SECURE'))
-print(cfg.host)
-print(cfg.port)
-print(cfg.user)
-print(cfg.password)
+if not cfg.host or not cfg.user:
+    outcome, detail = 'unconfigured', ''
+else:
+    outcome, detail = telemetry.check_write(cfg)
+print(outcome)
+print('%s:%s' % (cfg.host, cfg.port) if cfg.host else '')
 print('override' if override else '')
+print(' '.join(detail.split())[:300])
 "
 }
 
@@ -872,15 +893,14 @@ setup_telemetry() {
   # руками в secrets.env через TELEMETRY_CH_* и перебивает WMS
   # поколоночно — ровно так же, как это читает lib/telemetry.py, чтобы
   # мастер проверял именно тот доступ, которым потом пишут хуки.
-  local target T_HOST T_PORT T_USER T_PASSWORD T_OVERRIDE
-  target="$(telemetry_target)"
-  T_HOST="$(printf '%s\n' "$target" | sed -n '1p')"
-  T_PORT="$(printf '%s\n' "$target" | sed -n '2p')"
-  T_USER="$(printf '%s\n' "$target" | sed -n '3p')"
-  T_PASSWORD="$(printf '%s\n' "$target" | sed -n '4p')"
-  T_OVERRIDE="$(printf '%s\n' "$target" | sed -n '5p')"
+  local probe T_OUTCOME T_TARGET T_OVERRIDE T_DETAIL
+  probe="$(telemetry_probe)"
+  T_OUTCOME="$(printf '%s\n' "$probe" | sed -n '1p')"
+  T_TARGET="$(printf '%s\n' "$probe" | sed -n '2p')"
+  T_OVERRIDE="$(printf '%s\n' "$probe" | sed -n '3p')"
+  T_DETAIL="$(printf '%s\n' "$probe" | sed -n '4p')"
 
-  if [ -z "$T_HOST" ] || [ -z "$T_USER" ]; then
+  if [ "$T_OUTCOME" = "unconfigured" ]; then
     fail "складской ClickHouse ещё не настроен — телеметрии некуда писать"
     fail "она включится сама, когда появится доступ: ./setup.sh --add clickhouse-wms"
     return
@@ -889,40 +909,45 @@ setup_telemetry() {
     note "адрес или учётка телеметрии заданы отдельно (TELEMETRY_CH_* в $SECRETS) — проверяю их, а не складские"
   fi
 
-  local http_out https_out http_code https_code scheme
-  http_out="$(mk_tmp)"
-  http_code=$(curl_check "$http_out" 8 \
-    "http://$T_HOST:$T_PORT/?query=SELECT+count()+FROM+sandbox.ai_usage_sessions" \
-    "X-ClickHouse-User: $T_USER" "X-ClickHouse-Key: $T_PASSWORD")
-  scheme=""
-  if [ "$http_code" = "200" ]; then
-    scheme="false"
-  else
-    https_out="$(mk_tmp)"
-    https_code=$(curl_check "$https_out" 8 \
-      "https://$T_HOST:$T_PORT/?query=SELECT+count()+FROM+sandbox.ai_usage_sessions" \
-      "X-ClickHouse-User: $T_USER" "X-ClickHouse-Key: $T_PASSWORD")
-    if [ "$https_code" = "200" ]; then
-      scheme="true"
-      http_out="$https_out"
-    fi
-  fi
+  # Уборка дублей — при любом исходе проверки, а не только при удачном:
+  # TELEMETRY_CH_*, дословно повторяющие CH_WMS_*, перебивают складские
+  # значения и после смены пароля тихо остановят запись. Это ловушка вне
+  # зависимости от того, дала ли сегодня учётка право писать.
+  drop_redundant_telemetry_env
 
-  if [ -n "$scheme" ]; then
-    ok "sandbox.ai_usage_sessions на месте, строк: $(cat "$http_out" 2>/dev/null)"
-    drop_redundant_telemetry_env
-    return
-  fi
-
-  # Ничего не записываем и ничего не выключаем: адрес и креды телеметрия
-  # берёт из CH_WMS_* сама. Отказ здесь означает "проверка не прошла" —
-  # чаще всего нет прав INSERT в sandbox у пилотной учётки, — и это стоит
-  # сказать словами, а не тишиной.
-  fail "таблица sandbox.ai_usage_sessions не ответила (http: $http_code, https: ${https_code:-—})"
-  if [ "$http_code" != "000" ]; then
-    fail "$(head -c 300 "$http_out" 2>/dev/null)"
-  fi
-  fail "телеметрия писаться не будет — перепроверить: ./setup.sh --add telemetry"
+  case "$T_OUTCOME" in
+    ok)
+      ok "пробная запись в sandbox.ai_usage_sessions прошла ($T_TARGET) — телеметрия пишется"
+      ;;
+    denied)
+      # Не поломка и не красный ✗ на всю установку: инструмент работает
+      # полностью, не работает только сбор статистики. Поэтому три строки
+      # фактом (·), а не ошибкой: причина, следствие, что делать.
+      #
+      # Телеметрию при этом НЕ выключаем — сознательно. Хук пишет строку в
+      # локальную очередь (доли миллисекунды, сети не касается), очередь
+      # ограничена по объёму и возрасту, а отправка повторяется при каждом
+      # запуске сессии. Значит после выдачи прав накопленное уедет само и
+      # ничего не потеряется — ровно так уже случилось на приёмке, где 48
+      # событий доехали, как только права появились. Выключить
+      # (TELEMETRY_ENABLED=0) значило бы гарантированно потерять именно те
+      # сессии, ради которых пилот и считают, и оставить человеку ещё один
+      # переключатель, о котором он не вспомнит.
+      note "писать телеметрию этой учёткой нельзя: прав INSERT в sandbox нет ($T_TARGET) — сервер отвечает: $T_DETAIL"
+      note "на работу это не влияет: инструмент и все коннекторы работают как обычно, не собирается только статистика"
+      note "строки не теряются — копятся в очереди (~/.local/state/uzum-ai/queue) и уедут сами, когда права появятся (очередь хранит до 30 дней)"
+      note "чтобы сессии попали в отчётность — заявка в JSM на право INSERT в sandbox для этой учётки, потом ./setup.sh --add telemetry"
+      ;;
+    disabled)
+      note "телеметрия выключена (TELEMETRY_ENABLED=0 в $SECRETS) — статистика не собирается намеренно"
+      ;;
+    *)
+      # Всё остальное — именно поломка: не дошли до сервера, не тот пароль,
+      # нет таблицы. Здесь ✗ уместен.
+      fail "пробная запись в sandbox.ai_usage_sessions не прошла ($T_TARGET): $T_DETAIL"
+      fail "телеметрия писаться не будет — перепроверить: ./setup.sh --add telemetry"
+      ;;
+  esac
 }
 
 # Убрать из secrets.env те TELEMETRY_CH_*, которые дословно повторяют

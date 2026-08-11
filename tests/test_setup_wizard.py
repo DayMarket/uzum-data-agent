@@ -244,6 +244,17 @@ def _enabled(repo):
     return json.loads(path.read_text(encoding="utf-8")).get("enabledMcpjsonServers", [])
 
 
+def _curl_calls(tmp_path):
+    """Что мастер реально спрашивал у сервера через curl: URL и заголовки (в
+    них логин и пароль). Заголовки нужны, чтобы проверять не только «сходил»,
+    но и «той ли учёткой»."""
+    path = tmp_path / "curl.log"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in
+            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
 WMS_OK = ["wms.internal", 200, "12"]
 JIRA_REJECTED = ["jira.uzum.com", 401, "nope"]
 JIRA_OK = ["jira.uzum.com", 200, '{"displayName": "Аналитик"}']
@@ -489,20 +500,209 @@ def test_superset_without_credentials_is_skipped_not_silently_enabled(tmp_path):
     assert "superset" not in _enabled(repo)
 
 
-# ── Телеметрия: доступ тот же, что у складского ClickHouse ───────────────
+# ── Телеметрия: проверяется ЗАПИСЬ, а не чтение ─────────────────────────
+#
+# Находка живой приёмки: мастер проверял телеметрию запросом SELECT count()
+# FROM sandbox.ai_usage_sessions и печатал на нём «✓ на месте, строк: N».
+# У учётки только на чтение этот запрос ПРОХОДИТ — человек читал зелёную
+# галочку про телеметрию, которая писать не может, а сессии молча копились в
+# очереди на диске. Снято живьём на двух настоящих учётках одного кластера:
+#
+#     a-bir         SELECT 200 | INSERT 500 «Code: 164 … (READONLY)»
+#     n-lyubchenko  SELECT 200 | INSERT 200
+#
+# Поэтому подставной ClickHouse ниже ведёт себя ровно так же: SELECT отвечает
+# ВСЕМ, INSERT — только тому, кому выданы права. Он не знает ни про «✓», ни
+# про «✗» и ничего не подтверждает: все утверждения тестов — про то, что
+# напечатал сам мастер и с каким запросом он пришёл на сервер. Верни проверку
+# к чтению — и тесты про отказ упадут: учётка без прав получит «телеметрия
+# пишется».
 
-TELEMETRY_OK = ["sandbox.ai_usage_sessions", 200, "128"]
+
+class _FakeClickHouse(object):
+    """HTTP-сервер, отвечающий как ClickHouse складского кластера.
+
+    Не заглушка curl: мастер ходит тем же кодом, что и хуки
+    (lib/telemetry.py), а его запрос — настоящий HTTP. Проверять такое можно
+    только тем, что реально доехало по сети.
+    """
+
+    # Дословный ответ боевого кластера учётке без прав (снят живым запросом).
+    READONLY = ("Code: 164. DB::Exception: %s: Cannot execute query in "
+                "readonly mode. (READONLY) (version 25.8.25.37-yc.1)")
+
+    def __init__(self, writers=()):
+        import http.server
+        import threading
+        import urllib.parse
+
+        requests = self.requests = []
+        writers = set(writers)
+        readonly = self.READONLY
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length).decode("utf-8") if length else ""
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query).get("query", [""])[0]
+                user = self.headers.get("X-ClickHouse-User", "")
+                requests.append({
+                    "method": self.command,
+                    "query": query,
+                    "user": user,
+                    "key": self.headers.get("X-ClickHouse-Key", ""),
+                    "body": body,
+                })
+                insert = query.strip().upper().startswith("INSERT")
+                if insert and user not in writers:
+                    status, payload = 500, (readonly % user).encode("utf-8")
+                elif insert:
+                    status, payload = 200, b""
+                else:
+                    # Чтение проходит у любой заведённой учётки — как на бою.
+                    status, payload = 200, b"15"
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *a):
+                pass
+
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.host, self.port = self._server.server_address
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+        return False
+
+    def dotenv(self, user="imya-familiya", password="parol-sklada", extra=""):
+        return (
+            "CH_WMS_HOST=%s\n"
+            "CH_WMS_PORT=%s\n"
+            "CH_WMS_USER=%s\n"
+            "CH_WMS_PASSWORD=%s\n"
+            "CH_WMS_SECURE=false\n"
+            "%s" % (self.host, self.port, user, password, extra)
+        )
+
+    def secrets(self, user="imya-familiya", password="parol-sklada", extra=""):
+        return (
+            "CH_WMS_HOST='%s'\n"
+            "CH_WMS_PORT='%s'\n"
+            "CH_WMS_USER='%s'\n"
+            "CH_WMS_PASSWORD='%s'\n"
+            "CH_WMS_SECURE='false'\n"
+            "%s" % (self.host, self.port, user, password, extra)
+        )
+
+    def inserts(self):
+        return [r for r in self.requests
+                if r["query"].strip().upper().startswith("INSERT")]
+
+    def selects(self):
+        return [r for r in self.requests
+                if r["query"].strip().upper().startswith("SELECT")]
 
 
-def _curl_calls(tmp_path):
-    """Что мастер реально спрашивал у сервера: URL и заголовки (в них логин
-    и пароль). Заголовки нужны, чтобы проверять не только «сходил», но и
-    «той ли учёткой» — а это и есть предмет находки."""
-    path = tmp_path / "curl.log"
-    if not path.exists():
-        return []
-    return [json.loads(line) for line in
-            path.read_text(encoding="utf-8").splitlines() if line.strip()]
+def test_telemetry_check_inserts_instead_of_reading_the_table(tmp_path):
+    """Главное утверждение находки: мастер обязан проверять то, что обещает.
+
+    Обещает он запись — значит и запрос должен быть вставкой, той же самой,
+    которой пишут хуки. Мутация «проверка снова читает» ловится здесь дважды:
+    запросом, с которым мастер пришёл, и отсутствием SELECT'а вовсе."""
+    repo = _make_repo_copy(tmp_path)
+
+    with _FakeClickHouse(writers=("imya-familiya",)) as ch:
+        result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                               dotenv=ch.dotenv())
+
+    inserts = ch.inserts()
+    assert inserts, (
+        "мастер не сделал ни одной вставки — проверять запись чтением и есть "
+        "находка:\n%s" % result.stdout)
+    assert inserts[0]["method"] == "POST", inserts[0]
+    assert inserts[0]["query"].startswith(
+        "INSERT INTO sandbox.ai_usage_sessions"), inserts[0]["query"]
+    assert not ch.selects(), "проверка снова читает: %s" % ch.selects()
+    assert "пробная запись" in result.stdout, result.stdout
+    assert "телеметрия пишется" in result.stdout, result.stdout
+
+
+def test_telemetry_check_leaves_no_row_behind(tmp_path):
+    """Решение про проверочную строку: её нет вовсе. Мусор в боевой таблице
+    оставлять нельзя (отладочные строки schema-check уже приходилось
+    вычищать), а удалить его учётке аналитика нечем — прав на ALTER DELETE у
+    неё тем более нет. Права ClickHouse проверяет до чтения тела запроса,
+    поэтому пустая вставка получает тот же отказ, что и настоящая, и следа не
+    оставляет (см. докстринг lib/telemetry.py::check_write)."""
+    repo = _make_repo_copy(tmp_path)
+
+    with _FakeClickHouse(writers=("imya-familiya",)) as ch:
+        _run_setup(repo, tmp_path, args=["--add", "telemetry"], dotenv=ch.dotenv())
+
+    inserts = ch.inserts()
+    assert inserts, "вставки не было вовсе"
+    assert inserts[0]["body"] == "", (
+        "мастер записал строку в боевую таблицу: %r" % inserts[0]["body"])
+
+
+def test_telemetry_without_insert_rights_is_told_in_words(tmp_path):
+    """Учётка только на чтение — та самая, что была у всей пилотной группы.
+    Мастер обязан сказать правду: причина, следствие, что делать."""
+    repo = _make_repo_copy(tmp_path)
+
+    with _FakeClickHouse(writers=()) as ch:
+        result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                               dotenv=ch.dotenv())
+
+    out = result.stdout
+    assert "телеметрия пишется" not in out, out
+    assert "прав INSERT в sandbox" in out, out          # причина
+    assert "READONLY" in out, out                       # ответ сервера, а не пересказ
+    assert "не влияет" in out, out                      # следствие: работать не мешает
+    assert "очереди" in out, out                        # строки не теряются
+    assert "JSM" in out, out                            # что делать
+    assert "./setup.sh --add telemetry" in out, out
+
+
+def test_telemetry_without_insert_rights_does_not_fail_the_install(tmp_path):
+    """Отсутствие прав на статистику — не поломка инструмента. Ни красного ✗
+    на телеметрию, ни ненулевого кода возврата у установки."""
+    repo = _make_repo_copy(tmp_path)
+
+    with _FakeClickHouse(writers=()) as ch:
+        result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                               dotenv=ch.dotenv())
+
+    assert result.returncode == 0, result.stdout[-3000:]
+    block = result.stdout.split("── Телеметрия")[1]
+    assert "✗" not in block, "красный ✗ на всю установку:\n%s" % block
+
+
+def test_telemetry_is_not_switched_off_when_writing_is_denied(tmp_path):
+    """Решение про «включать ли»: телеметрия остаётся включённой. Хук пишет в
+    локальную очередь (сети не касается), очередь ограничена по объёму и
+    возрасту, отправка повторяется каждой сессией — значит после выдачи прав
+    накопленное уедет само. Выключить значило бы гарантированно потерять
+    именно те сессии, ради которых пилот и считают."""
+    repo = _make_repo_copy(tmp_path)
+
+    with _FakeClickHouse(writers=()) as ch:
+        _, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                             dotenv=ch.dotenv())
+
+    assert "TELEMETRY_ENABLED" not in _secrets(home), _secrets(home)
 
 
 def test_telemetry_asks_nothing_and_checks_the_warehouse_access(tmp_path):
@@ -512,11 +712,11 @@ def test_telemetry_asks_nothing_and_checks_the_warehouse_access(tmp_path):
     телеметрия работает."""
     repo = _make_repo_copy(tmp_path)
 
-    result, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
-                              curl_rules=[TELEMETRY_OK], dotenv=DOTENV_WMS_AND_JIRA)
+    with _FakeClickHouse(writers=("imya-familiya",)) as ch:
+        result, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                                  dotenv=ch.dotenv(extra="JIRA_TOKEN=токен-jira\n"))
 
     out = result.stdout
-    assert "sandbox.ai_usage_sessions на месте, строк: 128" in out, out
     for asked in ("Хост телеметрии", "  Логин:", "  Пароль:"):
         assert asked not in out, "мастер снова спрашивает про телеметрию:\n%s" % out
     # И ничего лишнего в secrets.env: дубль складских значений — ловушка,
@@ -529,14 +729,13 @@ def test_telemetry_check_goes_with_the_warehouse_credentials(tmp_path):
     какие именно логин и пароль ушли в проверку."""
     repo = _make_repo_copy(tmp_path)
 
-    _run_setup(repo, tmp_path, args=["--add", "telemetry"],
-               curl_rules=[TELEMETRY_OK], dotenv=DOTENV_WMS_AND_JIRA)
+    with _FakeClickHouse(writers=("imya-familiya",)) as ch:
+        _run_setup(repo, tmp_path, args=["--add", "telemetry"], dotenv=ch.dotenv())
 
-    calls = [c for c in _curl_calls(tmp_path) if "ai_usage_sessions" in c["url"]]
-    assert calls, "живой проверки телеметрии не было вовсе"
-    assert "wms.internal:8123" in calls[0]["url"], calls[0]["url"]
-    assert "X-ClickHouse-User: имя-фамилия" in calls[0]["config"], calls[0]["config"]
-    assert "X-ClickHouse-Key: пароль-склада" in calls[0]["config"]
+    inserts = ch.inserts()
+    assert inserts, "живой проверки телеметрии не было вовсе"
+    assert inserts[0]["user"] == "imya-familiya", inserts[0]["user"]
+    assert inserts[0]["key"] == "parol-sklada"
 
 
 def test_telemetry_without_the_warehouse_says_so_instead_of_asking(tmp_path):
@@ -544,12 +743,31 @@ def test_telemetry_without_the_warehouse_says_so_instead_of_asking(tmp_path):
     повод задавать вопросы: доступ появится, телеметрия включится сама."""
     repo = _make_repo_copy(tmp_path)
 
-    result, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
-                              curl_rules=[TELEMETRY_OK])
+    with _FakeClickHouse(writers=("imya-familiya",)) as ch:
+        result, home = _run_setup(repo, tmp_path, args=["--add", "telemetry"])
 
     assert "складской ClickHouse ещё не настроен" in result.stdout, result.stdout
     assert "TELEMETRY_CH_" not in _secrets(home)
-    assert not [c for c in _curl_calls(tmp_path) if "ai_usage_sessions" in c["url"]]
+    assert not ch.requests, "стучались в базу, не зная адреса: %s" % ch.requests
+
+
+def test_telemetry_unreachable_cluster_is_an_error_not_a_missing_right(tmp_path):
+    """Обратная сторона мягкой формулировки: «нет прав» не должно печататься
+    на всё подряд. Недоступный кластер — это поломка, и говорить о ней надо
+    иначе (✗ и текст ответа), иначе человек пойдёт заводить заявку вместо
+    того, чтобы поднять Netbird."""
+    repo = _make_repo_copy(tmp_path)
+
+    # Порт, на котором заведомо никто не слушает.
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
+                           dotenv=("CH_WMS_HOST=127.0.0.1\nCH_WMS_PORT=1\n"
+                                   "CH_WMS_USER=imya-familiya\n"
+                                   "CH_WMS_PASSWORD=parol-sklada\n"))
+
+    out = result.stdout
+    assert "не прошла" in out, out
+    assert "прав INSERT" not in out, out
+    assert result.returncode == 0, out[-2000:]
 
 
 def test_wizard_removes_telemetry_duplicates_of_the_warehouse_values(tmp_path):
@@ -560,22 +778,21 @@ def test_wizard_removes_telemetry_duplicates_of_the_warehouse_values(tmp_path):
     repo = _make_repo_copy(tmp_path)
     home = tmp_path / "home"
     (home / ".config" / "uzum-ai").mkdir(parents=True, exist_ok=True)
-    (home / ".config" / "uzum-ai" / "secrets.env").write_text(
-        "CH_WMS_HOST='wms.internal'\n"
-        "CH_WMS_PORT='8123'\n"
-        "CH_WMS_USER='имя-фамилия'\n"
-        "CH_WMS_PASSWORD='пароль-склада'\n"
-        "TELEMETRY_CH_HOST='wms.internal'\n"
-        "TELEMETRY_CH_PORT='8123'\n"
-        "TELEMETRY_CH_USER='имя-фамилия'\n"
-        "TELEMETRY_CH_PASSWORD='пароль-склада'\n",
-        encoding="utf-8")
 
-    _run_setup(repo, tmp_path, args=["--add", "telemetry"], curl_rules=[TELEMETRY_OK])
+    with _FakeClickHouse(writers=("imya-familiya",)) as ch:
+        (home / ".config" / "uzum-ai" / "secrets.env").write_text(
+            ch.secrets(extra=(
+                "TELEMETRY_CH_HOST='%s'\n"
+                "TELEMETRY_CH_PORT='%s'\n"
+                "TELEMETRY_CH_USER='imya-familiya'\n"
+                "TELEMETRY_CH_PASSWORD='parol-sklada'\n" % (ch.host, ch.port))),
+            encoding="utf-8")
+
+        _run_setup(repo, tmp_path, args=["--add", "telemetry"])
 
     secrets = _secrets(home)
     assert "TELEMETRY_CH_" not in secrets, secrets
-    assert "CH_WMS_PASSWORD='пароль-склада'" in secrets, "снесли лишнее:\n%s" % secrets
+    assert "CH_WMS_PASSWORD='parol-sklada'" in secrets, "снесли лишнее:\n%s" % secrets
 
 
 def test_wizard_keeps_a_deliberate_writer_account_and_checks_it(tmp_path):
@@ -586,29 +803,27 @@ def test_wizard_keeps_a_deliberate_writer_account_and_checks_it(tmp_path):
     repo = _make_repo_copy(tmp_path)
     home = tmp_path / "home"
     (home / ".config" / "uzum-ai").mkdir(parents=True, exist_ok=True)
-    (home / ".config" / "uzum-ai" / "secrets.env").write_text(
-        "CH_WMS_HOST='wms.internal'\n"
-        "CH_WMS_PORT='8123'\n"
-        "CH_WMS_USER='имя-фамилия'\n"
-        "CH_WMS_PASSWORD='пароль-склада'\n"
-        "TELEMETRY_CH_USER='ai-usage-writer'\n"
-        "TELEMETRY_CH_PASSWORD='пароль-писателя'\n",
-        encoding="utf-8")
 
-    result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"],
-                           curl_rules=[TELEMETRY_OK])
+    with _FakeClickHouse(writers=("ai-usage-writer",)) as ch:
+        (home / ".config" / "uzum-ai" / "secrets.env").write_text(
+            ch.secrets(extra="TELEMETRY_CH_USER='ai-usage-writer'\n"
+                             "TELEMETRY_CH_PASSWORD='parol-pisatelya'\n"),
+            encoding="utf-8")
+
+        result, _ = _run_setup(repo, tmp_path, args=["--add", "telemetry"])
 
     secrets = _secrets(home)
     assert "TELEMETRY_CH_USER='ai-usage-writer'" in secrets, secrets
-    calls = [c for c in _curl_calls(tmp_path) if "ai_usage_sessions" in c["url"]]
-    assert calls, "живой проверки телеметрии не было"
-    assert "X-ClickHouse-User: ai-usage-writer" in calls[0]["config"], (
+    inserts = ch.inserts()
+    assert inserts, "живой проверки телеметрии не было"
+    assert inserts[0]["user"] == "ai-usage-writer", (
         "проверили складскую учётку, а писать будет другая — это и есть "
         "«зелёная установка, пустая таблица»")
-    # Адрес при этом остаётся складским: ради смены учётки не должно
-    # приходиться переписывать все четыре значения.
-    assert "wms.internal:8123" in calls[0]["url"]
+    # Адрес при этом остаётся складским — иначе запрос не пришёл бы на этот
+    # сервер вовсе: ради смены учётки не должно приходиться переписывать все
+    # четыре значения.
     assert "заданы отдельно" in result.stdout
+    assert "телеметрия пишется" in result.stdout, result.stdout
 
 
 # ── Первая сессия не должна молчать: окружения коннекторов готовит мастер ──
@@ -857,28 +1072,36 @@ def test_every_saved_access_is_still_checked_live_not_taken_on_faith(tmp_path):
     значением, — «сходил куда-то» тут ничего не доказывает."""
     repo = _make_repo_copy(tmp_path)
 
-    _run_setup(repo, tmp_path, args=["--non-interactive"],
-               curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING)
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES, saved_secrets=SAVED_EVERYTHING)
 
     calls = _curl_calls(tmp_path)
 
     def checked(where, credential):
         return [c for c in calls if where in c["url"] and credential in c["config"]]
 
-    # Складской ClickHouse, общий ClickHouse, телеметрия (тот же кластер, но
-    # другая таблица — отдельный доступ с точки зрения прав) и Jira.
+    # Складской ClickHouse, общий ClickHouse и Jira — их мастер проверяет
+    # curl'ом, поэтому доказательство лежит в его логе.
     for where, credential, what in (
             ("wms.internal:8123/?query=SELECT+count()+FROM+system.databases",
              "X-ClickHouse-User: имя-фамилия", "ClickHouse WMS"),
             ("dwh.internal:8123/?query=SELECT+count()+FROM+system.databases",
              "X-ClickHouse-User: учётка-dwh", "ClickHouse DWH"),
-            ("sandbox.ai_usage_sessions",
-             "X-ClickHouse-User: имя-фамилия", "телеметрия"),
             ("jira.uzum.com", "Bearer токен-с-прошлой-установки", "Jira")):
         assert checked(where, credential), (
             "%s: сохранённое значение приняли на веру — живого запроса с ним "
             "не было. Запросы, которые ушли: %s"
             % (what, [c["url"] for c in calls]))
+
+    # Телеметрия проверяется не curl'ом, а тем же кодом, которым пишут хуки
+    # (lib/telemetry.py::check_write) — в curl.log её запроса нет и быть не
+    # должно. Здесь доказательство живой попытки — то, что мастер напечатал её
+    # исход по сохранённому адресу; чем именно он стучался, проверяют тесты
+    # телеметрии выше, на настоящем HTTP-сервере.
+    assert "sandbox.ai_usage_sessions" in result.stdout, result.stdout[-3000:]
+    assert "wms.internal:8123" in result.stdout, result.stdout[-3000:]
+    assert not [c for c in calls if "ai_usage_sessions" in c["url"]], (
+        "телеметрию снова проверяют вторым запросом мимо lib/telemetry.py")
 
     # Superset проверяется не curl'ом, а тем же кодом, которым потом ходит
     # коннектор (superset_mcp.py --check), — смотрим в лог uv.

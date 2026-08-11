@@ -141,8 +141,15 @@ def _base_url(cfg):
     return "%s://%s:%s/" % (scheme, cfg.host, cfg.port)
 
 
-def _post(cfg, table, rows):
-    """Отправить строки в ClickHouse. True — успех, False — нет."""
+def _insert_request(cfg, table, rows):
+    """Собрать HTTP-запрос вставки — ровно тот, которым пишется телеметрия.
+
+    Одно место на весь модуль: и настоящая отправка (`_post`), и живая
+    проверка доступа (`check_write`) берут запрос отсюда. Иначе проверка была
+    бы вторым экземпляром запроса и разошлась бы с настоящим при первой же
+    правке — а именно так и появился дефект, из-за которого мастер установки
+    объявлял рабочей телеметрию, которая писать не может.
+    """
     query = "INSERT INTO %s.%s FORMAT JSONEachRow" % (cfg.database, table)
     # async_insert: без него на каждый вызов инструмента у каждого аналитика
     # приходится отдельная вставка — по куску на строку, и MergeTree потом
@@ -158,11 +165,105 @@ def _post(cfg, table, rows):
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-ClickHouse-User", cfg.user)
     req.add_header("X-ClickHouse-Key", cfg.password)
+    return req
+
+
+def _send(cfg, table, rows):
+    """Выполнить вставку и вернуть (код ответа, текст ответа).
+
+    Код None — до сервера не дошли вовсе (нет сети, не поднят Netbird, не
+    отвечает хост). Текст — то, что ответил сервер: у ClickHouse это строка
+    вида "Code: 164. DB::Exception: … (READONLY)", единственный источник
+    правды о причине отказа. Никогда не бросает исключений.
+    """
     try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-            return 200 <= resp.status < 300
-    except Exception:
-        return False
+        with urllib.request.urlopen(_insert_request(cfg, table, rows),
+                                    timeout=TIMEOUT_S) as resp:
+            return resp.status, ""
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        return e.code, detail.strip()
+    except Exception as e:
+        return None, "%s: %s" % (type(e).__name__, e)
+
+
+def _post(cfg, table, rows):
+    """Отправить строки в ClickHouse. True — успех, False — нет."""
+    status, _ = _send(cfg, table, rows)
+    return status is not None and 200 <= status < 300
+
+
+# Таблица, на которой проверяется доступ на запись. Та же, что и у самой
+# дорогой строки телеметрии (сессия): права в ClickHouse выдаются на таблицу,
+# и «пишется ли sessions» — это то, что человека спрашивают в отчётности.
+CHECK_TABLE = "ai_usage_sessions"
+
+# Отказ по правам, а не поломка. 164 READONLY — учётка заведена только на
+# чтение (так настроена вся пилотная группа), 497 ACCESS_DENIED — учётка не
+# читает-только, но именно на INSERT в sandbox прав нет. Оба кода означают
+# одно и то же для человека: «доступ есть, права на запись нет» — и лечатся
+# заявкой, а не перезапуском мастера. Всё остальное (не отвечает хост, не тот
+# пароль, нет таблицы) — это уже поломка, и говорить о ней надо иначе.
+DENIED_MARKERS = ("Code: 164.", "Code: 497.", "Not enough privileges")
+
+
+def _is_denied(detail):
+    return any(marker in detail for marker in DENIED_MARKERS)
+
+
+def check_write(cfg=None):
+    """Живая проверка того, что телеметрия может ПИСАТЬ. Возвращает
+    (исход, текст ответа сервера); исход — одно из:
+
+      "ok"           — вставка принята, хуки будут писать;
+      "denied"       — сервер отвечает отказом по правам (см. DENIED_MARKERS);
+      "disabled"     — писать некуда/незачем: адреса нет или TELEMETRY_ENABLED=0;
+      "error"        — всё остальное: не дошли до сервера, не тот пароль,
+                       нет таблицы. Текст ответа — в втором элементе.
+
+    Идёт ровно тем же путём, что и хуки: тот же `_insert_request` (тот адрес,
+    та схема, та учётка, те настройки async_insert), та же база, та же
+    таблица. Единственное отличие — строк ноль.
+
+    Почему ноль строк, а не пробная строка. Права на INSERT ClickHouse
+    проверяет при разборе запроса, до чтения тела: пустая вставка получает
+    ровно тот же отказ, что и настоящая, — проверено живьём на боевом
+    кластере обеими учётками (учётка-писатель: 200; учётка только на чтение:
+    500, "Code: 164. DB::Exception: Cannot modify \'async_insert\' setting in
+    readonly mode"). При этом в таблице не появляется ни одной строки —
+    счётчик до и после проверки одинаковый, проверено обеими учётками.
+
+    Отказ опознаётся по КОДУ (см. DENIED_MARKERS), а не по тексту: один и тот
+    же READONLY приходит с разными формулировками — «Cannot execute query in
+    readonly mode» на голом INSERT и «Cannot modify async_insert setting» на
+    нашем, потому что мы задаём настройки запроса. Ловить по словам значило бы
+    считать «нет прав» ошибкой связи при первой же смене формулировки. Это и есть честный способ без следа:
+    мусорную строку в боевой таблице пришлось бы потом чистить (уже чистили —
+    отладочные строки schema-check), а удаление требует ещё и прав на
+    ALTER DELETE, которых у пилотной группы тем более нет.
+
+    Чего эта проверка НЕ проверяет и не может: что строка правильной формы
+    доедет до диска. Хуки пишут с wait_for_async_insert=0 — сервер отвечает
+    200 до разбора тела, поэтому ошибку формата строки не увидит и настоящая
+    вставка. Проверка честна ровно в том, что обещает: доступ и права.
+
+    Никогда не бросает исключений.
+    """
+    try:
+        cfg = Config.from_env() if cfg is None else cfg
+        if not cfg.enabled or not cfg.user:
+            return "disabled", ""
+        status, detail = _send(cfg, CHECK_TABLE, [])
+        if status is not None and 200 <= status < 300:
+            return "ok", ""
+        if _is_denied(detail):
+            return "denied", detail
+        return "error", detail or ("HTTP %s" % status)
+    except Exception as e:
+        return "error", "%s: %s" % (type(e).__name__, e)
 
 
 def queue_stats(queue_dir):

@@ -684,3 +684,193 @@ def test_no_warehouse_and_no_override_means_no_telemetry(monkeypatch, tmp_path):
     assert telemetry.Config.from_env().enabled is False
     assert telemetry.write("ai_usage_events", {"user": "denis"}) is False
     assert not (tmp_path / "queue").exists()
+
+
+# --- Живая проверка доступа: check_write ------------------------------------
+#
+# Находка приёмки: мастер установки проверял телеметрию ЧТЕНИЕМ
+# (SELECT count() FROM sandbox.ai_usage_sessions) там, где обещает запись. У
+# учётки только на чтение такой запрос проходит — и человек получал зелёную
+# галочку на телеметрию, которая писать не может. Снято живьём на двух
+# настоящих учётках одного кластера: SELECT 200 у обеих, INSERT — 200 и 500
+# «Code: 164 … (READONLY)».
+#
+# Сервер ниже воспроизводит именно эту разницу: чтение отвечает всем, вставка
+# — только тому, кому выданы права.
+
+
+class _PermissionedClickHouse(object):
+    """HTTP-сервер, различающий чтение и запись, как боевой кластер."""
+
+    READONLY = ("Code: 164. DB::Exception: %s: Cannot execute query in "
+                "readonly mode. (READONLY) (version 25.8.25.37-yc.1)")
+
+    def __init__(self, writers=()):
+        import http.server
+        import threading
+        import urllib.parse
+
+        received = self.received = []
+        writers = set(writers)
+        readonly = self.READONLY
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _handle(self):
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                body = self.rfile.read(length).decode("utf-8") if length else ""
+                query = urllib.parse.parse_qs(
+                    urllib.parse.urlparse(self.path).query).get("query", [""])[0]
+                user = self.headers.get("X-ClickHouse-User", "")
+                received.append({"method": self.command, "query": query,
+                                 "user": user, "body": body})
+                insert = query.strip().upper().startswith("INSERT")
+                if insert and user not in writers:
+                    status, payload = 500, (readonly % user).encode("utf-8")
+                elif insert:
+                    status, payload = 200, b""
+                else:
+                    status, payload = 200, b"15"
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            do_GET = _handle
+            do_POST = _handle
+
+            def log_message(self, *a):
+                pass
+
+        self._server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        self.host, self.port = self._server.server_address
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._server.shutdown()
+        self._server.server_close()
+        return False
+
+
+def _point_at(monkeypatch, tmp_path, server, user, password="secret"):
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("CH_WMS_HOST", server.host)
+    monkeypatch.setenv("CH_WMS_PORT", str(server.port))
+    monkeypatch.setenv("CH_WMS_USER", user)
+    monkeypatch.setenv("CH_WMS_PASSWORD", password)
+
+
+def test_check_write_goes_by_insert_not_by_select(monkeypatch, tmp_path):
+    """Проверка обязана идти тем же запросом, которым пишут хуки: POST,
+    INSERT INTO sandbox.ai_usage_sessions, те же настройки async_insert.
+    Мутация «снова читаем» ломает это утверждение."""
+    with _PermissionedClickHouse(writers=("a-writer",)) as server:
+        _point_at(monkeypatch, tmp_path, server, "a-writer")
+
+        assert telemetry.check_write() == ("ok", "")
+
+    assert len(server.received) == 1, server.received
+    call = server.received[0]
+    assert call["method"] == "POST", call
+    assert call["query"] == "INSERT INTO sandbox.ai_usage_sessions FORMAT JSONEachRow"
+    assert call["user"] == "a-writer"
+
+
+def test_check_write_leaves_no_row_behind(monkeypatch, tmp_path):
+    """Проверочная строка не пишется вовсе: тело запроса пустое. Права
+    ClickHouse проверяет до чтения тела, поэтому отказ приходит тот же самый,
+    а мусора в боевой таблице не остаётся — чистить его было бы нечем."""
+    with _PermissionedClickHouse(writers=("a-writer",)) as server:
+        _point_at(monkeypatch, tmp_path, server, "a-writer")
+
+        telemetry.check_write()
+
+    assert server.received[0]["body"] == "", server.received[0]
+
+
+def test_check_write_reports_denial_separately_from_breakage(monkeypatch, tmp_path):
+    """Учётка только на чтение: «нет прав» — отдельный исход, а не «сломалось»
+    и уж точно не «ok». Текст ответа сервера возвращается как есть — человеку
+    показывают причину, а не пересказ."""
+    with _PermissionedClickHouse(writers=()) as server:
+        _point_at(monkeypatch, tmp_path, server, "a-reader")
+
+        outcome, detail = telemetry.check_write()
+
+    assert outcome == "denied", (outcome, detail)
+    assert "READONLY" in detail, detail
+
+
+def test_check_write_says_error_when_the_cluster_is_unreachable(monkeypatch, tmp_path):
+    """Недоступный кластер — это поломка, а не отсутствие прав: у неё другой
+    разбор (Netbird, адрес) и другой разговор с человеком."""
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("CH_WMS_HOST", "127.0.0.1")
+    monkeypatch.setenv("CH_WMS_PORT", "1")
+    monkeypatch.setenv("CH_WMS_USER", "a-reader")
+    monkeypatch.setenv("CH_WMS_PASSWORD", "secret")
+
+    outcome, detail = telemetry.check_write()
+
+    assert outcome == "error", (outcome, detail)
+    assert detail
+
+
+def test_check_write_says_disabled_when_there_is_nowhere_to_write(monkeypatch, tmp_path):
+    """Склад не настроен или телеметрию выключили — проверять нечего, и это
+    не отказ сервера."""
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+    assert telemetry.check_write() == ("disabled", "")
+
+    with _PermissionedClickHouse(writers=("a-writer",)) as server:
+        _point_at(monkeypatch, tmp_path, server, "a-writer")
+        monkeypatch.setenv("TELEMETRY_ENABLED", "0")
+
+        assert telemetry.check_write() == ("disabled", "")
+
+    assert server.received == [], "выключенная телеметрия ходила в сеть"
+
+
+def test_check_write_and_the_hooks_send_the_same_request(monkeypatch, tmp_path):
+    """Проверка и настоящая запись обязаны быть одним и тем же запросом, а не
+    двумя похожими: иначе они разойдутся при первой правке — ровно так и
+    появился дефект, который здесь чинится. Сравниваем то, что доехало до
+    сервера: адрес с параметрами, метод и заголовки одинаковы, отличается
+    только тело."""
+    with _PermissionedClickHouse(writers=("a-writer",)) as server:
+        _point_at(monkeypatch, tmp_path, server, "a-writer")
+
+        telemetry.check_write()
+        cfg = telemetry.Config.from_env()
+        telemetry._post(cfg, telemetry.CHECK_TABLE, [{"session_id": "s1"}])
+
+    check, real = server.received
+    assert check["method"] == real["method"]
+    assert check["query"] == real["query"]
+    assert check["user"] == real["user"]
+    assert check["body"] == ""
+    assert real["body"] == '{"session_id": "s1"}'
+
+
+def test_check_write_never_raises(monkeypatch, tmp_path):
+    """Контракт модуля: телеметрия не имеет права мешать работе — в том числе
+    её проверка."""
+    _clear_telemetry_env(monkeypatch)
+    monkeypatch.setenv("UZUM_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("CH_WMS_HOST", "ch")
+    monkeypatch.setenv("CH_WMS_USER", "u")
+
+    def boom(*a, **k):
+        raise RuntimeError("сеть кончилась")
+
+    monkeypatch.setattr(telemetry.urllib.request, "urlopen", boom)
+
+    outcome, detail = telemetry.check_write()
+    assert outcome == "error"
+    assert "сеть кончилась" in detail
