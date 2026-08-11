@@ -163,14 +163,15 @@ class Connector:
 
         Правило одно на все девять и берётся из самого описания: обязательна
         та переменная, у которой НЕТ дефолта. У секрета дефолт невозможен по
-        построению, у структурной он либо есть (порт, адрес Jira), либо её
-        неоткуда взять (адрес Grafana, путь к ключу Google) — и тогда она
-        такая же обязательная, как токен.
+        построению, у структурной он либо есть (порт, адрес Jira, адрес
+        Superset, адрес Grafana), либо её неоткуда взять (адрес
+        OpenMetadata — инстансов несколько, путь к ключу Google — он у
+        каждого свой) — и тогда она такая же обязательная, как токен.
 
         Совпадение с чужим прочтением, а не только с нашим: `claude mcp list`
         сам считает по `.mcp.json` «Missing environment variables» и выдаёт
         ровно эти же наборы (проверено живым запуском на клоне без кредов —
-        JIRA_TOKEN у atlassian, GRAFANA_URL+GRAFANA_TOKEN у grafana и т.д.,
+        JIRA_TOKEN у atlassian, OMD_URL+OMD_TOKEN у openmetadata и т.д.,
         и ни одной у trino).
 
         Считаем по обеим веткам запуска (общей и Codex): у clickhouse-* они
@@ -319,7 +320,21 @@ CONNECTORS: Tuple[Connector, ...] = (
         command="uvx",
         args=("mcp-grafana",),
         env=(
-            EnvVar(target="GRAFANA_URL", source="GRAFANA_URL", secret=False),
+            # Дефолт здесь по той же причине, что у SUPERSET_URL выше: адрес
+            # один на всю компанию, и мастер его не спрашивает. Пока дефолта
+            # не было, connector_readiness числил GRAFANA_URL недостающим, а
+            # человек читал «grafana — нет GRAFANA_URL, GRAFANA_TOKEN» и шёл
+            # выпрашивать у платформы адрес вместе с токеном.
+            #
+            # Именно https, не http: тот же хост по http отвечает 308
+            # Permanent Redirect (проверено живым запросом), а mcp-grafana
+            # редирект не переигрывает — в конфиге адрес по http бесполезен.
+            # Проверено живьём с сервисным токеном: /api/health → 200
+            # (Grafana 12.3.0), /api/org → 200 (Main Org.), /api/user → 200
+            # (сервис-аккаунт, orgId 1), /api/search?type=dash-db и
+            # /api/datasources → 200.
+            EnvVar(target="GRAFANA_URL", source="GRAFANA_URL", secret=False,
+                   default="https://ops-grafana.prod.cluster.daymarket.uz"),
             EnvVar(target="GRAFANA_SERVICE_ACCOUNT_TOKEN", source="GRAFANA_TOKEN", secret=True),
         ),
     ),

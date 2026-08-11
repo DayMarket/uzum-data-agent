@@ -146,13 +146,14 @@ def test_source_names_are_not_left_lying_around_under_their_own_names():
 # Точный словарь, а не «содержит»: лишнее имя здесь означало бы выдуманное
 # значение там, где его быть не должно (в первую очередь — у секрета).
 #
-# SUPERSET_URL попал сюда позже остальных и по той же причине, что и
-# JIRA_URL: адрес один на всю компанию, мастер подставляет его сам. Пока
-# дефолта не было, connector_readiness числил переменную обязательной, и в
-# итоге установки человек читал «superset — нет SUPERSET_URL, …» про
-# значение, которого у него никто не спрашивал.
+# SUPERSET_URL и GRAFANA_URL попали сюда позже остальных и по той же
+# причине, что и JIRA_URL: адрес один на всю компанию, мастер подставляет его
+# сам. Пока дефолта не было, connector_readiness числил переменную
+# обязательной, и в итоге установки человек читал «grafana — нет GRAFANA_URL,
+# …» про значение, которого у него никто не спрашивал.
 DEFAULTS_ON_EMPTY_ENVIRONMENT = {
     "JIRA_URL": "https://jira.uzum.com",
+    "GRAFANA_URL": "https://ops-grafana.prod.cluster.daymarket.uz",
     "CONFLUENCE_URL": "https://confluence.uzum.com",
     "TRINO_HOST": "trino.prod-data.internal.daymarket.uz",
     "TRINO_CATALOG": "dwh-iceberg",

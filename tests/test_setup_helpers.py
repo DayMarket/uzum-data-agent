@@ -865,7 +865,10 @@ def test_whitespace_only_value_is_not_a_value(tmp_path):
     path = tmp_path / "secrets.env"
     setup_helpers.write_env(str(path), {"GRAFANA_URL": "   ", "GRAFANA_TOKEN": "\t"})
 
-    assert _readiness(path)["grafana"] == ("GRAFANA_URL", "GRAFANA_TOKEN")
+    # Адрес получил дефолт в реестре, поэтому пробелы в нём — не нехватка:
+    # подставится дефолт. А вот пробел вместо токена остаётся нехваткой,
+    # иначе коннектор поднялся бы без доступа.
+    assert _readiness(path)["grafana"] == ("GRAFANA_TOKEN",)
     assert "grafana" not in setup_helpers.configured_connector_ids(str(path))
 
 

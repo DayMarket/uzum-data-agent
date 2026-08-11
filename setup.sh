@@ -1002,10 +1002,11 @@ setup_superset() {
   superset_url_default="$(registry_default SUPERSET_URL)"
   ask SUPERSET_URL "  URL Superset [$superset_url_default]: "
   SUPERSET_URL=${SUPERSET_URL:-$superset_url_default}
-  # Необязательность коннектора держится на логине, а не на URL. У остальных
-  # трёх необязательных (grafana — GRAFANA_URL, openmetadata — OMD_URL,
-  # sheets — GOOGLE_SA_FILE) первым спрашивается значение без дефолта, и
-  # пустой ответ выводит из коннектора целиком. У SUPERSET_URL дефолт есть,
+  # Необязательность коннектора держится на логине, а не на URL. Форма одна
+  # на все необязательные: первым спрашивается значение БЕЗ дефолта, и
+  # пустой ответ выводит из коннектора целиком — у grafana это
+  # GRAFANA_TOKEN (у адреса дефолт есть), у openmetadata OMD_URL, у sheets
+  # GOOGLE_SA_FILE. У SUPERSET_URL дефолт есть,
   # поэтому «нет URL» тут не наступает никогда — и без этой развилки
   # ./setup.sh --non-interactive на машине, где Superset осознанно не
   # заводили, выходил с кодом 1 по SUPERSET_USERNAME/SUPERSET_PASSWORD.
@@ -1087,19 +1088,36 @@ setup_trino() {
 # брифе его никто не спрашивал — добавляю запрос URL, иначе включённый
 # коннектор гарантированно не поднимется.
 setup_grafana() {
-  say "── Grafana ── сервисный токен у платформы (URL приходит вместе с ним)"
-  ask GRAFANA_URL "  URL Grafana (Enter — пропустить): "
-  if [ -z "$GRAFANA_URL" ]; then
-    # GRAFANA_TOKEN мог прийти из .env сам по себе — без URL он бесполезен,
-    # и молчание тут выглядело бы как "мастер его не заметил", хотя на
-    # самом деле он просто не может включить коннектор без адреса.
-    if [ -n "${GRAFANA_TOKEN:-}" ]; then
-      fail "GRAFANA_TOKEN в .env есть, а GRAFANA_URL нет — токен не использован"
+  say "── Grafana ── сервисный токен: заявка платформе"
+  # Адрес берём из реестра, а не пишем здесь вторым экземпляром — та же
+  # причина, что у setup_superset: два литерала разошлись бы при первой
+  # правке, и мастер предлагал бы один адрес, а коннектор ходил бы на
+  # другой. Именно https: тот же хост по http отвечает 308 Permanent
+  # Redirect, и адрес по http в конфиге бесполезен.
+  local grafana_url_default
+  grafana_url_default="$(registry_default GRAFANA_URL)"
+  ask GRAFANA_URL "  URL Grafana [$grafana_url_default]: "
+  GRAFANA_URL=${GRAFANA_URL:-$grafana_url_default}
+  # Необязательность коннектора держится на ТОКЕНЕ, а не на URL. Раньше
+  # держалась на URL — но теперь у GRAFANA_URL есть дефолт, поэтому «нет
+  # адреса» не наступает никогда, и без этой развилки ./setup.sh
+  # --non-interactive на машине, где Grafana осознанно не заводили, выходил
+  # бы с кодом 1 по GRAFANA_TOKEN. Ровно тот дефект, что чинили у Superset
+  # кругом раньше: коннектор необязательный, а выход красный. Второго
+  # перечня «кто необязателен» не заводим — развилка живёт в самом
+  # коннекторе, по значению без дефолта.
+  ask_secret GRAFANA_TOKEN "  Токен (Enter — пропустить): "
+  if [ -z "${GRAFANA_TOKEN:-}" ]; then
+    # Зеркальное предупреждение, как у Superset: адрес назвали руками, а
+    # токен нет — значит человек Grafana всё-таки хотел, и молчание тут
+    # выглядело бы как «мастер не заметил».
+    if [ -n "$GRAFANA_URL" ] && [ "$GRAFANA_URL" != "$grafana_url_default" ]; then
+      fail "GRAFANA_URL указан, а GRAFANA_TOKEN нет — адрес не использован"
     fi
+    fail "токен не введён — проверять нечего"
     fail "пропущено — подключить позже: ./setup.sh --add grafana"
     return
   fi
-  ask_required_secret GRAFANA_TOKEN "  Токен: " "GRAFANA_TOKEN (Grafana токен — GRAFANA_URL уже указан)"
   local out code org
   out="$(mk_tmp)"
   code=$(curl_check "$out" 10 "${GRAFANA_URL%/}/api/org" \

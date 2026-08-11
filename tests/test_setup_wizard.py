@@ -722,7 +722,9 @@ def test_wizard_says_which_values_are_missing_not_just_that_it_is_absent(tmp_pat
 
     out = result.stdout
     assert "openmetadata" in out and "нет OMD_URL, OMD_TOKEN" in out, out[-2500:]
-    assert "нет GRAFANA_URL, GRAFANA_TOKEN" in out
+    assert "нет GRAFANA_TOKEN" in out
+    assert "GRAFANA_URL" not in out, (
+        "адрес Grafana объявлен дефолтом в реестре — просить его у человека нечего")
     assert "нет GROWTHBOOK_TOKEN" in out
     assert "./setup.sh --add openmetadata" in out
 
@@ -1033,11 +1035,13 @@ def test_add_without_questions_reuses_the_saved_value_instead_of_failing(tmp_pat
 
 # ── Необязательный коннектор не роняет прогон без вопросов ───────────────
 #
-# У grafana (GRAFANA_URL), openmetadata (OMD_URL) и sheets (GOOGLE_SA_FILE)
-# первым спрашивается значение без дефолта, и пустой ответ выводит из
-# коннектора целиком. У SUPERSET_URL дефолт есть, поэтому «нет URL» не
-# наступало никогда, и Superset доходил до ask_required — на машине, где его
-# осознанно не заводили, `./setup.sh --non-interactive` выходил с кодом 1.
+# Форма одна на все необязательные: первым спрашивается значение БЕЗ
+# дефолта, и пустой ответ выводит из коннектора целиком. У openmetadata это
+# OMD_URL, у sheets GOOGLE_SA_FILE, у superset SUPERSET_USERNAME, у grafana
+# GRAFANA_TOKEN. У адресов Superset и Grafana дефолт есть, поэтому «нет URL»
+# не наступает никогда — и пока развилка стояла на адресе, `./setup.sh
+# --non-interactive` на машине, где коннектор осознанно не заводили, выходил
+# с кодом 1.
 
 SAVED_WITHOUT_SUPERSET = "".join(
     line + "\n" for line in SAVED_EVERYTHING.splitlines()
@@ -1060,6 +1064,38 @@ def test_a_connector_nobody_configured_does_not_fail_the_run_without_questions(t
     # Пропущен так же, как остальные необязательные: строкой и командой.
     assert "./setup.sh --add superset" in result.stdout
     assert "superset" not in _enabled(repo)
+
+
+def test_grafana_without_a_token_does_not_fail_the_run_without_questions(tmp_path):
+    """То же самое для Grafana, и по той же причине: адрес получил дефолт в
+    реестре, значит «нет URL» больше не наступает, и без развилки по токену
+    мастер дошёл бы до ask_required и уронил прогон у каждого, кто Grafana
+    не заводил. Тест падает, если развилку вернуть на URL."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES,
+                           saved_secrets=SAVED_EVERYTHING)
+
+    assert "не хватает значений" not in result.stdout, result.stdout[-3000:]
+    assert "✗ GRAFANA_TOKEN" not in result.stdout, result.stdout[-3000:]
+    assert result.returncode == 0, result.stdout[-3000:]
+    assert "./setup.sh --add grafana" in result.stdout
+    assert "grafana" not in _enabled(repo)
+
+
+def test_a_grafana_address_given_by_hand_without_a_token_is_not_swallowed(tmp_path):
+    """Обратная сторона развилки: адрес назвали руками, а токен нет — значит
+    Grafana человеку всё-таки нужна, и молчание выглядело бы как «мастер не
+    заметил». Ровно как зеркальное предупреждение у Superset."""
+    repo = _make_repo_copy(tmp_path)
+    with_url = SAVED_EVERYTHING + "GRAFANA_URL='https://своя-графана.internal'\n"
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES, saved_secrets=with_url)
+
+    assert "адрес не использован" in result.stdout, result.stdout[-3000:]
+    assert "grafana" not in _enabled(repo)
 
 
 def test_half_configured_superset_is_still_reported_as_missing(tmp_path):

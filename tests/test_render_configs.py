@@ -409,7 +409,7 @@ def test_required_sources_match_the_placeholders_without_defaults_in_mcp_json():
     какие `${VAR}` в нём стоят без `:-дефолта`. Claude Code по этому же
     файлу печатает «Missing environment variables», и на клоне без кредов
     его список совпал с нашим дословно (JIRA_TOKEN у atlassian,
-    GRAFANA_URL+GRAFANA_TOKEN у grafana, ни одной у trino)."""
+    OMD_URL+OMD_TOKEN у openmetadata, ни одной у trino)."""
     servers = _mcp_json_servers()
 
     for connector in CONNECTORS:
@@ -432,5 +432,5 @@ def test_trino_requires_nothing_and_openmetadata_requires_both_values():
 
     assert by_id["trino"].required_sources() == ()
     assert set(by_id["openmetadata"].required_sources()) == {"OMD_URL", "OMD_TOKEN"}
-    assert set(by_id["grafana"].required_sources()) == {"GRAFANA_URL", "GRAFANA_TOKEN"}
+    assert set(by_id["grafana"].required_sources()) == {"GRAFANA_TOKEN"}
     assert by_id["growthbook"].required_sources() == ("GROWTHBOOK_TOKEN",)

@@ -77,7 +77,7 @@
         "mcp-grafana"
       ],
       "env": {
-        "GRAFANA_URL": "${GRAFANA_URL}",
+        "GRAFANA_URL": "${GRAFANA_URL:-https://ops-grafana.prod.cluster.daymarket.uz}",
         "GRAFANA_SERVICE_ACCOUNT_TOKEN": "${GRAFANA_TOKEN}"
       }
     },
