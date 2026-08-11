@@ -206,6 +206,28 @@ for cid, missing in setup_helpers.connector_readiness('$SECRETS'):
   return 0
 }
 
+# Дефолт переменной, объявленный в описании коннектора. Нужен, чтобы
+# общеизвестный адрес (Superset) не был записан в мастере вторым
+# экземпляром: реестр — единственное место, где он живёт, и там же его
+# читает connector_readiness, решая, обязательна переменная или нет. Пусто,
+# если дефолта нет.
+registry_default() {
+  UZUM_DEFAULT_SOURCE="$1" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR')
+from connectors.registry import CONNECTORS, EnvVar
+name = os.environ['UZUM_DEFAULT_SOURCE']
+for connector in CONNECTORS:
+    branches = (connector.env, connector.codex.env if connector.codex else ())
+    for branch in branches:
+        for item in branch:
+            if isinstance(item, EnvVar) and item.source == name \
+                    and item.default is not None:
+                sys.stdout.write(item.default)
+                raise SystemExit
+"
+}
+
 missing_vars_for() {
   printf '%s\n' "$READINESS" | awk -F'\t' -v id="$1" '$1 == id {print $2}'
 }
@@ -450,7 +472,23 @@ ask_required_secret() {
 # определить не удалось», а не «всё хорошо»: молчаливое «ок» при непонятном
 # ответе и есть тот дефект, который здесь чинится.
 #
-# Печатает "<состояние><TAB><подробность>": up | down | daemon | absent | unknown.
+# Отдельный исход `nopeers` — management подключён, а пиров ноль из
+# ненулевого числа. Снято живьём в окне сразу после `netbird up`:
+# Management: Connected, Signal: Connected, Peers count: 0/2, Networks: «-»,
+# у обоих пиров status "Connecting" и networks: null — и прод-ClickHouse в
+# этот момент отвечает кодом 000. Когда пиры доходят до 2/2, у них
+# появляется networks: ["10.0.0.0/8", …], и прод отвечает 200. То есть
+# маршруты до прод-сетей раздают именно пиры.
+#
+# Наблюдение снято на переходном состоянии, не на застрявшем, поэтому в
+# тексте остаётся «скорее всего»: за установленный факт про НЕпереходный
+# случай оно не выдаётся. Зелёной строки тут не должно быть в любом случае —
+# это последнее место, где ✓ могла сопровождать неработающий туннель.
+# Переходность и делает вторую строку полезной: если человек запустил мастер
+# сразу после `netbird up`, ему надо просто подождать.
+#
+# Печатает "<состояние><TAB><подробность>":
+# up | down | nopeers | daemon | absent | slow | unknown.
 netbird_state() {
   if ! command -v netbird >/dev/null 2>&1; then
     # Команды нет, а процесс есть — на машине стоит приложение, но CLI не в
@@ -462,12 +500,35 @@ netbird_state() {
     fi
     return
   fi
+  # Сам вызов запускает python: ему нужен таймаут, а `timeout(1)` на macOS
+  # нет вовсе. Нормальный ответ приходит за 0,26 с (замерено), поэтому 5 с —
+  # это двадцатикратный запас, а не гонка. Без таймаута человек смотрел бы в
+  # пустой экран: при недоступном демоне netbird молчит около 10 секунд,
+  # прежде чем упереться в свой дедлайн, — на фоне мгновенного остального
+  # мастера это читается как «повис».
+  #
   # stderr отбрасываем намеренно: netbird пишет туда предупреждения grpc даже
   # при удачном вызове, а разбираем мы только стандартный вывод.
-  UZUM_NB_JSON="$(netbird status --json 2>/dev/null)" python3 -c '
-import json, os, sys
+  python3 -c '
+import json, subprocess, sys
 
-raw = os.environ.get("UZUM_NB_JSON", "")
+TIMEOUT = 5
+try:
+    done = subprocess.run(["netbird", "status", "--json"],
+                          stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                          timeout=TIMEOUT)
+    raw = done.stdout.decode("utf-8", errors="replace")
+except subprocess.TimeoutExpired:
+    # Не выдаём это за «служба не запущена»: наблюдение одно (незапущенная
+    # служба молчит дольше нашего таймаута), а причин молчать может быть
+    # больше. Говорим ровно то, что знаем, и подсказываем самый частый
+    # разбор — второй строкой ниже, в check_environment.
+    sys.stdout.write("slow\tnetbird status не ответил за %d с" % TIMEOUT)
+    raise SystemExit
+except Exception as exc:
+    sys.stdout.write("unknown\tне удалось запустить netbird status: %s" % exc)
+    raise SystemExit
+
 if not raw.strip():
     # Демон не запущен или недоступен: netbird уходит с кодом 1, диагностику
     # пишет в stderr, стандартный вывод оставляет пустым (проверено).
@@ -484,11 +545,23 @@ if not isinstance(connected, bool):
     sys.stdout.write("unknown\tв ответе netbird нет management.connected")
     raise SystemExit
 detail = ""
+live = total = None
 peers = data.get("peers")
 if isinstance(peers, dict) and isinstance(peers.get("connected"), int) \
         and isinstance(peers.get("total"), int):
-    detail = "пиров: %d/%d" % (peers["connected"], peers["total"])
-sys.stdout.write(("up\t" if connected else "down\t") + detail)
+    live, total = peers["connected"], peers["total"]
+    detail = "пиров: %d/%d" % (live, total)
+if not connected:
+    sys.stdout.write("down\t" + detail)
+elif live == 0 and total:
+    # Туннель поднят, но ни один пир не отвечает. Маршруты до прод-сетей
+    # (10.0.0.0/8 и остальные) приходят именно от пиров-бастионов — значит
+    # данных, скорее всего, не будет. "Скорее всего", а не "точно": это
+    # разбор устройства сети, а не наблюдение — состояние вживую снять не
+    # удалось. Зелёной строки тут быть не должно в любом случае.
+    sys.stdout.write("nopeers\t" + detail)
+else:
+    sys.stdout.write("up\t" + detail)
 '
 }
 
@@ -581,6 +654,17 @@ check_environment() {
     daemon)
       fail "Служба Netbird не отвечает — прод-данных (ClickHouse, Trino, OpenMetadata, Grafana) не будет"
       fail "Запусти приложение Netbird (или netbird service start), затем netbird up"
+      ;;
+    nopeers)
+      fail "Netbird подключён, но ни один пир не отвечает ($nb_detail)"
+      fail "Маршруты до прод-сетей раздают пиры-бастионы — прод-источники (ClickHouse, Trino, OpenMetadata, Grafana), скорее всего, не ответят"
+      fail "Если туннель только что подняли — подожди несколько секунд и запусти мастер заново; иначе смотри netbird status -d"
+      ;;
+    slow)
+      # Не диагноз, а факт: обычно ответ приходит мгновенно. Дальше — самый
+      # частый разбор, названный как версия, а не как вывод.
+      note "состояние Netbird определить не удалось ($nb_detail, обычно отвечает мгновенно)"
+      note "так себя ведёт незапущенная служба: netbird service start, затем netbird up. Без туннеля прод-данных (ClickHouse, Trino, OpenMetadata, Grafana) не будет"
       ;;
     absent)
       fail "Netbird не установлен — без него не будет доступа к прод-данным (ClickHouse, Trino, OpenMetadata, Grafana). Инструкция: connectors/ACCESS.md"
@@ -910,8 +994,14 @@ setup_jira() {
 # (superset_mcp.py::_login), браузер не открывается.
 setup_superset() {
   say "── Superset ── логин и пароль корп-учётки (Keycloak): форму входа отправляет сам коннектор, браузер не открывается"
-  ask SUPERSET_URL "  URL Superset [https://bi.uzum.uz]: "
-  SUPERSET_URL=${SUPERSET_URL:-https://bi.uzum.uz}
+  # Адрес берём из реестра, а не пишем здесь вторым экземпляром: он там уже
+  # объявлен дефолтом (и именно поэтому connector_readiness не числит
+  # SUPERSET_URL недостающим). Два литерала разошлись бы при первой правке —
+  # мастер предлагал бы один адрес, коннектор ходил бы на другой.
+  local superset_url_default
+  superset_url_default="$(registry_default SUPERSET_URL)"
+  ask SUPERSET_URL "  URL Superset [$superset_url_default]: "
+  SUPERSET_URL=${SUPERSET_URL:-$superset_url_default}
   # Необязательность коннектора держится на логине, а не на URL. У остальных
   # трёх необязательных (grafana — GRAFANA_URL, openmetadata — OMD_URL,
   # sheets — GOOGLE_SA_FILE) первым спрашивается значение без дефолта, и

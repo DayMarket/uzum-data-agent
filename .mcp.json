@@ -66,7 +66,7 @@
         "${CLAUDE_PROJECT_DIR:-.}/connectors/superset_mcp.py"
       ],
       "env": {
-        "SUPERSET_URL": "${SUPERSET_URL}",
+        "SUPERSET_URL": "${SUPERSET_URL:-https://bi.uzum.uz}",
         "SUPERSET_USERNAME": "${SUPERSET_USERNAME}",
         "SUPERSET_PASSWORD": "${SUPERSET_PASSWORD}"
       }

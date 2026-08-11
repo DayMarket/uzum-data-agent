@@ -141,10 +141,16 @@ def test_source_names_are_not_left_lying_around_under_their_own_names():
 
 # ── дефолты ───────────────────────────────────────────────────────────────
 
-# Всё, что аналитик имеет право не заполнять: адреса Jira/Confluence/Trino,
-# каталог Trino, порт и признак https обоих кластеров ClickHouse. Точный
-# словарь, а не «содержит»: лишнее имя здесь означало бы выдуманное
+# Всё, что аналитик имеет право не заполнять: адреса Jira/Confluence/Trino/
+# Superset, каталог Trino, порт и признак https обоих кластеров ClickHouse.
+# Точный словарь, а не «содержит»: лишнее имя здесь означало бы выдуманное
 # значение там, где его быть не должно (в первую очередь — у секрета).
+#
+# SUPERSET_URL попал сюда позже остальных и по той же причине, что и
+# JIRA_URL: адрес один на всю компанию, мастер подставляет его сам. Пока
+# дефолта не было, connector_readiness числил переменную обязательной, и в
+# итоге установки человек читал «superset — нет SUPERSET_URL, …» про
+# значение, которого у него никто не спрашивал.
 DEFAULTS_ON_EMPTY_ENVIRONMENT = {
     "JIRA_URL": "https://jira.uzum.com",
     "CONFLUENCE_URL": "https://confluence.uzum.com",
@@ -154,6 +160,7 @@ DEFAULTS_ON_EMPTY_ENVIRONMENT = {
     "CH_WMS_SECURE": "false",
     "CH_DWH_PORT": "8123",
     "CH_DWH_SECURE": "false",
+    "SUPERSET_URL": "https://bi.uzum.uz",
 }
 
 

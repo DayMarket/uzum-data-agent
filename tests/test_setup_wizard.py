@@ -24,6 +24,7 @@ import os
 import shutil
 import stat
 import subprocess
+import time
 from collections import namedtuple
 from pathlib import Path
 
@@ -130,7 +131,8 @@ sys.exit(0 if answer.startswith("OK:") else 1)
 # летят в stderr; когда демон недоступен — stdout ПУСТ, код возврата 1, вся
 # диагностика в stderr. Стаб ничего не решает за проверяемый код: он не
 # знает ни про «✓», ни про «✗», только печатает и возвращает код.
-import os, sys
+import os, sys, time
+time.sleep(float(os.environ.get("UZUM_TEST_NETBIRD_SLEEP", "0")))
 sys.stderr.write(os.environ.get("UZUM_TEST_NETBIRD_STDERR", ""))
 sys.stdout.write(os.environ.get("UZUM_TEST_NETBIRD_STDOUT", ""))
 sys.exit(int(os.environ.get("UZUM_TEST_NETBIRD_CODE", "0")))
@@ -1089,9 +1091,10 @@ def test_half_configured_superset_is_still_reported_as_missing(tmp_path):
 
 
 def _netbird_run(repo, tmp_path, stdout=None, code="0", stderr="",
-                 netbird="up", pgrep_found=False):
+                 netbird="up", pgrep_found=False, sleep="0"):
     env = {"UZUM_TEST_NETBIRD_CODE": code,
            "UZUM_TEST_NETBIRD_STDERR": stderr,
+           "UZUM_TEST_NETBIRD_SLEEP": sleep,
            "UZUM_TEST_PGREP_FOUND": "1" if pgrep_found else "0"}
     if stdout is not None:
         env["UZUM_TEST_NETBIRD_STDOUT"] = stdout
@@ -1190,3 +1193,126 @@ def test_a_missing_cli_with_a_live_daemon_is_not_called_missing(tmp_path):
     assert "Netbird подключён" not in out, out[:1500]
     assert "состояние Netbird определить не удалось" in out, out[:1500]
     assert "нет в PATH" in out, out[:1500]
+
+
+def test_a_silent_netbird_does_not_hold_the_wizard(tmp_path):
+    """Своего таймаута у проверки не было, а настоящий netbird при
+    недоступном демоне молчит около 10 секунд (замерено). На фоне мгновенного
+    остального мастера человек десять секунд смотрит в пустой экран и решает,
+    что всё повисло. Нормальный ответ приходит за 0,26 с."""
+    repo = _make_repo_copy(tmp_path)
+    started = time.monotonic()
+
+    out = _netbird_run(repo, tmp_path, stdout=NETBIRD_STATUS_UP,
+                       sleep="30", pgrep_found=True)
+
+    spent = time.monotonic() - started
+    assert "Netbird подключён" not in out, out[:1500]
+    assert "состояние Netbird определить не удалось" in out, out[:1500]
+    assert "не ответил за 5 с" in out, out[:1500]
+    # Мастер дошёл до конца, а не завис на молчащей команде.
+    assert "growthbook" in _enabled(repo), out[-2000:]
+    assert spent < 30, (
+        "мастер дождался молчащего netbird целиком — таймаут не сработал, "
+        "прошло %.1f с" % spent)
+
+
+def test_a_silent_netbird_names_the_usual_cause(tmp_path):
+    """Строка должна помогать. Незапущенная служба — самый частый разбор, но
+    названа как версия, а не как диагноз: наблюдение одно, причин молчать
+    может быть больше."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout=NETBIRD_STATUS_UP, sleep="30")
+
+    assert "netbird service start" in out, out[:1500]
+
+
+# ── Адрес Superset: один, и он в реестре ────────────────────────────────
+
+def test_the_person_is_not_asked_for_a_variable_the_wizard_fills_itself(tmp_path):
+    """connector_readiness числил SUPERSET_URL недостающим, хотя мастер
+    подставляет его сам. На поведение не влияло, но в итоге установки человек
+    читал имя переменной, которую у него никто не спрашивал, и шёл её
+    искать."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--non-interactive"],
+                           curl_rules=SAVED_ALL_RULES,
+                           saved_secrets=SAVED_WITHOUT_SUPERSET)
+
+    out = result.stdout
+    assert "нет SUPERSET_USERNAME, SUPERSET_PASSWORD" in out, out[-3000:]
+    assert "SUPERSET_URL" not in out, (
+        "мастер называет переменную, которую подставляет сам:\n%s" % out[-3000:])
+
+
+def test_the_superset_address_is_taken_from_the_registry_not_copied(tmp_path):
+    """Два литерала одного адреса разошлись бы при первой правке: мастер
+    предлагал бы один, коннектор ходил бы на другой. Источник один — реестр."""
+    from connectors.registry import CONNECTORS_BY_ID
+
+    declared = [item.default for item in CONNECTORS_BY_ID["superset"].env_vars()
+                if item.source == "SUPERSET_URL"]
+    assert declared and declared[0], "в реестре у SUPERSET_URL нет дефолта"
+    address = declared[0]
+
+    repo = _make_repo_copy(tmp_path)
+    result, home = _run_setup(repo, tmp_path, args=["--add", "superset"],
+                              answers="\nлогин-аналитика\nпароль-superset\n\n")
+
+    # На приглашение не смотрим: `read -p` печатает его, только когда ввод
+    # идёт с терминала, а здесь это труба — проверять было бы нечего.
+    # Смотрим на то, что мастер реально записал: подстановка дефолта видна
+    # именно там, и мутация «свой литерал в setup.sh» её ломает.
+    assert result.returncode == 0, result.stdout[-2000:]
+    assert "SUPERSET_URL='%s'" % address in _secrets(home), (
+        "мастер записал не тот адрес, что объявлен в реестре:\n%s" % _secrets(home))
+
+
+NETBIRD_STATUS_NO_PEERS = (
+    '{"peers":{"total":2,"connected":0},"daemonStatus":"Connected",'
+    '"management":{"url":"https://vpn.daymarket.uz:33073","connected":true,"error":""},'
+    '"signal":{"url":"http://vpn.daymarket.uz:10000","connected":true,"error":""}}'
+)
+
+
+def test_a_tunnel_without_peers_is_not_a_green_line(tmp_path):
+    """Последнее место, где зелёная строка могла сопровождать неработающий
+    туннель: management подключён, а пиров ноль. Маршруты до прод-сетей
+    раздают пиры-бастионы — значит данных не будет, а мастер говорил
+    «✓ Netbird подключён (пиров: 0/2)» и оставлял человека догадываться, что
+    значит это число."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout=NETBIRD_STATUS_NO_PEERS)
+
+    assert "✓ Netbird подключён" not in out, out[:1500]
+    assert "ни один пир не отвечает" in out, out[:1500]
+    assert "пиров: 0/2" in out, out[:1500]
+
+
+def test_a_tunnel_without_peers_says_what_to_check_without_overclaiming(tmp_path):
+    """Состояние вживую снять не удалось — это разбор устройства сети, а не
+    наблюдение. Строка обязана и помогать, и не выдавать себя за факт."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout=NETBIRD_STATUS_NO_PEERS)
+
+    assert "скорее всего" in out, out[:1500]
+    assert "netbird status -d" in out, out[:1500]
+
+
+def test_a_network_with_no_peers_at_all_is_not_accused(tmp_path):
+    """Обратная сторона: сеть, где пиров нет вовсе (0 из 0), — это не
+    «пиры отвалились». Без этой границы правило ругалось бы на исправную
+    установку, у которой просто нет соседей."""
+    repo = _make_repo_copy(tmp_path)
+    empty_network = NETBIRD_STATUS_NO_PEERS.replace(
+        '"total":2,"connected":0', '"total":0,"connected":0')
+    assert empty_network != NETBIRD_STATUS_NO_PEERS, "подмена в образце не сработала"
+
+    out = _netbird_run(repo, tmp_path, stdout=empty_network)
+
+    assert "Netbird подключён (пиров: 0/0)" in out, out[:1500]
+    assert "ни один пир не отвечает" not in out, out[:1500]

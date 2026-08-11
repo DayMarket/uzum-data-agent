@@ -290,7 +290,16 @@ CONNECTORS: Tuple[Connector, ...] = (
         command="uv",
         args=("run", ProjectScript("connectors/superset_mcp.py")),
         env=(
-            EnvVar(target="SUPERSET_URL", source="SUPERSET_URL", secret=False),
+            # Дефолт здесь, а не только в мастере: без него required_sources
+            # числил SUPERSET_URL обязательным, и в итоге установки человек
+            # читал «superset — нет SUPERSET_URL, SUPERSET_USERNAME,
+            # SUPERSET_PASSWORD» и шёл искать переменную, которую у него
+            # никто не спрашивал (мастер подставляет её сам). На поведение
+            # это не влияло — put_env писал подставленный адрес, и гейт
+            # сходился, — но строка называла лишнее. Адрес Superset такой же
+            # общеизвестный, как адрес Jira выше: он один на всю компанию.
+            EnvVar(target="SUPERSET_URL", source="SUPERSET_URL", secret=False,
+                   default="https://bi.uzum.uz"),
             # Вход в Superset проходит сам коннектор: superset_mcp.py::_login
             # отправляет форму Keycloak (логин + пароль) и держит cookie —
             # браузер в этом не участвует. Раньше этих двух переменных тут не
