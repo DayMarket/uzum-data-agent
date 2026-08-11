@@ -432,3 +432,29 @@ def test_bridge_without_a_command_explains_itself(tmp_path):
 
     assert result.returncode != 0
     assert "Использование" in result.stderr
+
+
+def test_the_registry_is_read_at_call_time_not_frozen_at_import(monkeypatch):
+    """Сторож против формы, которая уже стоила одного круга правок.
+
+    `def codex_env_overlay(source_env, connectors=CONNECTORS)` выглядит
+    настраиваемым, но умолчание-выражение вычисляется ОДИН раз при импорте:
+    подмена `codex_env_bridge.CONNECTORS` после этого ни на что не влияет.
+    В `log_session.clickhouse_users` ровно такая сигнатура прятала дефект
+    полгода — тест подменял путь к secrets.env, подмена молча не
+    действовала, читался личный файл владельца, и утверждение теста не
+    проверялось никогда.
+
+    Здесь дефекта не было: реестр берётся из исходников репозитория, а не с
+    машины. Но форма та же, и наступить в неё можно завтра. Тест падает,
+    если умолчание вернут в сигнатуру."""
+    fake = (
+        Connector(id="только-в-подменённом-реестре", command="x", args=(),
+                  env=(EnvVar(target="ЦЕЛЬ", source="ИСТОЧНИК", secret=False),)),
+    )
+    monkeypatch.setattr(codex_env_bridge, "CONNECTORS", fake)
+
+    overlay = codex_env_bridge.codex_env_overlay({"ИСТОЧНИК": "значение"})
+
+    assert overlay == {"ЦЕЛЬ": "значение"}, (
+        "мостик взял реестр, зафиксированный при импорте, а не текущий")

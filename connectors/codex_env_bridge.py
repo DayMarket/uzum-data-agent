@@ -80,7 +80,7 @@ class ConflictingTargets(Exception):
     """
 
 
-def codex_env_overlay(source_env, connectors=CONNECTORS) -> dict:
+def codex_env_overlay(source_env, connectors=None) -> dict:
     """Что дописать в окружение перед запуском Codex: {target: значение}.
 
     Значения берутся ТОЛЬКО из `source_env` и никогда из уже собранного
@@ -94,7 +94,16 @@ def codex_env_overlay(source_env, connectors=CONNECTORS) -> dict:
     «доступ есть, но не работает» вместо «доступа нет». У секретов
     `default` невозможен по построению (registry.EnvVar это проверяет), так
     что выдумать значение секрета тут неоткуда.
+
+    `connectors=None`, а не `=CONNECTORS`: умолчание-выражение вычисляется
+    один раз при импорте, и прибитый в сигнатуре список игнорировал бы
+    подмену `codex_env_bridge.CONNECTORS`. Здесь это не прятало дефекта —
+    реестр берётся из исходников репозитория, а не с машины, и тесты, у
+    которых свой набор, передают его явным `connectors=` (так и надо), —
+    но форма ровно та же, что стоила круга в log_session.clickhouse_users.
+    Ловушку убираем, пока в неё не наступили.
     """
+    connectors = CONNECTORS if connectors is None else connectors
     overlay = {}
     origin = {}  # target -> (id коннектора, source, default)
     for connector in connectors:

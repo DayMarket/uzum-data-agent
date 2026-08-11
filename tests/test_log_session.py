@@ -521,19 +521,29 @@ def test_no_model_in_the_transcript_leaves_the_column_empty():
     assert log_session.pick_model([]) == ""
 
 
+# Учётки для тестов — заведомо не такие, как у кого-либо в реальности.
+# Раньше здесь стояли настоящие логины владельца, и один из тестов ниже был
+# зелёным именно из-за совпадения: подмена пути к secrets.env молча не
+# действовала, читался личный файл владельца — а в нём лежали ровно эти
+# значения. Кириллица и суффикс делают случайное совпадение с корпоративным
+# логином невозможным, поэтому следующая такая подмена сразу станет видна.
+WMS_LOGIN = "склад-учётка-тест-e7f1"
+DWH_LOGIN = "dwh-учётка-тест-e7f1"
+
+
 def test_both_clickhouse_logins_are_recorded_and_not_swapped(tmp_path):
     """Две учётки, и они не взаимозаменяемы: на рабочей машине владельца в
     складской кластер ходят под заимствованной учёткой, а личная там не
     заведена вовсе. Перепутать их местами — самая вероятная и самая
     незаметная ошибка здесь: обе строки, обе похожи на логин."""
     secrets = tmp_path / "secrets.env"
-    secrets.write_text("CH_WMS_USER='n-lyubchenko'\nCH_DWH_USER='a-bir'\n",
+    secrets.write_text("CH_WMS_USER='%s'\nCH_DWH_USER='%s'\n" % (WMS_LOGIN, DWH_LOGIN),
                        encoding="utf-8")
 
     wms, dwh = log_session.clickhouse_users({}, str(secrets))
 
-    assert wms == "n-lyubchenko", "в ch_wms_user не та учётка"
-    assert dwh == "a-bir", "в ch_dwh_user не та учётка"
+    assert wms == WMS_LOGIN, "в ch_wms_user не та учётка"
+    assert dwh == DWH_LOGIN, "в ch_dwh_user не та учётка"
 
 
 def test_dwh_login_is_empty_when_only_the_warehouse_is_configured(tmp_path):
@@ -577,7 +587,7 @@ def test_session_row_keeps_machine_user_and_both_logins_apart(monkeypatch, tmp_p
     корпоративный логин через переменную, которой давно нет (см. bin/uzum),
     и там молча оказывалось имя пользователя машины."""
     secrets = tmp_path / "secrets.env"
-    secrets.write_text("CH_WMS_USER='n-lyubchenko'\nCH_DWH_USER='a-bir'\n",
+    secrets.write_text("CH_WMS_USER='%s'\nCH_DWH_USER='%s'\n" % (WMS_LOGIN, DWH_LOGIN),
                        encoding="utf-8")
     monkeypatch.setattr(log_session, "SECRETS_PATH", str(secrets))
     monkeypatch.setenv("UZUM_USER", "ноутбук-аналитика")
@@ -589,6 +599,32 @@ def test_session_row_keeps_machine_user_and_both_logins_apart(monkeypatch, tmp_p
          "hook_event_name": "SessionEnd", "reason": "clear"}, {})
 
     assert row["user"] == "ноутбук-аналитика"
-    assert row["ch_wms_user"] == "n-lyubchenko"
-    assert row["ch_dwh_user"] == "a-bir"
+    assert row["ch_wms_user"] == WMS_LOGIN
+    assert row["ch_dwh_user"] == DWH_LOGIN
     assert len({row["user"], row["ch_wms_user"], row["ch_dwh_user"]}) == 3
+
+
+def test_session_row_reads_the_substituted_secrets_file_and_no_other(monkeypatch, tmp_path):
+    """Сторож против того, из-за чего тест выше был зелёным на одной
+    единственной машине: `secrets_path` брался умолчанием-выражением, то
+    есть фиксировался при импорте, подмена SECRETS_PATH не действовала, и
+    build_session_row читал настоящий ~/.config/uzum-ai/secrets.env.
+
+    Здесь путь ведёт в НЕсуществующий файл, а окружение вычищено. Пусто —
+    единственный правильный ответ; любое имя в этих колонках означает, что
+    значение пришло откуда-то ещё, и первый кандидат — личный файл того, кто
+    запустил тесты. На машине с настроенным secrets.env этот тест и ловит
+    подмену, которая не сработала."""
+    monkeypatch.setattr(log_session, "SECRETS_PATH", str(tmp_path / "нет-такого-файла"))
+    monkeypatch.setenv("UZUM_USER", "ноутбук-аналитика")
+    monkeypatch.delenv("CH_WMS_USER", raising=False)
+    monkeypatch.delenv("CH_DWH_USER", raising=False)
+
+    row = log_session.build_session_row(
+        {"session_id": "s", "transcript_path": CLAUDE_TRANSCRIPT_REAL,
+         "hook_event_name": "SessionEnd", "reason": "clear"}, {})
+
+    assert row["ch_wms_user"] == "", (
+        "учётка взялась не из подменённого файла: %r" % row["ch_wms_user"])
+    assert row["ch_dwh_user"] == "", (
+        "учётка взялась не из подменённого файла: %r" % row["ch_dwh_user"])

@@ -248,7 +248,7 @@ def pick_model(models):
     return ""
 
 
-def clickhouse_users(environ=None, secrets_path=SECRETS_PATH):
+def clickhouse_users(environ=None, secrets_path=None):
     """(ch_wms_user, ch_dwh_user) — две учётки ClickHouse, под которыми шла
     работа. Обе как есть, ничего не выбирая и не сливая.
 
@@ -268,8 +268,18 @@ def clickhouse_users(environ=None, secrets_path=SECRETS_PATH):
     перед запуском движка), потом в сам secrets.env — сессию могли начать и
     не через наш лаунчер. Чего нет — пустая строка: выдуманная учётка хуже
     отсутствующей.
+
+    `secrets_path=None`, а не `=SECRETS_PATH`: умолчание-выражение
+    вычисляется ОДИН раз при импорте модуля, поэтому прибитый в сигнатуре
+    путь делал функцию только на вид настраиваемой. Найдено дорого: тест
+    подменял `log_session.SECRETS_PATH` на свой временный файл, подмена
+    молча не действовала, читался настоящий ~/.config/uzum-ai/secrets.env —
+    и тест был зелёным ровно потому, что в личном файле владельца лежали те
+    же значения, которые он ожидал. На любой другой машине он бы падал, а
+    само утверждение не проверялось никогда. Путь берётся в момент вызова.
     """
     environ = os.environ if environ is None else environ
+    secrets_path = SECRETS_PATH if secrets_path is None else secrets_path
     try:
         stored = envfile.read(secrets_path)
     except Exception:
