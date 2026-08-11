@@ -55,7 +55,24 @@ def _script(path, body):
     path.chmod(path.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def _stubs(tmp_path, engines=("claude",)):
+# Ответы `netbird status --json`, снятые с живой машины (netbird 0.73.2) и
+# урезанные до полей, которые читает мастер. Различие между состояниями —
+# ровно то, что было снято: management.connected, daemonStatus, счётчик
+# пиров. Процесс демона в ОБОИХ состояниях жив, поэтому старая проверка
+# `pgrep -x netbird` их не различала вовсе.
+NETBIRD_STATUS_UP = (
+    '{"peers":{"total":2,"connected":2},"daemonStatus":"Connected",'
+    '"management":{"url":"https://vpn.daymarket.uz:33073","connected":true,"error":""},'
+    '"signal":{"url":"http://vpn.daymarket.uz:10000","connected":true,"error":""}}'
+)
+NETBIRD_STATUS_DOWN = (
+    '{"peers":{"total":0,"connected":0},"daemonStatus":"Idle",'
+    '"management":{"url":"https://vpn.daymarket.uz:33073","connected":false,"error":""},'
+    '"signal":{"url":"http://vpn.daymarket.uz:10000","connected":false,"error":""}}'
+)
+
+
+def _stubs(tmp_path, engines=("claude",), with_netbird=True):
     """Подставные внешние команды. `curl` и `uv` — содержательные (см.
     докстринг модуля), остальные нужны только чтобы `command -v` их нашёл."""
     stub_dir = tmp_path / "stubs"
@@ -105,6 +122,28 @@ print(answer)
 sys.exit(0 if answer.startswith("OK:") else 1)
 """)
 
+    if with_netbird:
+        _script(stub_dir / "netbird", """#!/usr/bin/env python3
+# Подставной netbird. Отвечает ровно тем, что задал тест, — включая то, чем
+# настоящий netbird 0.73.2 отличает свои состояния (снято живыми прогонами):
+# при удачном вызове JSON идёт в stdout, а предупреждения grpc всё равно
+# летят в stderr; когда демон недоступен — stdout ПУСТ, код возврата 1, вся
+# диагностика в stderr. Стаб ничего не решает за проверяемый код: он не
+# знает ни про «✓», ни про «✗», только печатает и возвращает код.
+import os, sys
+sys.stderr.write(os.environ.get("UZUM_TEST_NETBIRD_STDERR", ""))
+sys.stdout.write(os.environ.get("UZUM_TEST_NETBIRD_STDOUT", ""))
+sys.exit(int(os.environ.get("UZUM_TEST_NETBIRD_CODE", "0")))
+""")
+
+    # Единственное место, где мастер зовёт pgrep, — запасной путь Netbird
+    # (команды нет в PATH, но процесс демона может быть жив). Стабим, иначе
+    # тест читал бы состояние ЭТОЙ машины, где демон обычно запущен.
+    _script(stub_dir / "pgrep", """#!/usr/bin/env bash
+[ "${UZUM_TEST_PGREP_FOUND:-0}" = "1" ] && exit 0
+exit 1
+""")
+
     for name in ("uvx", "npx"):
         _script(stub_dir / name, "#!/usr/bin/env bash\nexit 0\n")
     for name in engines:
@@ -120,7 +159,8 @@ sys.exit(0 if answer.startswith("OK:") else 1)
 
 def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
                superset_check="OK:7", engines=("claude",), answers=None,
-               stub_overrides=None, extra_env=None, saved_secrets=None):
+               stub_overrides=None, extra_env=None, saved_secrets=None,
+               netbird="up"):
     home = tmp_path / "home"
     home.mkdir(exist_ok=True)
     if "codex" in engines:
@@ -129,9 +169,19 @@ def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
         # или нет» ничего бы не проверяли.
         (home / ".codex").mkdir(exist_ok=True)
         (home / ".codex" / "auth.json").write_text("{}", encoding="utf-8")
-    stub_dir = _stubs(tmp_path, engines=engines)
+    stub_dir = _stubs(tmp_path, engines=engines, with_netbird=netbird != "absent")
     for name, body in (stub_overrides or {}).items():
         _script(stub_dir / name, body)
+    if netbird == "absent":
+        # Машина без Netbird: команды нет вовсе. Настоящий netbird лежит в
+        # системном PATH, поэтому его каталог оттуда убираем — иначе тест
+        # проверял бы состояние VPN ЭТОЙ машины, а не поведение мастера.
+        path_dirs = [d for d in os.environ["PATH"].split(os.pathsep)
+                     if d and not (Path(d) / "netbird").exists()]
+        assert not any((Path(d) / "netbird").exists() for d in path_dirs)
+        search_path = os.pathsep.join([str(stub_dir), *path_dirs])
+    else:
+        search_path = "%s%s%s" % (stub_dir, os.pathsep, os.environ["PATH"])
     rules_path = tmp_path / "curl-rules.json"
     rules_path.write_text(json.dumps(list(curl_rules)), encoding="utf-8")
     if dotenv is not None:
@@ -144,9 +194,12 @@ def _run_setup(repo, tmp_path, args=(), curl_rules=(), dotenv=None,
 
     env = {
         "HOME": str(home),
-        "PATH": "%s:%s" % (stub_dir, os.environ["PATH"]),
+        "PATH": search_path,
         "USER": "test",
         "TERM": "dumb",
+        # По умолчанию туннель поднят — иначе каждый тест про что угодно
+        # другое начинался бы с красной строки про Netbird.
+        "UZUM_TEST_NETBIRD_STDOUT": NETBIRD_STATUS_UP,
         "UZUM_TEST_CURL_RULES": str(rules_path),
         "UZUM_TEST_CURL_LOG": str(tmp_path / "curl.log"),
         "UZUM_TEST_UV_LOG": str(tmp_path / "uv.log"),
@@ -1020,3 +1073,120 @@ def test_half_configured_superset_is_still_reported_as_missing(tmp_path):
     assert "не хватает значений" in result.stdout, result.stdout[-3000:]
     assert "SUPERSET_PASSWORD" in result.stdout, result.stdout[-3000:]
     assert result.returncode == 1
+
+
+# ── Netbird: проверяем состояние туннеля, а не наличие процесса ──────────
+#
+# Поймано на живой машине: `netbird status` показывал Management:
+# Disconnected и Peers count: 0/0, процесс демона при этом был жив — и мастер
+# печатал «✓ Netbird запущен», а следом четыре ✗ подряд от внутренних
+# коннекторов с кодом 000. Единственная строка, которая должна была объяснить
+# причину, говорила «всё хорошо».
+#
+# Стаб netbird ничего не решает за проверяемый код: он печатает ответ, который
+# задал тест, и уходит с заданным кодом — ровно как настоящий. Все утверждения
+# ниже — про то, что сказал мастер.
+
+
+def _netbird_run(repo, tmp_path, stdout=None, code="0", stderr="",
+                 netbird="up", pgrep_found=False):
+    env = {"UZUM_TEST_NETBIRD_CODE": code,
+           "UZUM_TEST_NETBIRD_STDERR": stderr,
+           "UZUM_TEST_PGREP_FOUND": "1" if pgrep_found else "0"}
+    if stdout is not None:
+        env["UZUM_TEST_NETBIRD_STDOUT"] = stdout
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "growthbook"],
+                           answers="ключ-gb\n\n", extra_env=env, netbird=netbird)
+    return result.stdout
+
+
+def test_a_connected_tunnel_is_reported_as_connected(tmp_path):
+    """Положительный контроль. Без него всё, что ниже, прошло бы и на
+    проверке, которая ругается всегда."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout=NETBIRD_STATUS_UP)
+
+    assert "Netbird подключён (пиров: 2/2)" in out, out[:1500]
+
+
+def test_a_live_netbird_process_with_the_tunnel_down_is_not_called_fine(tmp_path):
+    """Сама находка: демон жив, туннель опущен. Раньше здесь печаталось
+    «✓ Netbird запущен» — и человек шёл перевыпускать токены."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout=NETBIRD_STATUS_DOWN, pgrep_found=True)
+
+    assert "Netbird подключён" not in out, out[:1500]
+    assert "Netbird не подключён" in out, out[:1500]
+    # Строка обязана помогать, а не только сообщать диагноз.
+    assert "netbird up" in out, out[:1500]
+
+
+def test_an_unrecognised_netbird_answer_is_not_called_fine(tmp_path):
+    """Netbird — не наш продукт, формат вывода может поменяться. Тогда мастер
+    обязан сказать «определить не удалось» и идти дальше, а не молчаливо
+    согласиться, что всё хорошо."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout="статус: всё чудесно\n",
+                       pgrep_found=True)
+
+    assert "Netbird подключён" not in out, out[:1500]
+    assert "состояние Netbird определить не удалось" in out, out[:1500]
+    # И это не остановка установки: коннектор после этого настроен.
+    assert "growthbook" in _enabled(repo), out[-2000:]
+
+
+def test_json_without_the_expected_field_is_not_called_fine(tmp_path):
+    """Второй способ, которым чужой формат ломается: JSON разобрался, а поля
+    нет. Молчаливое «ок» тут — тот же дефект."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path,
+                       stdout='{"peers":{"total":2,"connected":2}}',
+                       pgrep_found=True)
+
+    assert "Netbird подключён" not in out, out[:1500]
+    assert "состояние Netbird определить не удалось" in out, out[:1500]
+    assert "management.connected" in out, out[:1500]
+
+
+def test_an_unreachable_daemon_says_how_to_start_it(tmp_path):
+    """Демон не запущен: настоящий netbird уходит с кодом 1, стандартный
+    вывод оставляет пустым, диагностику пишет в stderr (проверено живым
+    прогоном). Это не «не установлен» и не «опущен» — и делать надо другое."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, stdout="", code="1",
+                       stderr="Error: failed to connect to daemon error: "
+                              "context deadline exceeded\n")
+
+    assert "Netbird подключён" not in out, out[:1500]
+    assert "Служба Netbird не отвечает" in out, out[:1500]
+    assert "netbird service start" in out, out[:1500]
+
+
+def test_netbird_not_installed_at_all_is_still_reported(tmp_path):
+    """Случай, который работал и раньше: Netbird на машине нет вовсе.
+    Ломать его было нельзя."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, netbird="absent", pgrep_found=False)
+
+    assert "Netbird не установлен" in out, out[:1500]
+    assert "connectors/ACCESS.md" in out, out[:1500]
+
+
+def test_a_missing_cli_with_a_live_daemon_is_not_called_missing(tmp_path):
+    """Приложение стоит, а команды netbird в PATH нет. Сказать «не
+    установлен» значило бы соврать в другую сторону: туннель может быть
+    поднят. Мы просто не знаем — так и говорим."""
+    repo = _make_repo_copy(tmp_path)
+
+    out = _netbird_run(repo, tmp_path, netbird="absent", pgrep_found=True)
+
+    assert "Netbird не установлен" not in out, out[:1500]
+    assert "Netbird подключён" not in out, out[:1500]
+    assert "состояние Netbird определить не удалось" in out, out[:1500]
+    assert "нет в PATH" in out, out[:1500]

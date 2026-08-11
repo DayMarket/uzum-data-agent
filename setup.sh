@@ -422,6 +422,76 @@ ask_required_secret() {
   read -rsp "$__prompt" "$__var"; echo
 }
 
+# ── Netbird: состояние туннеля, а не наличие процесса ────────────────────
+#
+# Было `pgrep -x netbird`, и это худший вид сообщения: на живом демоне с
+# опущенным туннелем мастер печатал «✓ Netbird запущен», а следом шли четыре
+# ✗ подряд от внутренних коннекторов с кодом 000. Единственная строка,
+# которая должна была объяснить причину, говорила «всё хорошо» — человек
+# идёт перевыпускать токены и писать в поддержку про сломанный ClickHouse.
+# Поймано на живой машине: процесс демона жив и когда туннель поднят, и
+# после `netbird down`, — pgrep эти состояния не различает в принципе.
+#
+# Чем состояния отличаются на самом деле (снято живыми прогонами, netbird
+# 0.73.2, дословный вывод — в отчёте задачи):
+#
+#   поднят            management.connected = true,  daemonStatus "Connected", пиров 2/2
+#   опущен            management.connected = false, daemonStatus "Idle",      пиров 0/0
+#   демон недоступен  код возврата 1, стандартный вывод ПУСТ, всё в stderr
+#
+# `netbird status -C ready` для этого не годится, хотя название обещает
+# ровно это: на опущенном туннеле он отвечает кодом 0 (проверено). Из трёх
+# режимов -C состояние различает только `startup`, но опираться на поле,
+# которое однажды уже соврало по названию, не стоит — берём management
+# .connected, он в обоих сломанных состояниях повёл себя одинаково.
+#
+# Формат вывода netbird — не наш контракт, продукт чужой и может поменяться.
+# Поэтому любое отклонение (не JSON, нет поля, поле не bool) — это «состояние
+# определить не удалось», а не «всё хорошо»: молчаливое «ок» при непонятном
+# ответе и есть тот дефект, который здесь чинится.
+#
+# Печатает "<состояние><TAB><подробность>": up | down | daemon | absent | unknown.
+netbird_state() {
+  if ! command -v netbird >/dev/null 2>&1; then
+    # Команды нет, а процесс есть — на машине стоит приложение, но CLI не в
+    # PATH. Врать «не установлен» тут нельзя: туннель может быть поднят.
+    if pgrep -x netbird >/dev/null 2>&1; then
+      printf 'unknown\tпроцесс демона запущен, но команды netbird нет в PATH'
+    else
+      printf 'absent\t'
+    fi
+    return
+  fi
+  # stderr отбрасываем намеренно: netbird пишет туда предупреждения grpc даже
+  # при удачном вызове, а разбираем мы только стандартный вывод.
+  UZUM_NB_JSON="$(netbird status --json 2>/dev/null)" python3 -c '
+import json, os, sys
+
+raw = os.environ.get("UZUM_NB_JSON", "")
+if not raw.strip():
+    # Демон не запущен или недоступен: netbird уходит с кодом 1, диагностику
+    # пишет в stderr, стандартный вывод оставляет пустым (проверено).
+    sys.stdout.write("daemon\t")
+    raise SystemExit
+try:
+    data = json.loads(raw)
+except Exception:
+    sys.stdout.write("unknown\tnetbird status --json вернул не JSON")
+    raise SystemExit
+management = data.get("management") if isinstance(data, dict) else None
+connected = management.get("connected") if isinstance(management, dict) else None
+if not isinstance(connected, bool):
+    sys.stdout.write("unknown\tв ответе netbird нет management.connected")
+    raise SystemExit
+detail = ""
+peers = data.get("peers")
+if isinstance(peers, dict) and isinstance(peers.get("connected"), int) \
+        and isinstance(peers.get("total"), int):
+    detail = "пиров: %d/%d" % (peers["connected"], peers["total"])
+sys.stdout.write(("up\t" if connected else "down\t") + detail)
+'
+}
+
 check_environment() {
   say "Проверяю окружение…"
 
@@ -492,11 +562,36 @@ check_environment() {
   else
     fail "npx не найден — коннектор growthbook не поднимется. Поставь Node.js 18+: brew install node"
   fi
-  if pgrep -x netbird >/dev/null 2>&1; then
-    ok "Netbird запущен"
-  else
-    fail "Netbird не запущен — без него не будет доступа к прод-данным (ClickHouse, Trino, OpenMetadata, Grafana). Инструкция: connectors/ACCESS.md"
-  fi
+  local nb nb_state nb_detail
+  nb="$(netbird_state)"
+  nb_state="${nb%%$'\t'*}"
+  nb_detail="${nb#*$'\t'}"
+  case "$nb_state" in
+    up)
+      if [ -n "$nb_detail" ]; then
+        ok "Netbird подключён ($nb_detail)"
+      else
+        ok "Netbird подключён"
+      fi
+      ;;
+    down)
+      fail "Netbird не подключён — прод-данных (ClickHouse, Trino, OpenMetadata, Grafana) не будет: они видны только через туннель"
+      fail "Подними его и запусти мастер заново: netbird up (состояние — netbird status)"
+      ;;
+    daemon)
+      fail "Служба Netbird не отвечает — прод-данных (ClickHouse, Trino, OpenMetadata, Grafana) не будет"
+      fail "Запусти приложение Netbird (или netbird service start), затем netbird up"
+      ;;
+    absent)
+      fail "Netbird не установлен — без него не будет доступа к прод-данным (ClickHouse, Trino, OpenMetadata, Grafana). Инструкция: connectors/ACCESS.md"
+      ;;
+    *)
+      # Не «всё хорошо» и не «сломано»: мы просто не знаем. Молчаливое «ок»
+      # при непонятном ответе — ровно тот дефект, который здесь чинится.
+      note "состояние Netbird определить не удалось (${nb_detail:-неожиданный ответ netbird}) — проверь сам: netbird status"
+      note "если туннель не поднят, прод-данные (ClickHouse, Trino, OpenMetadata, Grafana) будут недоступны"
+      ;;
+  esac
 }
 
 # ── ClickHouse ───────────────────────────────────────────────────────────
