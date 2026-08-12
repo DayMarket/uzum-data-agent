@@ -1575,3 +1575,92 @@ def test_a_network_with_no_peers_at_all_is_not_accused(tmp_path):
 
     assert "Netbird подключён (пиров: 0/0)" in out, out[:1500]
     assert "ни один пир не отвечает" not in out, out[:1500]
+
+
+# ── Windows ──────────────────────────────────────────────────────────────
+#
+# Установка на Windows идёт внутри WSL2, и оба правила ниже — про то, что
+# видит человек, у которого что-то не так. Оба проверяются подделкой ровно
+# одного признака: `uname -s` для Git Bash и переменной WSL_DISTRO_NAME для
+# WSL. Подделывать /proc на macOS, где эти тесты обычно и запускаются,
+# нечем — поэтому мастер и смотрит на два независимых признака, а не на
+# один.
+
+UNAME_GIT_BASH = "#!/bin/sh\necho MINGW64_NT-10.0-19045\n"
+
+
+def test_git_bash_is_refused_before_a_single_secret_is_asked(tmp_path):
+    """Git Bash проходит заметную часть мастера: bash там настоящий, curl
+    есть. Ломается позже и по частям, а профиль разрешений Codex на
+    Windows-путях не применяется вовсе — то есть остаётся сессия, которая
+    выглядит рабочей и при этом читает .env. Половина установки хуже
+    отсутствующей, поэтому здесь именно отказ."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(repo, tmp_path, dotenv=DOTENV_WMS_AND_JIRA,
+                              stub_overrides={"uname": UNAME_GIT_BASH})
+
+    assert result.returncode != 0, result.stdout[:1500]
+    assert "Git Bash" in result.stdout, result.stdout[:1500]
+    assert "WSL2" in result.stdout, result.stdout[:1500]
+    # Не «сказал и пошёл дальше»: до вопросов и записи дело не дошло.
+    assert _secrets(home) == "", _secrets(home)
+    assert _enabled(repo) == [], _enabled(repo)
+
+
+def test_git_bash_is_told_what_exactly_would_be_broken(tmp_path):
+    """«Не поддержано» без причины читается как каприз, и человек идёт
+    обходить запрет. Названа именно та потеря, которую по вывозу не
+    видно, — молчащий профиль разрешений."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path,
+                           stub_overrides={"uname": UNAME_GIT_BASH})
+
+    assert ".env" in result.stdout, result.stdout[:1500]
+    # Не «читай README», а точный путь до пошаговой инструкции: человек в
+    # этот момент стоит перед сломанной установкой, и лишний поиск по
+    # оглавлению — ровно та мелочь, на которой бросают.
+    assert "docs/install/windows.md" in result.stdout, result.stdout[:1500]
+
+
+def test_in_wsl_a_missing_netbird_is_not_called_not_installed(tmp_path):
+    """Внутри WSL команды netbird нет почти всегда, и это норма: клиент
+    стоит на Windows. Прежняя строка «Netbird не установлен» отправляла
+    человека ставить то, что у него уже стоит, — вместо настоящей причины,
+    по которой прод не виден: WSL2 сидит за своим NAT."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "growthbook"],
+                           answers="ключ-gb\n\n", netbird="absent",
+                           extra_env={"WSL_DISTRO_NAME": "Ubuntu"})
+
+    assert "Netbird не установлен" not in result.stdout, result.stdout[:2000]
+    assert "networkingMode=mirrored" in result.stdout, result.stdout[:2000]
+
+
+def test_in_wsl_the_network_hint_does_not_claim_the_tunnel_is_down(tmp_path):
+    """Состояние туннеля изнутри WSL снять нечем, и утверждать про него
+    мастер не имеет права. Он обязан назвать единственную честную проверку
+    — живой запрос к ClickHouse, который делает сам."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "growthbook"],
+                           answers="ключ-gb\n\n", netbird="absent",
+                           extra_env={"WSL_DISTRO_NAME": "Ubuntu"})
+
+    assert "ClickHouse" in result.stdout, result.stdout[:2000]
+    assert "живым запросом" in result.stdout, result.stdout[:2000]
+
+
+def test_outside_wsl_a_missing_netbird_is_still_a_plain_error(tmp_path):
+    """Обратная сторона: на обычном ноутбуке отсутствие Netbird — это по-
+    прежнему ошибка с прежней формулировкой. Без этой границы WSL-ветка
+    смягчила бы диагноз всем."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "growthbook"],
+                           answers="ключ-gb\n\n", netbird="absent")
+
+    assert "Netbird не установлен" in result.stdout, result.stdout[:2000]
+    assert "networkingMode=mirrored" not in result.stdout, result.stdout[:2000]
