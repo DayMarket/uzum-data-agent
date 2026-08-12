@@ -156,7 +156,49 @@ def test_secrets_paths_are_denied_to_read():
 def test_hooks_survived_next_to_permissions():
     assert set(SETTINGS["hooks"]) >= {
         "SessionStart", "SessionEnd", "UserPromptSubmit",
-        "PostToolUse", "PostToolUseFailure"}
+        "PostToolUse", "PostToolUseFailure", "Stop"}
+
+
+def test_stop_hook_writes_the_session_row_before_the_exit():
+    """Строка сессии не должна зависеть от `/exit`: люди его не набирают,
+    окно просто закрывают. Регистрация именно здесь, в .claude/settings.json
+    репозитория, — единственный способ доставки, не требующий обхода машин:
+    файл доедет обычным `git pull` на SessionStart."""
+    commands = [h["command"] for entry in SETTINGS["hooks"]["Stop"]
+                for h in entry["hooks"]]
+    assert any("log_session.py" in c for c in commands), commands
+
+
+def test_stop_hook_is_synchronous():
+    """Не косметика и не осторожность — измеренный факт (живой прогон
+    12.08.2026, Claude Code 2.1.228). С "async": true движок не дожидается
+    процесса хука, и строка сессии не появлялась ВООБЩЕ: в очереди было
+    только событие промпта и финальная строка SessionEnd. Без async та же
+    сессия дала все три строки.
+
+    Соблазн вернуть async понятен — хук висит в конце каждого хода. Цена
+    синхронности измерена там же: 60 мс на транскрипте 88 КБ и 150 мс в
+    худшем случае (файл 36 МБ, читается хвост в 5 МБ), не чаще раза в
+    минуту на сессию (log_session.PROGRESS_MIN_INTERVAL_S). Это дешевле,
+    чем потерянная сессия."""
+    for entry in SETTINGS["hooks"]["Stop"]:
+        for hook in entry["hooks"]:
+            assert not hook.get("async"), (
+                "async на Stop = строка сессии теряется, проверено запуском")
+
+
+def test_codex_hook_events_are_not_extended():
+    """Жёсткое ограничение, а не предпочтение: $CODEX_HOME/hooks.json лежит
+    ВНЕ репозитория, и `git pull` его не обновляет. Любое новое событие в
+    этом списке означает обход всех машин аналитиков с переустановкой —
+    поэтому обогащение сессии Codex висит на уже зарегистрированном
+    UserPromptSubmit (.claude/hooks/log_event.py), а не на Stop, хотя такое
+    событие Codex присылает (docs/codex-facts.md, раздел 2)."""
+    sys.path.insert(0, str(REPO_ROOT / "lib"))
+    import setup_helpers  # noqa: E402
+
+    assert set(setup_helpers.CODEX_HOOK_EVENTS) == {
+        "SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse"}
 
 
 def test_five_rules_are_in_claude_md_itself():

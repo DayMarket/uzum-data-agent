@@ -2,8 +2,32 @@
 """Хуки сессии.
 
 SessionStart — отправляет накопленную очередь и запоминает время старта.
+Stop         — промежуточная строка сессии: агрегаты БЕЗ транскрипта.
 SessionEnd   — собирает агрегаты, маскирует транскрипт и пишет строку в sessions.
 Всегда завершается с кодом 0.
+
+Про Stop (правка 12.08). Раньше строка сессии писалась ТОЛЬКО на SessionEnd,
+то есть при чистом выходе. Люди `/exit` не набирают — просто закрывают окно, и
+строки не появлялось вовсе: у Рамиля за 12.08 было 129 событий и ноль сессий.
+Теперь строка пишется по ходу работы, а SessionEnd лишь дополняет её тем, что
+до конца сессии неизвестно (причина выхода) и что нельзя слать часто
+(транскрипт). Дедупликация в датасетах дашборда сводит все строки одной сессии
+к одной; она же переведена на argMaxIf(..., значение непустое) — иначе
+последняя строка (промежуточная, без транскрипта и без end_reason) затирала бы
+непустые значения предыдущих.
+
+Хук Stop зарегистрирован СИНХРОННЫМ, в отличие от соседних. Это измеренный
+факт, а не осторожность: с "async": true движок не дожидается процесса, и
+строка не появлялась вовсе — в очереди оставались только событие промпта и
+финальная строка SessionEnd (живой прогон 12.08.2026, Claude Code 2.1.228).
+Цена синхронности замерена там же: 60 мс на транскрипте 88 КБ, 150 мс в худшем
+случае (файл 36 МБ, читается хвост в 5 МБ), не чаще раза в минуту на сессию.
+
+У Codex этого хука нет: события Stop он присылает, но регистрируются хуки в
+$CODEX_HOME/hooks.json, а он лежит вне репозитория и через `git pull` не
+обновляется — новое событие потребовало бы обхода всех машин с переустановкой.
+Поэтому для Codex ту же строку пишет .claude/hooks/log_event.py на уже
+зарегистрированном UserPromptSubmit.
 """
 import datetime
 import json
@@ -11,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "lib"))
 
@@ -47,8 +72,51 @@ JIRA_KEY_RE = re.compile(
 TRANSCRIPT_MAX_BYTES = 5_000_000
 
 
+# Не чаще раза в минуту на сессию. Хук Stop у Claude Code срабатывает после
+# КАЖДОГО ответа модели, а разбор транскрипта — это чтение и маскирование до
+# 5 МБ текста; без потолка частоты активная сессия слала бы десятки почти
+# одинаковых строк в минуту. Минута выбрана как компромисс: дашборд всё равно
+# считает по минутам, а сессия, оборвавшаяся на закрытии окна, теряет не
+# больше минуты работы.
+PROGRESS_MIN_INTERVAL_S = 60
+
+
 def _started_at_path(session_id):
     return os.path.join(STATE_DIR, "started-%s" % session_id)
+
+
+def _progress_at_path(session_id):
+    """Метка «когда последний раз писали промежуточную строку» — рядом с
+    меткой времени старта, в том же STATE_DIR и с тем же временем жизни."""
+    return os.path.join(STATE_DIR, "progress-%s" % session_id)
+
+
+def _progress_is_due(session_id, now=None):
+    """Пора ли писать промежуточную строку этой сессии.
+
+    Проверяется ДО разбора транскрипта: смысл троттлинга в том, чтобы не
+    выполнять дорогую работу, а не в том, чтобы выбросить её результат.
+    Метки нет — пишем (первый Stop сессии). Никогда не бросает исключений:
+    при любой проблеме с диском отвечаем «пора», потеря строки телеметрии
+    хуже лишней.
+    """
+    now = time.time() if now is None else now
+    try:
+        return now - os.stat(_progress_at_path(session_id)).st_mtime >= PROGRESS_MIN_INTERVAL_S
+    except OSError:
+        return True
+
+
+def _mark_progress(session_id):
+    """Запомнить момент записи промежуточной строки. Никогда не бросает
+    исключений: не удалось отметить — в худшем случае следующая строка уйдёт
+    раньше, чем через минуту."""
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        with open(_progress_at_path(session_id), "w", encoding="utf-8") as f:
+            f.write(datetime.datetime.now(datetime.timezone.utc).isoformat())
+    except OSError:
+        pass
 
 
 def _to_int(value):
@@ -302,7 +370,17 @@ def _repo_sha():
         return ""
 
 
-def build_session_row(payload, secrets):
+def build_session_row(payload, secrets, include_transcript=True):
+    """Строка сессии для sandbox.ai_usage_sessions.
+
+    include_transcript=False — промежуточная строка (хук Stop у Claude Code,
+    UserPromptSubmit у Codex): всё то же самое, но колонка transcript пустая.
+    Транскрипт живой сессии — это сотни килобайт (в замерах 283-490 КБ, потолок
+    чтения 5 МБ), и слать их на каждом ходу нельзя ни по сети, ни по месту в
+    очереди. Набор ключей от флага НЕ зависит: он сверяется со схемой таблицы
+    тестом, и «на промежуточной строке колонок меньше» означало бы вторую,
+    молчаливую форму той же строки.
+    """
     session_id = payload.get("session_id", "")
     # Разбор транскрипта — движок определяет, каким парсером читать: формат
     # JSONL общий, структура записей — нет (docs/codex-facts.md, раздел 6;
@@ -380,9 +458,40 @@ def build_session_row(payload, secrets):
         # end_reason нельзя, и это должно быть видно по данным, а не
         # спрятано за подставленным значением.
         "end_reason": payload.get("reason", ""),
-        "transcript": text,
+        "transcript": text if include_transcript else "",
         "engine": engine,
     }
+
+
+def log_progress(payload, secrets_path=None):
+    """Промежуточная строка сессии — не дожидаясь выхода.
+
+    Возвращает True, если строка принята в очередь; False — если рано (не
+    прошла минута с прошлой) или писать нечего. Никогда не бросает
+    исключений: вызывается из хуков, у которых код возврата обязан быть 0, а
+    на UserPromptSubmit у Codex ненулевой код — это `Blocked`, то есть
+    молчащая сессия вместо ответа (docs/codex-facts.md, раздел 11).
+
+    `secrets_path` нужен только тестам; в бою берётся SECRETS_PATH в момент
+    вызова — по той же причине, что и в clickhouse_users(): умолчание-
+    выражение в сигнатуре вычисляется один раз при импорте и делает функцию
+    настраиваемой только на вид.
+    """
+    try:
+        session_id = payload.get("session_id", "")
+        # Порядок важен: троттлинг раньше разбора транскрипта, иначе самая
+        # дорогая часть работы выполнялась бы и выбрасывалась.
+        if not _progress_is_due(session_id):
+            return False
+        secrets = redact.load_secret_values(
+            SECRETS_PATH if secrets_path is None else secrets_path)
+        telemetry.write("ai_usage_sessions",
+                        build_session_row(payload, secrets, include_transcript=False))
+        _mark_progress(session_id)
+        telemetry.flush_in_background()
+        return True
+    except Exception:
+        return False
 
 
 def main():
@@ -407,6 +516,11 @@ def main():
             # у flush() — 2 секунды, и это две секунды тишины перед первым
             # ответом).
             telemetry.flush_in_background()
+        elif event == "Stop":
+            # Ответ модели закончен — сессия жива, но строку о ней можно
+            # писать уже сейчас, не дожидаясь выхода, которого может не быть
+            # вовсе. Без транскрипта и не чаще раза в минуту, см. log_progress.
+            log_progress(payload)
         elif event == "SessionEnd":
             secrets = redact.load_secret_values(SECRETS_PATH)
             session_id = payload.get("session_id", "")
@@ -421,10 +535,14 @@ def main():
             # write() никогда не теряет строку молча). Сам файл больше не
             # нужен: не убирать его — значит копить в STATE_DIR по файлу на
             # каждую сессию бессрочно.
-            try:
-                os.remove(_started_at_path(session_id))
-            except OSError:
-                pass
+            # Метка троттлинга уходит вместе с меткой старта и по той же
+            # причине: сессия закончилась, файл на каждую сессию бессрочно
+            # копиться в STATE_DIR не должен.
+            for path in (_started_at_path(session_id), _progress_at_path(session_id)):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
     except Exception:
         pass
     return 0
