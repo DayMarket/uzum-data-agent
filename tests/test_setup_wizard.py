@@ -400,6 +400,50 @@ def test_rejected_confluence_token_does_not_disable_jira(tmp_path):
     assert "CONFLUENCE_TOKEN=" not in _secrets(home)
 
 
+def test_add_atlassian_enter_keeps_the_saved_jira_token_and_asks_for_confluence(tmp_path):
+    """Главный сценарий «добавить Confluence к рабочей Jira». В интерактивном
+    --add сохранённое намеренно не подставляется (вопрос задаётся всегда),
+    но PAT нельзя подсмотреть повторно: требовать перевыпуск рабочего
+    Jira-токена ради добавления второго — заставлять чинить то, что не
+    сломано. Enter на вопросе Jira оставляет сохранённый токен (и гоняет
+    его через живую проверку), после чего мастер доходит до Confluence."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(
+        repo, tmp_path, args=["--add", "atlassian"],
+        curl_rules=[JIRA_OK, CONFLUENCE_OK],
+        saved_secrets="JIRA_TOKEN='сохранённый-токен-jira'\n",
+        answers="\nновый-токен-confluence\n")
+
+    assert "atlassian" in _enabled(repo), result.stdout[-3000:]
+    assert "CONFLUENCE_TOKEN=" in _secrets(home), result.stdout[-3000:]
+    jira_calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
+    assert jira_calls and "сохранённый-токен-jira" in jira_calls[0]["config"]
+    conf_calls = [c for c in _curl_calls(tmp_path)
+                  if "confluence.uzum.com" in c["url"]]
+    assert conf_calls and "новый-токен-confluence" in conf_calls[0]["config"]
+
+
+def test_add_atlassian_enter_on_confluence_keeps_the_saved_token_too(tmp_path):
+    """Симметрично Jira: Enter на вопросе Confluence при сохранённом токене —
+    «оставить и проверить», а не ложное «Confluence будет без доступа»
+    (значение осталось бы в файле и продолжило работать)."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(
+        repo, tmp_path, args=["--add", "atlassian"],
+        curl_rules=[JIRA_OK, CONFLUENCE_OK],
+        saved_secrets=("JIRA_TOKEN='сохранённый-токен-jira'\n"
+                       "CONFLUENCE_TOKEN='сохранённый-токен-confluence'\n"),
+        answers="\n\n")
+
+    out = result.stdout
+    assert "Confluence будет без доступа" not in out, out[-3000:]
+    conf_calls = [c for c in _curl_calls(tmp_path)
+                  if "confluence.uzum.com" in c["url"]]
+    assert conf_calls and "сохранённый-токен-confluence" in conf_calls[0]["config"]
+
+
 def test_non_interactive_add_atlassian_survives_without_confluence_token(tmp_path):
     """`./setup.sh --add atlassian --non-interactive` — команда, которую
     мастер сам советует при отвале Jira. Отсутствие CONFLUENCE_TOKEN не

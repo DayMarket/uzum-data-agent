@@ -375,6 +375,23 @@ for key, value in envfile.read('$SECRETS').items():
 "
 }
 
+# Одно сохранённое значение из secrets.env, без кавычек. Пусто — значения
+# нет (или файла нет). Нужен интерактивному --add: там сохранённое в
+# окружение намеренно не подставляется (вопрос задаётся всегда — см. границу
+# «подстановка/вопрос» ниже), но Enter на вопросе означает «оставить как
+# есть», и проверять живым запросом надо ровно то, что останется — значение
+# из файла. Хвостовой перевод строки командная подстановка срежет; для
+# токенов и паролей из мастера это безопасно — put_env их так не пишет.
+saved_secret_value() {
+  [ -f "$SECRETS" ] || return 0
+  UZUM_SAVED_KEY="$1" python3 -c "
+import os, sys
+sys.path.insert(0, '$REPO_DIR/lib')
+import envfile
+sys.stdout.write(envfile.read('$SECRETS').get(os.environ['UZUM_SAVED_KEY'], ''))
+"
+}
+
 # ask VAR "приглашение" ["дефолт"]
 # ask_secret VAR "приглашение" [обязателен: метка для --non-interactive]
 #
@@ -1093,11 +1110,26 @@ if removed:
 # ничего в установке не намекает, что это два разных доступа.
 setup_jira() {
   say "── Jira ── Профиль → Personal Access Tokens → Create token"
-  ask_required_secret JIRA_TOKEN "  Токен: " "JIRA_TOKEN (токен Jira)"
-  # Пустой ввод — это не «токен не подошёл». Без этой развилки Enter на
-  # вопросе давал пустой Bearer, Jira отвечала 401, и человек читал «токен
-  # не принят» — шёл перевыпускать нормальный токен вместо того, чтобы
-  # просто вставить его (ровно так и произошло на приёмке).
+  # Подсказка про Enter — только когда сохранённое значение реально есть:
+  # на первой установке «оставить сохранённый» читалось бы как загадка.
+  local jira_prompt="  Токен: "
+  [ -n "$(saved_secret_value JIRA_TOKEN)" ] && jira_prompt="  Токен (Enter — оставить сохранённый): "
+  ask_required_secret JIRA_TOKEN "$jira_prompt" "JIRA_TOKEN (токен Jira)"
+  # Enter на вопросе — «оставить как есть», если есть что оставлять. В
+  # интерактивном --add сохранённое в окружение намеренно не подставляется
+  # (вопрос задаётся всегда — см. границу «подстановка/вопрос» выше), но
+  # PAT нельзя подсмотреть повторно: человек, который пришёл добавить
+  # ВТОРОЙ токен (Confluence) к рабочей Jira, значения Jira-токена на руках
+  # не имеет. Требовать перевыпуск ради этого — заставлять чинить то, что
+  # не сломано. Сохранённый токен всё равно проходит живую проверку ниже.
+  if [ -z "$JIRA_TOKEN" ]; then
+    JIRA_TOKEN="$(saved_secret_value JIRA_TOKEN)"
+    [ -n "$JIRA_TOKEN" ] && note "Enter — проверяю сохранённый токен Jira"
+  fi
+  # Пустой ввод без сохранённого — это не «токен не подошёл». Без этой
+  # развилки Enter на вопросе давал пустой Bearer, Jira отвечала 401, и
+  # человек читал «токен не принят» — шёл перевыпускать нормальный токен
+  # вместо того, чтобы просто вставить его (ровно так произошло на приёмке).
   if [ -z "$JIRA_TOKEN" ]; then
     fail "токен не введён — проверять нечего"
     fail "пропущено — подключить позже: ./setup.sh --add atlassian"
@@ -1132,7 +1164,16 @@ setup_confluence_token() {
   say "── Confluence ── токен ОТДЕЛЬНЫЙ от Jira: PAT действует только там, где создан"
   printf "  Создать: https://confluence.uzum.com → Профиль → Personal Access Tokens\n"
   if [ -z "${CONFLUENCE_TOKEN:-}" ] && [ "$NONINTERACTIVE" != "1" ]; then
-    read -rsp "  Токен (Enter — пропустить, без него не работает только Confluence): " CONFLUENCE_TOKEN; echo
+    local conf_prompt="  Токен (Enter — пропустить, без него не работает только Confluence): "
+    [ -n "$(saved_secret_value CONFLUENCE_TOKEN)" ] && conf_prompt="  Токен (Enter — оставить сохранённый): "
+    read -rsp "$conf_prompt" CONFLUENCE_TOKEN; echo
+  fi
+  # Enter — «оставить как есть», симметрично Jira выше: если токен уже
+  # сохранён, проверяем его, а не объявляем Confluence отключённым — это
+  # было бы неправдой, значение осталось бы в файле и продолжило работать.
+  if [ -z "${CONFLUENCE_TOKEN:-}" ]; then
+    CONFLUENCE_TOKEN="$(saved_secret_value CONFLUENCE_TOKEN)"
+    [ -n "$CONFLUENCE_TOKEN" ] && note "Enter — проверяю сохранённый токен Confluence"
   fi
   if [ -z "${CONFLUENCE_TOKEN:-}" ]; then
     note "пропущено — Jira работает, Confluence будет без доступа"
