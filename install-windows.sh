@@ -27,6 +27,11 @@ ok()   { printf "  \xe2\x9c\x93 %s\n" "$1"; }
 fail() { printf "  \xe2\x9c\x97 %s\n" "$1"; }
 note() { printf "  \xc2\xb7 %s\n" "$1"; }
 
+# Одна реализация правила «команда есть И запускается здесь» на все три
+# точки входа — разбор и история отказа внутри файла.
+# shellcheck source=lib/win_path.sh
+. "$REPO_DIR/lib/win_path.sh"
+
 # ── Мы вообще там, где надо ───────────────────────────────────────────────
 #
 # Три разных «не там», и каждое требует своего ответа. Общее «запусти в WSL»
@@ -78,19 +83,83 @@ ok "репозиторий в файловой системе WSL"
 
 # ── Сеть до прод-данных ───────────────────────────────────────────────────
 #
-# Говорится ДО установки пакетов, а не после: если зеркальный режим не
-# включён, человек узнает об этом через десять минут на смоук-тесте
-# ClickHouse и будет думать, что у него неверный пароль. Утверждать, что
-# режим выключен, мы не можем — снять это изнутри WSL нечем, — поэтому здесь
-# именно предупреждение, а проверка остаётся живой: её делает setup.sh.
-say "Про сеть — прочитай сейчас, это самое частое место отказа"
-note "Прод-данные (ClickHouse, Trino, Grafana, OpenMetadata) видны только через Netbird. Клиент стоит на Windows, и это правильно — внутрь WSL его ставить не нужно"
-note "Но по умолчанию WSL2 живёт за собственным NAT и в туннель хоста не попадает. Включи зеркальный режим — в блокноте на стороне Windows, файл %UserProfile%\\.wslconfig:"
-note "    [wsl2]"
-note "    networkingMode=mirrored"
-note "    dnsTunneling=true"
-note "затем в PowerShell: wsl --shutdown — и открой Ubuntu заново (нужна Windows 11 22H2 или новее)"
-note "Netbird при этом должен быть поднят на Windows как обычно"
+# Самое частое место отказа, и раньше оно было ручным шагом в инструкции:
+# создать %UserProfile%\.wslconfig блокнотом на стороне Windows. Шаг
+# пропускали, а расплата приходила через десять минут — смоук-тест
+# ClickHouse не проходил, и это читалось как неверный пароль. Файл лежит на
+# диске Windows, то есть отсюда он виден: /mnt/c/Users/<имя>/.wslconfig.
+# Значит, шаг можно не объяснять, а сделать.
+#
+# Дальше по коду важно различать три исхода, а не два: «уже включено»,
+# «дописали, нужен перезапуск WSL» и «сами не смогли, вот что сделать
+# руками». Третий случай остаётся — Windows-сторона может быть недоступна
+# (диск не примонтирован, cmd.exe вне PATH), и молча пройти мимо этого
+# нельзя.
+NEED_WSL_RESTART=0
+
+# Домашняя папка пользователя Windows глазами WSL. Через cmd.exe, а не
+# разбором /mnt/c/Users: имя папки профиля не обязано совпадать с именем
+# учётки, а профиль может лежать и не на C:. Переход в /mnt/c — не
+# косметика: из /home cmd.exe ругается на UNC-путь и молча подставляет
+# C:\Windows, после чего мы бы записали .wslconfig не туда. Но и жёстким
+# условием он быть не должен: точка монтирования настраивается
+# (/etc/wsl.conf, root=), и там, где её нет, спросить cmd.exe всё равно
+# стоит — хуже пустого ответа уже не будет.
+windows_home() {
+  local raw
+  raw="$( { cd /mnt/c 2>/dev/null || cd /; } && cmd.exe /c 'echo %UserProfile%' 2>/dev/null | tr -d '\r\n')"
+  case "$raw" in
+    ?:\\*) wslpath -u "$raw" 2>/dev/null ;;
+    *) printf "" ;;
+  esac
+}
+
+say "Сеть до прод-данных"
+note "ClickHouse, Trino, Grafana и OpenMetadata видны только через Netbird. Клиент стоит на Windows, и это правильно — внутрь WSL его ставить не нужно"
+
+WIN_HOME="$(windows_home)"
+WSLCONFIG=""
+[ -n "$WIN_HOME" ] && [ -d "$WIN_HOME" ] && WSLCONFIG="$WIN_HOME/.wslconfig"
+
+if [ -z "$WSLCONFIG" ]; then
+  # Не смогли дотянуться до Windows-стороны. Говорим ровно то, что знаем.
+  fail "не нашёл домашнюю папку Windows — настрою сеть за тебя не смогу"
+  note "Создай %UserProfile%\\.wslconfig блокнотом на стороне Windows:"
+  note "    [wsl2]"
+  note "    networkingMode=mirrored"
+  note "    dnsTunneling=true"
+  note "затем в PowerShell: wsl --shutdown — и открой Ubuntu заново"
+elif [ -f "$WSLCONFIG" ] && grep -qE '^[[:space:]]*networkingMode[[:space:]]*=[[:space:]]*mirrored' "$WSLCONFIG"; then
+  # Прописано — но применено ли, отсюда не видно: для этого нужен был
+  # `wsl --shutdown` после правки. Утверждать «сеть в порядке» мы не имеем
+  # права и не утверждаем; настоящую проверку сделает смоук-тест ClickHouse.
+  ok "зеркальный режим сети уже прописан ($WSLCONFIG)"
+elif [ -f "$WSLCONFIG" ]; then
+  # Файл есть, но настройки в нём нет. Не переписываем: там может лежать
+  # чужая конфигурация (лимиты памяти, ядро), и разбирать INI шеллом,
+  # чтобы вложиться в нужную секцию, — способ испортить рабочий файл.
+  fail "$WSLCONFIG уже есть, но зеркального режима в нём нет — не трогаю чужой файл"
+  note "Допиши в него сам, в секцию [wsl2]:"
+  note "    networkingMode=mirrored"
+  note "    dnsTunneling=true"
+  note "затем в PowerShell: wsl --shutdown — и открой Ubuntu заново"
+  NEED_WSL_RESTART=1
+else
+  if printf '[wsl2]\nnetworkingMode=mirrored\ndnsTunneling=true\n' > "$WSLCONFIG" 2>/dev/null; then
+    ok "создал $WSLCONFIG — WSL будет видеть сеть Windows вместе с туннелем Netbird"
+    NEED_WSL_RESTART=1
+  else
+    fail "не смог записать $WSLCONFIG — создай его блокнотом на стороне Windows:"
+    note "    [wsl2]"
+    note "    networkingMode=mirrored"
+    note "    dnsTunneling=true"
+  fi
+fi
+
+if [ "$NEED_WSL_RESTART" = "1" ]; then
+  note "Настройка сети применится только после перезапуска WSL — это в конце, сейчас продолжаю"
+  note "Зеркальный режим требует Windows 11 22H2 или новее"
+fi
 
 # ── Пакеты ────────────────────────────────────────────────────────────────
 #
@@ -100,7 +169,7 @@ NEED_APT=""
 for pkg_cmd in "curl:curl" "git:git" "python3:python3"; do
   cmd="${pkg_cmd%%:*}"
   pkg="${pkg_cmd##*:}"
-  if command -v "$cmd" >/dev/null 2>&1; then
+  if have_native "$cmd"; then
     ok "$cmd уже стоит"
   else
     NEED_APT="$NEED_APT $pkg"
@@ -122,7 +191,7 @@ fi
 # uv — обязателен: через него поднимается каждый из девяти коннекторов
 # (`uv run` для наших, `uvx` для сторонних). Ставим официальным
 # установщиком, а не из apt: в репозиториях Ubuntu он старый или его нет.
-if command -v uv >/dev/null 2>&1 && command -v uvx >/dev/null 2>&1; then
+if have_native uv && have_native uvx; then
   ok "uv уже стоит"
 else
   say "Ставлю uv (через него работают все коннекторы)"
@@ -134,15 +203,18 @@ else
   # запущенном процессе PATH сам не обновится, а он нужен прямо сейчас,
   # ниже по этому же скрипту.
   export PATH="$HOME/.local/bin:$PATH"
-  command -v uv >/dev/null 2>&1 && ok "uv поставлен"
+  have_native uv && ok "uv поставлен"
 fi
 
 # Node нужен для двух вещей сразу: им ставится Codex (npm install -g) и на
 # нём работает коннектор growthbook (npx @growthbook/mcp). Ни то, ни другое
 # не обязательно — поэтому отказ здесь не роняет установку.
-if command -v npx >/dev/null 2>&1; then
+if have_native npx; then
   ok "Node.js уже стоит"
 else
+  if [ -n "$(foreign_path npx)" ]; then
+    note "npx нашёлся на стороне Windows ($(foreign_path npx)) — отсюда он не работает, ставлю Node внутрь Ubuntu"
+  fi
   say "Ставлю Node.js 18+ (нужен для Codex и для коннектора growthbook)"
   if curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - &&
      sudo apt-get install -y nodejs; then
@@ -160,8 +232,17 @@ fi
 # что-то настроено неправильно.
 HAVE_CLAUDE=0
 HAVE_CODEX=0
-command -v claude >/dev/null 2>&1 && HAVE_CLAUDE=1
-command -v codex  >/dev/null 2>&1 && HAVE_CODEX=1
+have_native claude && HAVE_CLAUDE=1
+have_native codex  && HAVE_CODEX=1
+
+# Движок стоит, но на стороне Windows. Молчать тут нельзя: раньше мы в
+# этом месте решали «уже стоит» и пропускали установку — сессия потом
+# падала с `exec: node: not found`, и связать одно с другим было нечем.
+for eng in claude codex; do
+  if ! have_native "$eng" && [ -n "$(foreign_path "$eng")" ]; then
+    note "$eng найден на стороне Windows ($(foreign_path "$eng")) — отсюда он не запускается, поставлю внутрь Ubuntu"
+  fi
+done
 
 if [ "$HAVE_CLAUDE" = "1" ] || [ "$HAVE_CODEX" = "1" ]; then
   [ "$HAVE_CODEX"  = "1" ] && ok "codex уже стоит"
@@ -222,6 +303,27 @@ fi
 
 # ── Дальше работает мастер ────────────────────────────────────────────────
 #
+# Но не всегда прямо сейчас. Если сеть мы только что настроили, мастер
+# запускать бессмысленно: до перезапуска WSL старый сетевой стек остаётся
+# на месте, смоук-тест ClickHouse не пройдёт, и человек получит красную
+# строку про доступ, которого на самом деле у него нет только до
+# перезагрузки. Лучше остановиться на понятном шаге, чем показать отказ,
+# который ничего не значит.
+#
+# Всё остальное к этому моменту уже поставлено, поэтому возвращаться сюда
+# не нужно — следующая команда сразу ./setup.sh.
+if [ "$NEED_WSL_RESTART" = "1" ]; then
+  say "Окружение готово. Остался один шаг — перезапустить WSL, иначе прод-данных не будет"
+  cat <<EOF
+  1. Закрой это окно и открой PowerShell:
+       wsl --shutdown
+  2. Открой Ubuntu заново и запусти мастер:
+       cd $REPO_DIR && ./setup.sh
+EOF
+  note "Netbird при этом должен быть поднят на Windows как обычно"
+  exit 0
+fi
+
 # exec, а не вызов: дальше всё происходит в setup.sh, и он должен получить
 # терминал и код возврата напрямую. Свой обработчик поверх его вывода нам
 # добавить нечего — а если добавится, он будет спорить с итогом мастера,

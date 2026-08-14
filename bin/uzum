@@ -83,8 +83,42 @@ done
 # комментарий в setup.sh, переменная ENABLED).
 CLAUDE_FOUND=0
 CODEX_FOUND=0
-command -v claude >/dev/null 2>&1 && CLAUDE_FOUND=1
-command -v codex  >/dev/null 2>&1 && CODEX_FOUND=1
+# Не просто «команда есть», а «её можно запустить здесь»: одна реализация
+# на все три точки входа, разбор и история отказа — внутри файла. Место
+# критическое именно здесь: раньше `uzum --codex` доходил до `exec codex`,
+# запускал шим с диска Windows и умирал с `exec: node: not found` —
+# сообщением, из которого не следует ни что движок чужой системы, ни что
+# ставить его надо внутрь Ubuntu.
+#
+# Отсутствие файла проверяется явно, до подключения. Без этой проверки
+# `set -uo pipefail` не спасает: `.` на несуществующем файле печатает ошибку
+# и идёт дальше, have_native остаётся неопределённой, оба движка получают
+# «не найден» — и человек читает «движок не виден в PATH» вместо правды про
+# сломанный клон. Тот же класс тихой деградации, что три барьера ниже.
+if [ ! -r "$REPO_DIR/lib/win_path.sh" ]; then
+  echo "Файл $REPO_DIR/lib/win_path.sh не найден — клон репозитория неполный." >&2
+  echo "Обнови репозиторий: cd $REPO_DIR && git pull" >&2
+  exit 1
+fi
+# shellcheck source=lib/win_path.sh
+. "$REPO_DIR/lib/win_path.sh"
+
+have_native claude && CLAUDE_FOUND=1
+have_native codex  && CODEX_FOUND=1
+
+# Движок есть, но чужой системы. Говорим об этом до выбора движка: иначе
+# ниже человек прочитает «движок не установлен» и пойдёт ставить его тем же
+# способом, которым уже поставил.
+for eng in claude codex; do
+  if ! have_native "$eng"; then
+    foreign="$(command -v "$eng" 2>/dev/null || true)"
+    if [ -n "$foreign" ]; then
+      echo "  · $eng найден на стороне Windows ($foreign) — отсюда он не запускается." >&2
+      echo "    Нужен $eng внутри Ubuntu: конфиг и хуки лежат в ~/.codex этой системы, а коннекторы — это Linux-процессы." >&2
+      echo "    Как поставить: docs/install/windows.md" >&2
+    fi
+  fi
+done
 
 REMEMBERED_ENGINE=""
 if [ -f "$ENGINE_CHOICE_FILE" ]; then

@@ -100,6 +100,11 @@ fail() { printf "  \xe2\x9c\x97 %s\n" "$1"; }
 # машине не стоит — это штатная ситуация, а не ошибка (✗ читается как ошибка).
 note() { printf "  \xc2\xb7 %s\n" "$1"; }
 
+# Одна реализация правила «команда есть И запускается здесь» на все три
+# точки входа — разбор и история отказа внутри файла.
+# shellcheck source=lib/win_path.sh
+. "$REPO_DIR/lib/win_path.sh"
+
 # Временные файлы смоук-проверок: непредсказуемые имена (mktemp, не
 # фиксированные /tmp/uzum_*) и гарантированная уборка при выходе — даже при
 # early exit из проверки окружения. Тела ответов (email, displayName и т.п.)
@@ -643,8 +648,19 @@ check_environment() {
   # Раньше это печаталось красным ✗ и в первый час читалось как «что-то не
   # так» — теперь строкой-заметкой, а ✗ остаётся там, где он и правда
   # означает ошибку: когда нет ни одного движка.
-  command -v claude >/dev/null 2>&1 && ENGINE_CLAUDE_FOUND=1
-  command -v codex  >/dev/null 2>&1 && ENGINE_CODEX_FOUND=1
+  have_native claude && ENGINE_CLAUDE_FOUND=1
+  have_native codex  && ENGINE_CODEX_FOUND=1
+
+  # Движок нашёлся, но на стороне Windows. Это не «не установлен» и
+  # говорить так нельзя: человек пойдёт ставить второй раз тем же способом
+  # и получит то же самое.
+  local eng
+  for eng in claude codex; do
+    if ! have_native "$eng" && [ -n "$(foreign_path "$eng")" ]; then
+      note "$eng найден на стороне Windows ($(foreign_path "$eng")) — отсюда он не запускается"
+      note "Нужен $eng, установленный внутри Ubuntu: конфиг и хуки лежат в ~/.codex этой системы, а коннекторы — это Linux-процессы"
+    fi
+  done
 
   if [ "$ENGINE_CLAUDE_FOUND" = "1" ]; then
     ok "claude найден"
@@ -693,8 +709,14 @@ check_environment() {
   # выше, `uvx` сам скачает пакет при первом запуске.
   # npx нужен только growthbook: официальный сервер GrowthBook — npm-пакет
   # @growthbook/mcp (node >= 18), питоновского аналога нет.
-  if command -v npx >/dev/null 2>&1; then
+  # npx — та же ловушка, что и с движками: на диске Windows лежит npm-шим
+  # `npx` без расширения, и он находится раньше, чем человек понимает, что
+  # Node внутри Ubuntu нет вовсе.
+  if have_native npx; then
     ok "npx найден"
+  elif [ -n "$(foreign_path npx)" ]; then
+    fail "npx найден только на стороне Windows ($(foreign_path npx)) — отсюда он не работает, коннектор growthbook не поднимется"
+    fail "Поставь Node.js внутри Ubuntu: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && sudo apt install -y nodejs"
   else
     fail "npx не найден — коннектор growthbook не поднимется. Поставь Node.js 18+: brew install node"
   fi

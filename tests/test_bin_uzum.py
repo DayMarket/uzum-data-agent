@@ -61,6 +61,12 @@ def _make_repo(tmp_path, broken_helper=False):
     (repo / "connectors").mkdir()
     (repo / "work").mkdir()
     shutil.copy(BIN_UZUM, repo / "bin" / "uzum")
+    # Правило «команда есть И запускается здесь» (см. tests/test_win_path.py):
+    # bin/uzum подключает его файлом, а не держит свою копию, поэтому в
+    # минимальном репозитории он тоже обязан быть. Без него лаунчер не
+    # определит ни одного движка — ровно так этот тест и упал, когда правило
+    # переехало в lib/.
+    shutil.copy(REPO_ROOT / "lib" / "win_path.sh", repo / "lib" / "win_path.sh")
     (repo / "bin" / "uzum").chmod(0o755)
     # Мостик окружения Codex и реестр, из которого он берёт соответствие
     # source→target (см. тесты про запуск Codex ниже).
