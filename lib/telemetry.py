@@ -30,9 +30,16 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import envfile
+
 DEFAULT_DB = "sandbox"
 DEFAULT_PORT = "8123"
 TIMEOUT_S = 4
+
+# Запасной источник значений для Config.from_env — тот же файл, который
+# bin/uzum разворачивает в окружение перед запуском движка. Тесты подменяют
+# атрибут модуля, чтобы не читать настоящий файл машины разработчика.
+SECRETS_PATH = os.path.expanduser("~/.config/uzum-ai/secrets.env")
 
 # Верхние границы на один вызов flush(), чтобы большая очередь или медленная
 # сеть не задерживали старт сессии аналитика дольше пары секунд.
@@ -66,7 +73,7 @@ class Config(object):
         self.port = port
 
     @classmethod
-    def from_env(cls):
+    def from_env(cls, environ=None, secrets_path=None):
         """Куда и чем писать телеметрию.
 
         По умолчанию — тот же складской ClickHouse (WMS), которым аналитик
@@ -83,14 +90,36 @@ class Config(object):
         соединения по-прежнему берут от WMS. Всё-или-ничего заставляло бы
         переписывать все четыре значения ради двух и разъезжаться с WMS при
         переезде кластера.
+
+        Каждое имя ищется сначала в окружении (bin/uzum разворачивает туда
+        secrets.env перед запуском движка), потом в самом secrets.env:
+        сессию могли поднять и мимо uzum — Claude Desktop после рестарта
+        приложения, голый `claude`/`codex` в терминале, — и тогда в
+        окружении хуков секретов нет вовсе. Раньше такая сессия получала
+        enabled=False и телеметрия молча не писалась — даже в очередь, то
+        есть без единого следа (тот же класс тихой поломки, что «https
+        вместо http»). Тот же запасной путь уже стоит в clickhouse_users
+        (.claude/hooks/log_session.py) — теперь и у доступа на запись.
+        Приоритет имён (TELEMETRY_* перебивает CH_WMS_*) старше приоритета
+        источников: осознанная учётка-писатель в secrets.env сильнее
+        складской переменной из окружения.
+
+        `secrets_path=None`, а не `=SECRETS_PATH`: умолчание-выражение
+        вычислилось бы при импорте и игнорировало подмену атрибута модуля
+        тестами (та же ловушка, что уже ловили в clickhouse_users).
         """
+        environ = os.environ if environ is None else environ
+        secrets_path = SECRETS_PATH if secrets_path is None else secrets_path
+        stored = envfile.read(secrets_path)
+
+        def get(name):
+            return environ.get(name) or stored.get(name) or ""
+
         def value(name, fallback, default=""):
-            return (os.environ.get(name)
-                    or os.environ.get(fallback)
-                    or default).strip()
+            return (get(name) or get(fallback) or default).strip()
 
         host = value("TELEMETRY_CH_HOST", "CH_WMS_HOST")
-        state = os.environ.get(
+        state = environ.get(
             "UZUM_STATE_DIR",
             os.path.expanduser("~/.local/state/uzum-ai"),
         )
@@ -100,11 +129,11 @@ class Config(object):
             # а не форматирование. Логин и хост чистим (их печатали руками
             # в мастере), пароль берём как есть.
             user=value("TELEMETRY_CH_USER", "CH_WMS_USER"),
-            password=(os.environ.get("TELEMETRY_CH_PASSWORD")
-                      or os.environ.get("CH_WMS_PASSWORD") or ""),
-            database=os.environ.get("TELEMETRY_CH_DB", DEFAULT_DB),
+            password=(get("TELEMETRY_CH_PASSWORD")
+                      or get("CH_WMS_PASSWORD") or ""),
+            database=get("TELEMETRY_CH_DB") or DEFAULT_DB,
             queue_dir=os.path.join(state, "queue"),
-            enabled=bool(host) and os.environ.get("TELEMETRY_ENABLED", "1") != "0",
+            enabled=bool(host) and (get("TELEMETRY_ENABLED") or "1") != "0",
             secure=value("TELEMETRY_CH_SECURE", "CH_WMS_SECURE").lower() == "true",
             port=value("TELEMETRY_CH_PORT", "CH_WMS_PORT", DEFAULT_PORT) or DEFAULT_PORT,
         )

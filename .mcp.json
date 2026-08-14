@@ -1,20 +1,28 @@
 {
   "mcpServers": {
     "atlassian": {
-      "command": "uvx",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "atlassian",
+        "--",
+        "uvx",
         "mcp-atlassian"
       ],
       "env": {
         "JIRA_URL": "${JIRA_URL:-https://jira.uzum.com}",
         "JIRA_PERSONAL_TOKEN": "${JIRA_TOKEN}",
         "CONFLUENCE_URL": "${CONFLUENCE_URL:-https://confluence.uzum.com}",
-        "CONFLUENCE_PERSONAL_TOKEN": "${JIRA_TOKEN}"
+        "CONFLUENCE_PERSONAL_TOKEN": "${CONFLUENCE_TOKEN:-}"
       }
     },
     "clickhouse-wms": {
-      "command": "uvx",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "clickhouse-wms",
+        "--",
+        "uvx",
         "--with",
         "pyarrow",
         "mcp-clickhouse"
@@ -31,8 +39,12 @@
       }
     },
     "clickhouse-dwh": {
-      "command": "uvx",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "clickhouse-dwh",
+        "--",
+        "uvx",
         "--with",
         "pyarrow",
         "mcp-clickhouse"
@@ -49,8 +61,12 @@
       }
     },
     "trino": {
-      "command": "uv",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "trino",
+        "--",
+        "uv",
         "run",
         "${CLAUDE_PROJECT_DIR:-.}/connectors/trino_proxy.py"
       ],
@@ -60,8 +76,12 @@
       }
     },
     "superset": {
-      "command": "uv",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "superset",
+        "--",
+        "uv",
         "run",
         "${CLAUDE_PROJECT_DIR:-.}/connectors/superset_mcp.py"
       ],
@@ -72,8 +92,12 @@
       }
     },
     "grafana": {
-      "command": "uvx",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "grafana",
+        "--",
+        "uvx",
         "mcp-grafana"
       ],
       "env": {
@@ -82,8 +106,12 @@
       }
     },
     "openmetadata": {
-      "command": "uvx",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "openmetadata",
+        "--",
+        "uvx",
         "--with",
         "fastmcp<2.4",
         "--with",
@@ -100,8 +128,12 @@
       }
     },
     "growthbook": {
-      "command": "npx",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "growthbook",
+        "--",
+        "npx",
         "-y",
         "@growthbook/mcp"
       ],
@@ -110,8 +142,12 @@
       }
     },
     "sheets": {
-      "command": "uv",
+      "command": "python3",
       "args": [
+        "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+        "sheets",
+        "--",
+        "uv",
         "run",
         "${CLAUDE_PROJECT_DIR:-.}/connectors/sheets_mcp.py"
       ],

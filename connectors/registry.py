@@ -44,8 +44,10 @@ Codex ждёт их в `[mcp_servers.<id>]` внутри `.codex/config.toml` �
       значение берётся. Для большинства коннекторов source совпадает с
       target; там, где имя пакета отличается от нашего соглашения о том, как
       называть секрет (ClickHouse: CLICKHOUSE_HOST ← CH_WMS_HOST/CH_DWH_HOST;
-      Jira/Confluence: JIRA_PERSONAL_TOKEN и CONFLUENCE_PERSONAL_TOKEN оба ←
-      JIRA_TOKEN; Grafana: GRAFANA_SERVICE_ACCOUNT_TOKEN ← GRAFANA_TOKEN;
+      Jira/Confluence: JIRA_PERSONAL_TOKEN ← JIRA_TOKEN и
+      CONFLUENCE_PERSONAL_TOKEN ← CONFLUENCE_TOKEN — два токена, PAT в
+      Server/DC действует только в своём продукте;
+      Grafana: GRAFANA_SERVICE_ACCOUNT_TOKEN ← GRAFANA_TOKEN;
       OpenMetadata: OPENMETADATA_URI/OPENMETADATA_JWT_TOKEN ← OMD_URL/
       OMD_TOKEN; GrowthBook: GB_API_KEY ← GROWTHBOOK_TOKEN; Sheets:
       GOOGLE_SERVICE_ACCOUNT_FILE ← GOOGLE_SA_FILE) — они разные.
@@ -113,17 +115,36 @@ class StaticEnv:
 
 @dataclass(frozen=True)
 class EnvVar:
-    """Переменная окружения, значение которой приходит от аналитика."""
+    """Переменная окружения, значение которой приходит от аналитика.
+
+    `required=False` — третья категория поверх «есть дефолт / нет дефолта»:
+    значения нет и взять его неоткуда, но коннектор без него не бесполезен,
+    а работает частично (CONFLUENCE_TOKEN: без него atlassian отдаёт Jira,
+    недоступен только Confluence). Такая переменная не попадает в
+    required_sources — иначе гейт установки «нет кредов — нет коннектора»
+    (setup_helpers.connector_readiness → write_enabled) выключал бы Jira
+    целиком у каждого, кто не завёл токен Confluence. В .mcp.json она
+    рендерится как `${VAR:-}` — пустой дефолт при отсутствии, чтобы
+    процессу коннектора не уезжал литерал `${VAR}` (см.
+    tools/render_configs.py). Осмысленна только у секрета: у структурной
+    переменной либо есть настоящий дефолт, либо без неё коннектор не
+    стартует вовсе."""
     target: str
     source: str
     secret: bool
     default: str = None  # разрешено только когда secret=False
+    required: bool = True
 
     def __post_init__(self):
         if self.secret and self.default is not None:
             raise ValueError(
                 f"{self.target}: у секретной переменной не может быть дефолта "
                 f"({self.default!r}) — это зашитое в git значение"
+            )
+        if not self.required and self.default is not None:
+            raise ValueError(
+                f"{self.target}: required=False вместе с default={self.default!r} "
+                f"не имеет смысла — переменная с дефолтом и так не обязательная"
             )
 
 
@@ -181,7 +202,8 @@ class Connector:
         names = []
         for branch in (self.env, self.codex.env if self.codex is not None else ()):
             for item in branch:
-                if isinstance(item, EnvVar) and item.default is None:
+                if (isinstance(item, EnvVar) and item.default is None
+                        and item.required):
                     if item.source not in names:
                         names.append(item.source)
         return tuple(names)
@@ -214,9 +236,20 @@ CONNECTORS: Tuple[Connector, ...] = (
             EnvVar(target="JIRA_PERSONAL_TOKEN", source="JIRA_TOKEN", secret=True),
             EnvVar(target="CONFLUENCE_URL", source="CONFLUENCE_URL", secret=False,
                    default="https://confluence.uzum.com"),
-            # Тот же JIRA_TOKEN — один PAT на Jira и Confluence разом, не два
-            # независимых секрета (см. .mcp.json / connectors/ACCESS.md).
-            EnvVar(target="CONFLUENCE_PERSONAL_TOKEN", source="JIRA_TOKEN", secret=True),
+            # ОТДЕЛЬНЫЙ токен, не JIRA_TOKEN. Раньше здесь стоял тот же
+            # JIRA_TOKEN с комментарием «один PAT на Jira и Confluence разом»
+            # — это была догадка, не проверенная запросом, и она неверна:
+            # PAT в Atlassian Server/DC действует только в том продукте, где
+            # создан. Проверено живым запросом (14.08.2026): рабочий токен
+            # Jira (200 на jira.uzum.com/rest/api/2/myself) на
+            # confluence.uzum.com/rest/api/user/current даёт 401 «Client must
+            # be authenticated». Токен Confluence аналитик создаёт отдельно —
+            # в профиле самого Confluence (см. connectors/ACCESS.md).
+            # required=False: без этого токена atlassian остаётся рабочим
+            # коннектором Jira — выключать его целиком из-за отсутствия
+            # доступа ко второму продукту нельзя (см. докстринг EnvVar).
+            EnvVar(target="CONFLUENCE_PERSONAL_TOKEN", source="CONFLUENCE_TOKEN",
+                   secret=True, required=False),
         ),
     ),
     Connector(

@@ -33,6 +33,15 @@ STRUCTURAL_VARS = ("CH_WMS_HOST", "CH_WMS_SECURE", "CH_DWH_HOST", "CH_DWH_SECURE
 SECRET_VARS = ("CH_WMS_USER", "CH_WMS_PASSWORD", "CH_DWH_USER", "CH_DWH_PASSWORD",
                "JIRA_TOKEN", "GRAFANA_TOKEN", "OMD_TOKEN", "GROWTHBOOK_TOKEN")
 
+# Необязательные секреты (registry.EnvVar, required=False): значения нет и
+# дефолта быть не может, но коннектор без них работает частично.
+# CONFLUENCE_TOKEN — второй токен atlassian, отдельный от JIRA_TOKEN: PAT в
+# Atlassian Server/DC действует только в том продукте, где создан (токен
+# Jira на Confluence — 401, проверено живым запросом). Рендерится как
+# ${VAR:-} — ПУСТОЙ дефолт: не значение, а способ не отдать процессу
+# литерал `${VAR}`, когда переменной нет (см. tools/render_configs.py).
+OPTIONAL_SECRET_VARS = ("CONFLUENCE_TOKEN",)
+
 
 def test_all_nine_servers_present():
     assert set(CONFIG["mcpServers"]) == EXPECTED
@@ -68,9 +77,38 @@ def test_secrets_forbid_default():
         assert not re.search(r"\$\{%s:-" % re.escape(var), raw), f"{var}: секрету нельзя задавать дефолт"
 
 
+def test_optional_secrets_default_to_empty_and_nothing_else():
+    """Необязательный секрет — ровно ${VAR:-}, пустой дефолт. Любой символ
+    после `:-` — это уже зашитое в git значение секрета, та же регрессия,
+    которую ловит test_secrets_forbid_default."""
+    raw = (REPO_ROOT / ".mcp.json").read_text(encoding="utf-8")
+    for var in OPTIONAL_SECRET_VARS:
+        assert re.search(r"\$\{%s:-\}" % re.escape(var), raw), (
+            f"{var}: нет подстановки ${{{var}:-}} с пустым дефолтом")
+        assert not re.search(r"\$\{%s:-[^}]" % re.escape(var), raw), (
+            f"{var}: у необязательного секрета дефолт может быть только пустым")
+        assert not re.search(r"\$\{%s\}" % re.escape(var), raw), (
+            f"{var}: голая ${{{var}}} уехала бы процессу литералом, "
+            "когда переменной нет")
+
+
 def test_local_scripts_exist():
-    for name in ("trino_proxy.py", "superset_mcp.py", "sheets_mcp.py"):
+    for name in ("trino_proxy.py", "superset_mcp.py", "sheets_mcp.py",
+                 "claude_env_bridge.py"):
         assert (REPO_ROOT / "connectors" / name).exists()
+
+
+def _real_launch(server):
+    """(команда, аргументы) настоящего процесса сервера — то, что стоит после
+    `--` в вызове мостика claude_env_bridge (см. tools/render_configs.py::
+    render_mcp_json: мостик пересобирает окружение из secrets.env и exec-ает
+    эту команду; сессии, поднятые мимо bin/uzum — Claude Desktop, голый
+    claude, — иначе получают литеральные `${VAR}` вместо значений)."""
+    assert server["command"] == "python3"
+    args = server["args"]
+    assert args[0] == "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py"
+    assert args[2] == "--"
+    return args[3], args[4:]
 
 
 def test_no_server_is_launched_from_a_nonexistent_pypi_package():
@@ -88,19 +126,22 @@ def test_no_server_is_launched_from_a_nonexistent_pypi_package():
     остальные пакетные серверы — без обязательного `brew install`.
     """
     servers = CONFIG["mcpServers"]
-    assert servers["grafana"]["command"] == "uvx"
-    assert servers["grafana"]["args"] == ["mcp-grafana"]
-    assert servers["growthbook"]["command"] == "npx"
-    assert "@growthbook/mcp" in servers["growthbook"]["args"]
-    omd_args = servers["openmetadata"]["args"]
+    grafana_cmd, grafana_args = _real_launch(servers["grafana"])
+    assert grafana_cmd == "uvx"
+    assert grafana_args == ["mcp-grafana"]
+    growthbook_cmd, growthbook_args = _real_launch(servers["growthbook"])
+    assert growthbook_cmd == "npx"
+    assert "@growthbook/mcp" in growthbook_args
+    _, omd_args = _real_launch(servers["openmetadata"])
     assert omd_args[-2:] == ["-m", "mcp_openmetadata.server"], (
         "у mcp-openmetadata нет console script — только запуск модулем"
     )
     for name, server in servers.items():
         if name == "grafana":
             continue
-        assert server["args"][:1] != ["mcp-grafana"]
-        assert server["args"][:1] != ["mcp-growthbook"]
+        _, args = _real_launch(server)
+        assert args[:1] != ["mcp-grafana"]
+        assert args[:1] != ["mcp-growthbook"]
 
 
 def test_connector_env_var_names_match_the_servers_we_actually_run():
@@ -128,7 +169,9 @@ def test_clickhouse_keeps_the_battle_tested_parameter_set():
     """
     for name, prefix in (("clickhouse-wms", "CH_WMS"), ("clickhouse-dwh", "CH_DWH")):
         ch = CONFIG["mcpServers"][name]
-        assert ch["args"] == ["--with", "pyarrow", "mcp-clickhouse"]
+        ch_cmd, ch_args = _real_launch(ch)
+        assert ch_cmd == "uvx"
+        assert ch_args == ["--with", "pyarrow", "mcp-clickhouse"]
         env = ch["env"]
         assert env["MCP_TRANSPORT"] == "stdio"
         assert env["CLICKHOUSE_PORT"] == "${%s_PORT:-8123}" % prefix

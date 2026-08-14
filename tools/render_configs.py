@@ -79,6 +79,20 @@ from known_secret_paths import KNOWN_SECRET_LOCATIONS  # noqa: E402
 def _mcp_json_env_value(item: EnvVar) -> str:
     if item.default is not None:
         return "${%s:-%s}" % (item.source, item.default)
+    if not item.required:
+        # Необязательный секрет (CONFLUENCE_TOKEN): пустой дефолт — не
+        # «зашитое в git значение» (там пусто), а способ не отдать процессу
+        # коннектора литерал `${VAR}`, когда переменной нет. Проверено живым
+        # запуском (14.08.2026, headless-сессия): при отсутствующей
+        # переменной Claude Code запускает сервер и передаёт `${VAR}` как
+        # есть, буквально — mcp-atlassian счёл бы такой «токен» настоящим и
+        # считал бы Confluence настроенным, но с 401 на каждом вызове.
+        # Пустая строка честнее: пакет видит «доступа нет» и просто не
+        # поднимает Confluence. Заодно `claude mcp list` не пугает
+        # «Missing environment variables» из-за доступа, который и не
+        # обязателен (required_sources его тоже не числит — паритет,
+        # который сверяет tests/test_render_configs.py).
+        return "${%s:-}" % item.source
     return "${%s}" % item.source
 
 
@@ -89,12 +103,30 @@ def _mcp_json_arg(item) -> str:
 
 
 def render_mcp_json(connectors: Iterable[Connector]) -> str:
-    """Собрать .mcp.json (формат Claude Code) из реестра коннекторов."""
+    """Собрать .mcp.json (формат Claude Code) из реестра коннекторов.
+
+    Каждый сервер запускается через connectors/claude_env_bridge.py:
+    подстановка `${VAR}` работает только когда окружение Claude Code
+    подготовил `bin/uzum`, а сессии поднимают и мимо него (Claude Desktop
+    после рестарта, голый `claude`) — тогда Claude Code передаёт
+    плейсхолдер дочернему процессу буквально (проверено живым запуском,
+    см. докстринг мостика). Мостик пересобирает переменные коннектора из
+    окружения → secrets.env → default и exec-ает настоящую команду — она
+    остаётся видимой в конфиге после `--`. env-словарь при этом рендерится
+    по-прежнему: по нему `claude mcp list` печатает «Missing environment
+    variables» (паритет с required_sources, сверяется тестом), значения из
+    него мостик не читает."""
     servers = {}
     for connector in connectors:
         entry = {
-            "command": connector.command,
-            "args": [_mcp_json_arg(a) for a in connector.args],
+            "command": "python3",
+            "args": [
+                "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py",
+                connector.id,
+                "--",
+                connector.command,
+                *[_mcp_json_arg(a) for a in connector.args],
+            ],
         }
         env = {}
         for item in connector.env:

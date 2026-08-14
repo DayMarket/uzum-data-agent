@@ -343,6 +343,78 @@ def test_empty_token_is_not_reported_as_a_rejected_one(tmp_path):
     assert not curl_log.exists() or "jira" not in curl_log.read_text(encoding="utf-8")
 
 
+# ── Confluence: токен отдельный от Jira ──────────────────────────────────
+#
+# PAT в Atlassian Server/DC действует только в том продукте, где создан:
+# живой токен Jira на confluence.uzum.com/rest/api/user/current даёт 401
+# (проверено запросом 14.08.2026). Раньше мастер спрашивал один JIRA_TOKEN
+# и подставлял его обоим продуктам — Jira работала, confluence_* «не
+# срабатывали», и ничто в установке не говорило, что доступа два.
+
+CONFLUENCE_REJECTED = ["confluence.uzum.com", 401, "Client must be authenticated"]
+CONFLUENCE_OK = ["confluence.uzum.com", 200, '{"displayName": "Аналитик"}']
+
+DOTENV_WITH_CONFLUENCE = DOTENV_WMS_AND_JIRA + "CONFLUENCE_TOKEN=токен-confluence\n"
+
+
+def test_confluence_is_checked_with_its_own_token_not_the_jira_one(tmp_path):
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(
+        repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK, CONFLUENCE_OK],
+        dotenv=DOTENV_WITH_CONFLUENCE)
+
+    assert "CONFLUENCE_TOKEN=" in _secrets(home), result.stdout[-3000:]
+    confluence_calls = [c for c in _curl_calls(tmp_path)
+                        if "confluence.uzum.com" in c["url"]]
+    assert confluence_calls, "мастер не проверил токен Confluence живым запросом"
+    assert "токен-confluence" in confluence_calls[0]["config"]
+    assert "токен-jira" not in confluence_calls[0]["config"]
+
+
+def test_missing_confluence_token_keeps_jira_enabled_and_says_so(tmp_path):
+    """Jira без Confluence — рабочий коннектор: пропуск второго токена не
+    выключает atlassian и проговаривается словами, а не молчит."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK],
+                              dotenv=DOTENV_WMS_AND_JIRA)
+
+    assert "atlassian" in _enabled(repo), result.stdout[-3000:]
+    assert "Confluence будет без доступа" in result.stdout, result.stdout[-3000:]
+    assert "CONFLUENCE_TOKEN=" not in _secrets(home)
+
+
+def test_rejected_confluence_token_does_not_disable_jira(tmp_path):
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(
+        repo, tmp_path, curl_rules=[WMS_OK, JIRA_OK, CONFLUENCE_REJECTED],
+        dotenv=DOTENV_WITH_CONFLUENCE)
+
+    out = result.stdout
+    assert "atlassian" in _enabled(repo), out[-3000:]
+    assert "токен Confluence не принят" in out, out[-3000:]
+    # Непринятый токен в secrets.env не попадает — как и у остальных проверок:
+    # put_env пишет только после успешной живой проверки.
+    assert "CONFLUENCE_TOKEN=" not in _secrets(home)
+
+
+def test_non_interactive_add_atlassian_survives_without_confluence_token(tmp_path):
+    """`./setup.sh --add atlassian --non-interactive` — команда, которую
+    мастер сам советует при отвале Jira. Отсутствие CONFLUENCE_TOKEN не
+    должно ронять её с кодом 1: это пропуск, не ошибка."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(
+        repo, tmp_path, args=["--add", "atlassian", "--non-interactive"],
+        curl_rules=[JIRA_OK],
+        saved_secrets="JIRA_TOKEN='токен-jira'\n")
+
+    assert result.returncode == 0, result.stdout[-3000:] + result.stderr[-1000:]
+    assert "Confluence будет без доступа" in result.stdout, result.stdout[-3000:]
+
+
 # ── Находка 3: --add доставляет конфиг Codex ─────────────────────────────
 
 def test_add_delivers_the_codex_profile_where_codex_actually_reads_it(tmp_path):

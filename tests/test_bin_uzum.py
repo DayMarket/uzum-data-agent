@@ -219,9 +219,11 @@ SECRETS_WITH_JIRA = (
     "CH_WMS_USER='u'\n"
     "CH_WMS_PASSWORD='пароль с пробелом'\n"
     "JIRA_TOKEN='токен-9f3a с пробелом и $знаком'\n"
+    "CONFLUENCE_TOKEN='конф-токен-7c1d'\n"
     "GRAFANA_TOKEN='граф-токен'\n"
 )
 JIRA_TOKEN_VALUE = "токен-9f3a с пробелом и $знаком"
+CONFLUENCE_TOKEN_VALUE = "конф-токен-7c1d"
 
 
 def _engine_env(dump_dir, engine):
@@ -265,7 +267,10 @@ def test_codex_gets_the_variables_under_the_names_connectors_actually_expect(tmp
     env = _engine_env(dump_dir, "codex")
     assert env.get("JIRA_PERSONAL_TOKEN") == JIRA_TOKEN_VALUE, (
         "JIRA_PERSONAL_TOKEN = %r" % env.get("JIRA_PERSONAL_TOKEN"))
-    assert env.get("CONFLUENCE_PERSONAL_TOKEN") == JIRA_TOKEN_VALUE
+    # Токен Confluence — свой, не JIRA_TOKEN: PAT в Server/DC действует
+    # только в том продукте, где создан (токен Jira на Confluence — 401,
+    # проверено живым запросом 14.08.2026).
+    assert env.get("CONFLUENCE_PERSONAL_TOKEN") == CONFLUENCE_TOKEN_VALUE
     assert env.get("GRAFANA_SERVICE_ACCOUNT_TOKEN") == "граф-токен"
     # Исходные имена никуда не делись — их читает, например, trino_proxy.py
     # из secrets.env, и ломать это не входило в задачу.

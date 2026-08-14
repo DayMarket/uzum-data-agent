@@ -184,8 +184,15 @@ def test_no_literal_secrets_in_mcp_json():
     for connector in CONNECTORS:
         for item in connector.env_vars():
             if item.secret:
-                # Секрет обязан быть голой подстановкой ${SOURCE}, без дефолта.
-                assert re.search(r"\$\{%s\}" % re.escape(item.source), raw), (connector.id, item.target)
+                if item.required:
+                    # Секрет обязан быть голой подстановкой ${SOURCE}, без дефолта.
+                    assert re.search(r"\$\{%s\}" % re.escape(item.source), raw), (connector.id, item.target)
+                else:
+                    # Необязательный секрет — ${SOURCE:-} с ПУСТЫМ дефолтом:
+                    # не значение, а способ не отдать процессу литерал
+                    # `${SOURCE}`, когда переменной нет.
+                    assert re.search(r"\$\{%s:-\}" % re.escape(item.source), raw), (connector.id, item.target)
+                    assert not re.search(r"\$\{%s:-[^}]" % re.escape(item.source), raw), (connector.id, item.target)
                 assert f'"{item.target}": "{item.source}"' not in raw
 
 
@@ -269,13 +276,24 @@ def test_extra_static_env_vars_survive_in_mcp_json_and_inside_the_proxy_wrapper(
 
 
 def test_launch_args_survive_both_formats():
+    """У Claude Code настоящий запуск стоит после `--` в вызове мостика
+    claude_env_bridge (см. render_mcp_json: сессии, поднятые мимо bin/uzum —
+    Claude Desktop, голый claude, — без мостика получают литеральные
+    `${VAR}` вместо значений). Команда и аргументы коннектора при этом
+    обязаны доехать до конфига без потерь — это и проверяем."""
     mcp_servers = _mcp_json_servers()
     codex_servers = _codex_servers()
     for connector in CONNECTORS:
         codex_command, codex_raw_args, _ = _codex_spec(connector)
 
-        mcp_args = mcp_servers[connector.id]["args"]
-        assert len(mcp_args) == len(connector.args), connector.id
+        entry = mcp_servers[connector.id]
+        assert entry["command"] == "python3", connector.id
+        bridge, cid, dashes, real_command, *real_args = entry["args"]
+        assert bridge == "${CLAUDE_PROJECT_DIR:-.}/connectors/claude_env_bridge.py"
+        assert cid == connector.id
+        assert dashes == "--"
+        assert real_command == connector.command, connector.id
+        assert len(real_args) == len(connector.args), connector.id
 
         codex_args = codex_servers[connector.id]["args"]
         assert len(codex_args) == len(codex_raw_args), connector.id
@@ -285,7 +303,6 @@ def test_launch_args_survive_both_formats():
             else:
                 assert rendered_codex == original
 
-        assert mcp_servers[connector.id]["command"] == connector.command
         assert codex_servers[connector.id]["command"] == codex_command
 
 
@@ -434,3 +451,7 @@ def test_trino_requires_nothing_and_openmetadata_requires_both_values():
     assert set(by_id["openmetadata"].required_sources()) == {"OMD_URL", "OMD_TOKEN"}
     assert set(by_id["grafana"].required_sources()) == {"GRAFANA_TOKEN"}
     assert by_id["growthbook"].required_sources() == ("GROWTHBOOK_TOKEN",)
+    # CONFLUENCE_TOKEN — необязательный (required=False): без него atlassian
+    # остаётся рабочим коннектором Jira, выключать его за отсутствие доступа
+    # ко второму продукту нельзя.
+    assert by_id["atlassian"].required_sources() == ("JIRA_TOKEN",)

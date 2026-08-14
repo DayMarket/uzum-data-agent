@@ -1081,7 +1081,16 @@ if removed:
   return 0
 }
 
-# ── Jira / Confluence (общий токен) ─────────────────────────────────────
+# ── Jira / Confluence (коннектор один — atlassian, токена ДВА) ──────────
+#
+# Раньше здесь спрашивался один JIRA_TOKEN и уходил обоим продуктам —
+# исходя из «один PAT на Jira и Confluence разом». Это была догадка, и она
+# неверна: PAT в Atlassian Server/DC действует только в том продукте, где
+# создан. Проверено живым запросом (14.08.2026): токен, который Jira
+# принимает (200 на /rest/api/2/myself), Confluence отвергает — 401 «Client
+# must be authenticated» на /rest/api/user/current. Симптом у аналитика:
+# инструменты Jira работают, любые confluence_* — «не срабатывают», и
+# ничего в установке не намекает, что это два разных доступа.
 setup_jira() {
   say "── Jira ── Профиль → Personal Access Tokens → Create token"
   ask_required_secret JIRA_TOKEN "  Токен: " "JIRA_TOKEN (токен Jira)"
@@ -1106,6 +1115,41 @@ setup_jira() {
   else
     fail "токен не принят (код: $code)"
     fail "пропущено — подключить позже: ./setup.sh --add atlassian"
+    # Без Jira коннектор не включён — токен Confluence спрашивать не к чему,
+    # ровно тот же --add atlassian спросит оба.
+    return
+  fi
+  setup_confluence_token
+}
+
+# Второй токен того же коннектора. НЕ через ask_required_secret: его MISSING
+# в --non-interactive валит установку с кодом 1, а Confluence — не тот
+# доступ, ради которого стоит ронять `./setup.sh --add atlassian
+# --non-interactive` (команду, которую мастер сам советует при отвале Jira).
+# Jira без Confluence — рабочий коннектор; пропуск здесь честно проговорен,
+# а не превращён в ошибку.
+setup_confluence_token() {
+  say "── Confluence ── токен ОТДЕЛЬНЫЙ от Jira: PAT действует только там, где создан"
+  printf "  Создать: https://confluence.uzum.com → Профиль → Personal Access Tokens\n"
+  if [ -z "${CONFLUENCE_TOKEN:-}" ] && [ "$NONINTERACTIVE" != "1" ]; then
+    read -rsp "  Токен (Enter — пропустить, без него не работает только Confluence): " CONFLUENCE_TOKEN; echo
+  fi
+  if [ -z "${CONFLUENCE_TOKEN:-}" ]; then
+    note "пропущено — Jira работает, Confluence будет без доступа"
+    note "добавить позже: ./setup.sh --add atlassian"
+    return
+  fi
+  local out code name
+  out="$(mk_tmp)"
+  code=$(curl_check "$out" 10 "https://confluence.uzum.com/rest/api/user/current" \
+    "Authorization: Bearer $CONFLUENCE_TOKEN")
+  if [ "$code" = "200" ]; then
+    name=$(UZUM_CHECK_FILE="$out" python3 -c "import json,os;print(json.load(open(os.environ['UZUM_CHECK_FILE']))['displayName'])" 2>/dev/null || echo "пользователя")
+    ok "Confluence видит тебя как $name"
+    put_env CONFLUENCE_TOKEN "$CONFLUENCE_TOKEN"
+  else
+    fail "токен Confluence не принят (код: $code) — не перепутан ли с токеном Jira? Они разные"
+    fail "Jira при этом работает; Confluence добавить позже: ./setup.sh --add atlassian"
   fi
 }
 

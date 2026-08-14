@@ -80,7 +80,11 @@ def _every_source_filled():
 # что имя контракта чужого пакета изменится незамеченным.
 BROKEN_ON_ACCEPTANCE = {
     "JIRA_PERSONAL_TOKEN": "JIRA_TOKEN",
-    "CONFLUENCE_PERSONAL_TOKEN": "JIRA_TOKEN",
+    # В брифе приёмки стояло ← JIRA_TOKEN («один PAT на оба продукта»), но
+    # это оказалось неверно: PAT в Server/DC действует только там, где
+    # создан (токен Jira на Confluence — 401, живой запрос 14.08.2026).
+    # Источник теперь свой, CONFLUENCE_TOKEN.
+    "CONFLUENCE_PERSONAL_TOKEN": "CONFLUENCE_TOKEN",
     "GOOGLE_SERVICE_ACCOUNT_FILE": "GOOGLE_SA_FILE",
     "GRAFANA_SERVICE_ACCOUNT_TOKEN": "GRAFANA_TOKEN",
     "OPENMETADATA_URI": "OMD_URL",
@@ -371,6 +375,7 @@ def test_bridge_execs_the_command_with_the_renamed_environment(tmp_path):
 
     env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path),
            "JIRA_TOKEN": "секрет с пробелом и $знаком",
+           "CONFLUENCE_TOKEN": "конф-секрет",
            "OMD_URL": "https://omd.internal", "OMD_TOKEN": "omd-tok"}
     result = subprocess.run(
         [sys.executable, str(BRIDGE_PATH), "--", str(stub), "-p", "uzum"],
@@ -382,7 +387,7 @@ def test_bridge_execs_the_command_with_the_renamed_environment(tmp_path):
     child_env = child["env"]
 
     assert child_env["JIRA_PERSONAL_TOKEN"] == "секрет с пробелом и $знаком"
-    assert child_env["CONFLUENCE_PERSONAL_TOKEN"] == "секрет с пробелом и $знаком"
+    assert child_env["CONFLUENCE_PERSONAL_TOKEN"] == "конф-секрет"
     assert child_env["JIRA_URL"] == "https://jira.uzum.com"
     assert child_env["OPENMETADATA_URI"] == "https://omd.internal"
     assert child_env["OPENMETADATA_JWT_TOKEN"] == "omd-tok"

@@ -4,12 +4,75 @@ import json
 import os
 import time
 
+import pytest
+
 import telemetry
+
+
+@pytest.fixture(autouse=True)
+def _isolated_secrets(monkeypatch, tmp_path):
+    """from_env читает secrets.env как запасной источник — на машине
+    разработчика там лежат настоящие креды, и без изоляции тесты «переменной
+    нет» читали бы их и зеленели/краснели в зависимости от машины."""
+    monkeypatch.setattr(telemetry, "SECRETS_PATH",
+                        str(tmp_path / "no-secrets.env"))
 
 
 def test_config_disabled_when_host_missing(monkeypatch):
     monkeypatch.delenv("TELEMETRY_CH_HOST", raising=False)
     assert telemetry.Config.from_env().enabled is False
+
+
+def test_config_falls_back_to_secrets_env_when_the_environment_is_bare(monkeypatch, tmp_path):
+    """Сессия, поднятая мимо bin/uzum (Claude Desktop после рестарта, голый
+    claude/codex): в окружении хуков секретов нет вовсе, но все значения
+    лежат в ~/.config/uzum-ai/secrets.env. Раньше такая сессия получала
+    enabled=False, и телеметрия молча не писалась даже в очередь."""
+    for name in ("TELEMETRY_CH_HOST", "CH_WMS_HOST", "CH_WMS_USER",
+                 "CH_WMS_PASSWORD", "CH_WMS_SECURE", "CH_WMS_PORT"):
+        monkeypatch.delenv(name, raising=False)
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text(
+        "CH_WMS_HOST='wms.internal'\n"
+        "CH_WMS_USER='imya-familiya'\n"
+        "CH_WMS_PASSWORD='пароль с пробелом '\n",
+        encoding="utf-8",
+    )
+
+    cfg = telemetry.Config.from_env(secrets_path=str(secrets))
+
+    assert cfg.enabled is True
+    assert cfg.host == "wms.internal"
+    assert cfg.user == "imya-familiya"
+    assert cfg.password == "пароль с пробелом ", "пароль нельзя чистить .strip()"
+    assert cfg.port == "8123"
+
+
+def test_config_environment_wins_over_the_secrets_file(monkeypatch, tmp_path):
+    """Явно заданное окружение сильнее файла — им пользуются тесты и
+    переопределения вида `TELEMETRY_CH_HOST=… uzum`."""
+    monkeypatch.setenv("TELEMETRY_CH_HOST", "iz-okruzheniya")
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("TELEMETRY_CH_HOST='iz-faila'\n", encoding="utf-8")
+
+    cfg = telemetry.Config.from_env(secrets_path=str(secrets))
+
+    assert cfg.host == "iz-okruzheniya"
+
+
+def test_config_name_priority_beats_source_priority(monkeypatch, tmp_path):
+    """Осознанная учётка-писатель TELEMETRY_* в secrets.env сильнее
+    складской CH_WMS_* из окружения: приоритет имён старше приоритета
+    источников (см. докстринг from_env — ради этого случая исключение
+    TELEMETRY_* и существует)."""
+    monkeypatch.delenv("TELEMETRY_CH_USER", raising=False)
+    monkeypatch.setenv("CH_WMS_USER", "sklad-iz-okruzheniya")
+    secrets = tmp_path / "secrets.env"
+    secrets.write_text("TELEMETRY_CH_USER='pisatel-iz-faila'\n", encoding="utf-8")
+
+    cfg = telemetry.Config.from_env(secrets_path=str(secrets))
+
+    assert cfg.user == "pisatel-iz-faila"
 
 
 def test_config_reads_env(monkeypatch, tmp_path):
