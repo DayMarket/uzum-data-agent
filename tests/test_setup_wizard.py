@@ -400,6 +400,74 @@ def test_rejected_confluence_token_does_not_disable_jira(tmp_path):
     assert "CONFLUENCE_TOKEN=" not in _secrets(home)
 
 
+# Обратная сторона того же разделения: подсказки были асимметричны. Шаг
+# Confluence называл хост, где создаётся токен, и при 401 спрашивал «не
+# перепутан ли с токеном Jira»; шаг Jira не делал ни того, ни другого.
+# Симптом с живой установки (17.08.2026): человек вставил в вопрос Jira токен,
+# созданный в Confluence, получил
+#
+#     ── Jira ── Профиль → Personal Access Tokens → Create token
+#       Токен (Enter — оставить сохранённый):
+#       ✗ токен не принят (код: 401)
+#
+# и не смог понять, о каком из двух токенов речь: слова «Jira» в самом отказе
+# нет, хоста в подсказке нет, а вопрос выглядит один в один как соседний.
+
+
+def test_jira_step_says_where_the_token_is_created(tmp_path):
+    """Хост в подсказке — единственное место установки, где видно, что PAT
+    берётся именно в Jira, а не «в профиле Atlassian» вообще."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "atlassian"],
+                           curl_rules=[JIRA_OK], answers="токен-jira\n\n")
+
+    jira_block = result.stdout.split("── Jira")[1].split("── Confluence")[0]
+    assert "jira.uzum.com" in jira_block, jira_block
+
+
+def test_rejected_jira_token_hints_at_the_mix_up_with_confluence(tmp_path):
+    """Отказ обязан называть продукт и самую вероятную причину. Симметрично
+    шагу Confluence, где такая подсказка есть с самого разделения токенов."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, _ = _run_setup(repo, tmp_path, args=["--add", "atlassian"],
+                           curl_rules=[JIRA_REJECTED], answers="токен-confluence\n\n")
+
+    out = result.stdout
+    # Продукт назван в самом отказе, а не только в заголовке шага четырьмя
+    # строками выше: именно на эту строку человек и смотрит.
+    assert "токен Jira не принят" in out, out
+    assert "Confluence" in out.split("токен Jira не принят")[1].splitlines()[0], (
+        "отказ Jira не намекает на путаницу с токеном Confluence:\n%s" % out)
+
+
+def test_carriage_return_from_a_pasted_token_does_not_reach_the_server(tmp_path):
+    """`read` снимает пробелы и табуляцию по краям (IFS), но НЕ возврат
+    каретки: на bash 3.2 у введённого "токен\\r" длина на единицу больше.
+    Такой хвост доезжает до заголовка Bearer, сервер отвечает 401, и человек
+    читает «токен не принят» на совершенно верном токене. Копипаста из
+    Windows-терминала и из части веб-полей даёт ровно это."""
+    repo = _make_repo_copy(tmp_path)
+
+    result, home = _run_setup(repo, tmp_path, args=["--add", "atlassian"],
+                              curl_rules=[JIRA_OK, CONFLUENCE_OK],
+                              answers="токен-jira\r\nтокен-confluence\r\n")
+
+    calls = _curl_calls(tmp_path)
+    jira_calls = [c for c in calls if "jira.uzum.com" in c["url"]]
+    assert jira_calls, result.stdout[-3000:]
+    assert "\r" not in jira_calls[0]["config"], repr(jira_calls[0]["config"])
+    # Обрезан ровно хвост, а не значение: токен доезжает целиком.
+    assert 'Bearer токен-jira"' in jira_calls[0]["config"], (
+        repr(jira_calls[0]["config"]))
+    conf_calls = [c for c in calls if "confluence.uzum.com" in c["url"]]
+    assert conf_calls and "\r" not in conf_calls[0]["config"], conf_calls
+    # И в файл секретов хвост попасть не должен: оттуда он поедет в каждую
+    # сессию — коннектор молча получит 401 уже после «зелёной» установки.
+    assert "\r" not in _secrets(home), repr(_secrets(home))
+
+
 def test_add_atlassian_enter_keeps_the_saved_jira_token_and_asks_for_confluence(tmp_path):
     """Главный сценарий «добавить Confluence к рабочей Jira». В интерактивном
     --add сохранённое намеренно не подставляется (вопрос задаётся всегда),
@@ -1241,7 +1309,7 @@ def test_a_stale_saved_token_is_reported_and_the_connector_is_not_enabled(tmp_pa
     calls = [c for c in _curl_calls(tmp_path) if "jira.uzum.com" in c["url"]]
     assert calls, "сохранённый токен приняли на веру — живой проверки не было"
     assert "Bearer токен-с-прошлой-установки" in calls[0]["config"], calls[0]["config"]
-    assert "токен не принят" in result.stdout, result.stdout[-3000:]
+    assert "токен Jira не принят" in result.stdout, result.stdout[-3000:]
     assert "atlassian" not in _enabled(repo)
 
 

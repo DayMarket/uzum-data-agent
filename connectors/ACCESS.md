@@ -9,7 +9,7 @@
 | ClickHouse (WMS, склад) | Логин — корп-почта через дефис. Пароль — заявка в JSM, тип «Доступ к DWH» | до 1 дня |
 | ClickHouse (DWH, общий) | Отдельная заявка в JSM, тот же тип «Доступ к DWH» — учётка независимая от складского кластера | до 1 дня |
 | Телеметрия | Отдельного доступа не нужно: те же логин и пароль складского ClickHouse (WMS) | — |
-| Jira | Профиль → Personal Access Tokens → Create token | сразу |
+| Jira | В профиле САМОЙ Jira (jira.uzum.com) → Personal Access Tokens → Create token | сразу |
 | Confluence | То же самое, но в профиле САМОГО Confluence (confluence.uzum.com) — PAT в Server/DC действует только в том продукте, где создан, токен Jira тут не подходит (проверено: 401). Без него работает всё, кроме Confluence | сразу |
 | Superset | Логин и пароль корп-учётки Keycloak — те же, что открывают Superset в браузере | сразу |
 | Trino | Ничего вводить не нужно: OAuth2 SSO в браузере при первом запросе | сразу |
