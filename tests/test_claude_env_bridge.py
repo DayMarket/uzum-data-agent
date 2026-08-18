@@ -129,6 +129,99 @@ def test_the_function_does_not_mutate_the_environment_it_was_given():
     assert environ == {"CLICKHOUSE_HOST": "${CH_DWH_HOST}"}
 
 
+# ── Коннектор, у которого source и target — одно имя ─────────────────────
+#
+# Вторая живая находка (18.08.2026), тот же механизм с другой стороны.
+# Все проверки выше написаны на clickhouse-dwh, где source (CH_DWH_HOST) и
+# target (CLICKHOUSE_HOST) — РАЗНЫЕ имена: литерал приезжает под target, а
+# мостик спрашивает source, и они просто не встречаются. У superset имена
+# совпадают (SUPERSET_USERNAME/SUPERSET_PASSWORD — и source, и target), и
+# литерал `${SUPERSET_PASSWORD}` ложится ровно под то имя, которое мостик
+# читает первым. `environ.get(...) or secrets.get(...)` считал его значением
+# и отдавал коннектору строку `${SUPERSET_PASSWORD}` вместо пароля.
+#
+# Симптом у аналитика: `./setup.sh --add superset` печатает «✓ вижу 300
+# дашбордов» (мастер проверяет вход СВОИМИ значениями, мимо мостика), а в
+# сессии тот же коннектор падает с «Keycloak: Invalid username or password».
+# Установка зелёная, коннектор мёртвый — и ни одной подсказки, что это одно
+# и то же место.
+
+
+def test_a_placeholder_under_its_own_name_does_not_beat_the_saved_secret():
+    """Случай Риды-2: у superset source и target — одно имя, и литерал
+    приезжает под тем же ключом, который мостик спрашивает у окружения."""
+    environ = {"SUPERSET_URL": "https://bi.uzum.uz",
+               "SUPERSET_USERNAME": "${SUPERSET_USERNAME}",
+               "SUPERSET_PASSWORD": "${SUPERSET_PASSWORD}"}
+    secrets = {"SUPERSET_USERNAME": "r-zabirova",
+               "SUPERSET_PASSWORD": "настоящий-пароль"}
+
+    env = claude_env_bridge.connector_env(BY_ID["superset"], environ, secrets)
+
+    assert env["SUPERSET_USERNAME"] == "r-zabirova"
+    assert env["SUPERSET_PASSWORD"] == "настоящий-пароль", (
+        "коннектор получил литерал вместо пароля — Keycloak отвечает на это "
+        "«Invalid username or password»")
+
+
+def test_a_placeholder_with_a_default_is_not_a_value_either():
+    """Вторая форма, которую рендерит tools/render_configs.py: `${VAR:-def}`.
+    Claude Code разворачивает её сам, но если не развернул — это тем более
+    не значение."""
+    environ = {"SUPERSET_URL": "${SUPERSET_URL:-https://bi.uzum.uz}",
+               "SUPERSET_USERNAME": "лог", "SUPERSET_PASSWORD": "пар"}
+
+    env = claude_env_bridge.connector_env(
+        BY_ID["superset"], environ, {"SUPERSET_URL": "https://bi.uzum.uz"})
+
+    assert env["SUPERSET_URL"] == "https://bi.uzum.uz"
+
+
+def test_a_placeholder_under_its_own_name_is_removed_when_nothing_is_saved():
+    """Нечем заменить — имя убирается вовсе, как и у соседей. Иначе
+    коннектор попробует войти логином `${SUPERSET_USERNAME}` и человек
+    получит «Invalid username or password» вместо «доступа нет»."""
+    environ = {"SUPERSET_USERNAME": "${SUPERSET_USERNAME}",
+               "SUPERSET_PASSWORD": "${SUPERSET_PASSWORD}"}
+
+    env = claude_env_bridge.connector_env(BY_ID["superset"], environ, {})
+
+    assert "SUPERSET_USERNAME" not in env
+    assert "SUPERSET_PASSWORD" not in env
+
+
+def test_a_real_value_that_merely_mentions_a_placeholder_still_wins():
+    """Обратная сторона: отбрасывается ТОЛЬКО значение, целиком состоящее из
+    неразвёрнутого `${…}`. Пароль, внутри которого есть такие символы, —
+    обычное значение, и терять его нельзя."""
+    environ = {"SUPERSET_USERNAME": "лог", "SUPERSET_PASSWORD": "a${b}c"}
+
+    env = claude_env_bridge.connector_env(
+        BY_ID["superset"], environ, {"SUPERSET_PASSWORD": "из-файла"})
+
+    assert env["SUPERSET_PASSWORD"] == "a${b}c"
+
+
+def test_every_connector_whose_source_and_target_share_a_name_is_covered():
+    """Бэкстоп к самой находке: слепое пятно было в том, что ВСЕ проверки
+    мостика написаны на коннекторе с разными именами. Список таких
+    переменных берётся из реестра — появится ещё одна, и она пройдёт через
+    ту же проверку, а не будет ждать следующей живой машины."""
+    from connectors.registry import EnvVar
+
+    same_name = [(c, item) for c in CONNECTORS for item in c.env
+                 if isinstance(item, EnvVar) and item.source == item.target]
+    assert same_name, "в реестре не осталось таких переменных — тест потерял смысл"
+
+    for connector, item in same_name:
+        env = claude_env_bridge.connector_env(
+            connector, {item.target: "${%s}" % item.source},
+            {item.source: "значение-из-файла"})
+        assert env[item.target] == "значение-из-файла", (
+            "%s: коннектор %s получил литерал вместо значения"
+            % (item.target, connector.id))
+
+
 # ── сквозные: настоящий процесс ──────────────────────────────────────────
 
 def _env_dump_stub(path, dump_path):

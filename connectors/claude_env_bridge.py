@@ -48,6 +48,7 @@ lib/telemetry.py::Config.from_env отдельно.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -64,13 +65,46 @@ from connectors.registry import CONNECTORS, EnvVar, StaticEnv  # noqa: E402
 
 SECRETS_PATH = os.path.expanduser("~/.config/uzum-ai/secrets.env")
 
+# Неразвёрнутая подстановка из `.mcp.json` — ровно те две формы, которые
+# пишет tools/render_configs.py: `${VAR}` и `${VAR:-дефолт}`. Целиком, а не
+# «содержит»: пароль, внутри которого есть такие символы, — обычное
+# значение, и терять его нельзя.
+_UNEXPANDED = re.compile(r"\A\$\{[A-Za-z_][A-Za-z0-9_]*(:-.*)?\}\Z", re.DOTALL)
+
+
+def _from_environ(environ, name):
+    """Значение из окружения процесса — или None, если Claude Code передал
+    под этим именем сам плейсхолдер.
+
+    Второй случай выглядит как значение (строка непустая), но значением не
+    является: подставить его было нечем, и в дочерний процесс уехала бы
+    строка `${SUPERSET_PASSWORD}`.
+
+    До этой развилки дефект прятался за именами. У большинства переменных
+    source и target разные (CH_DWH_HOST → CLICKHOUSE_HOST): литерал
+    приезжает под target, а спрашиваем мы source — не встречаются. Но у
+    superset source и target — одно имя, и `environ.get(item.source)`
+    возвращал ровно тот литерал, который сам же и должен был вычистить.
+    Живой симптом (18.08.2026): `./setup.sh --add superset` печатает «✓ вижу
+    300 дашбордов» (мастер проверяет вход своими значениями, мимо мостика),
+    а сессия падает с «Keycloak: Invalid username or password».
+
+    Codex-мостику такая развилка не нужна: у Codex нет per-server env-словаря
+    (окружение готовит codex_env_bridge на весь процесс разом), и взяться
+    плейсхолдеру в его source_env неоткуда.
+    """
+    value = environ.get(name)
+    if value and _UNEXPANDED.match(value):
+        return None
+    return value
+
 
 def connector_env(connector, environ, secrets) -> dict:
     """Окружение дочернего процесса: копия `environ` с достроенными target-
     переменными коннектора. Чистая функция — ничего не пишет в os.environ.
 
-    Пусто (нет в environ или пустая строка) — смотрим secrets, потом
-    default. Нет нигде — target-имя убирается вовсе: в environ под ним мог
+    Пусто (нет в environ, пустая строка или неразвёрнутый плейсхолдер из
+    `.mcp.json` — см. _from_environ) — смотрим secrets, потом default. Нет нигде — target-имя убирается вовсе: в environ под ним мог
     приехать литеральный `${VAR}` из `.mcp.json`, а пустой токен означал бы
     «доступ есть, но не работает» вместо «доступа нет» (см.
     codex_env_overlay — семантика та же, расхождение мостиков означало бы,
@@ -83,7 +117,7 @@ def connector_env(connector, environ, secrets) -> dict:
             continue
         if not isinstance(item, EnvVar):
             continue
-        value = environ.get(item.source) or secrets.get(item.source) or item.default
+        value = _from_environ(environ, item.source) or secrets.get(item.source) or item.default
         if value:
             env[item.target] = value
         else:
